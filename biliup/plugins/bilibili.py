@@ -14,6 +14,7 @@ from ..engine.download import DownloadBase
 OFFICIAL_API = "https://api.live.bilibili.com"
 STREAM_NAME_REGEXP = r"/live-bvc/\d+/(live_[^/\.]+)"
 WBI_WEB_LOCATION = "444.8"
+_BILIUP_PENALTY_STATE = {}  # 新增：全局状态机字典，用于记录各直播间的惩罚等级与拉流时间
 
 @Plugin.download(regexp=r'https?://(b23\.tv|live\.bilibili\.com)')
 class Bililive(DownloadBase):
@@ -127,6 +128,28 @@ class Bililive(DownloadBase):
             else:
                 self.raw_stream_url = None
 
+        # ================= 新增：状态机分级惩罚与600秒自愈窗口判定 =================
+        room_id_str = str(self.__real_room_id)
+        state = _BILIUP_PENALTY_STATE.setdefault(room_id_str, {'level': 0, 'last_time': 0})
+        current_time = time.time()
+        last_time = state['last_time']
+
+        if last_time > 0:
+            if (current_time - last_time) >= 600:
+                if state['level'] != 0:
+                    logger.info(f"{self.plugin_msg}: 录制已稳定超过10分钟，网络自愈，惩罚等级重置为 Level 0 (正常模式)")
+                state['level'] = 0
+            else:
+                if state['level'] == 0:
+                    state['level'] = 1
+                    logger.warning(f"{self.plugin_msg}: 距离上次拉流不足10分钟即断开！升级至 Level 1 惩罚期，优先使用回退 API。")
+                elif state['level'] == 1:
+                    state['level'] = 2
+                    logger.warning(f"{self.plugin_msg}: 连回退 API 也出现快速断流！升级至 Level 2 探测期，强制换回官方 API 以打破死锁。")
+                elif state['level'] == 2:
+                    state['level'] = 0
+                    logger.warning(f"{self.plugin_msg}: 探测期依然快速断流，重置惩罚等级回 Level 0 重新循环。")
+        # =========================================================================
 
         stream_urls = await self.aget_stream(self.bili_qn, self.bili_protocol, special_type)
         if not stream_urls:
@@ -181,6 +204,10 @@ class Bililive(DownloadBase):
                     return False
             else:
                 self.raw_stream_url = __url
+
+        # ================= 新增：成功拉流全局打卡更新时间戳 =================
+        _BILIUP_PENALTY_STATE[str(self.__real_room_id)]['last_time'] = time.time()
+        # ====================================================================
 
         return True
 
@@ -265,7 +292,20 @@ class Bililive(DownloadBase):
         :return: 流信息
         """
         stream_urls = {}
-        for api in self.bili_api_list:
+
+        # ================= 新增：根据状态机分级动态编排 API 路由优先级 =================
+        room_id_str = str(self.__real_room_id)
+        level = _BILIUP_PENALTY_STATE.get(room_id_str, {}).get('level', 0)
+        
+        api_list = list(self.bili_api_list)
+        if level == 1:
+            api_list.reverse()
+            logger.info(f"{self.plugin_msg}: 处于 Level 1 惩罚期，优先编排回退 API 链路")
+        elif level == 2:
+            logger.info(f"{self.plugin_msg}: 处于 Level 2 探测期，强行激活官方 API 重新探测")
+        # =============================================================================
+
+        for api in api_list:  # 修改：遍历重排后的 api_list
             play_info = await self.get_play_info(api, qn)
             if not play_info or check_areablock(play_info):
                 # logger.error(f"{self.plugin_msg}: {api} 返回内容错误: {play_info}")
