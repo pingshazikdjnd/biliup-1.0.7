@@ -63,6 +63,27 @@ const Bilibili: React.FC<Props> = props => {
           <Select.Option value={0}>0（最低画质）</Select.Option>
         </Form.Select>
         <Form.Switch
+          field="bili_wait_transcode"
+          extraText="开启后，若开播时未生成所选的转码画质（如蓝光/超清），将循环等待直至转码流生成或超时，避免直接录制大码率原画。注意：若主播码率较低不支持高画质，每次开播可能会等待至超时后才降级录制。"
+          label="等待转码流生成（bili_wait_transcode）"
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+        />
+        <Form.InputNumber
+          field="bili_wait_transcode_timeout"
+          extraText="等待转码流生成的最大超时时间（秒）。超时后将自动降级录制当前可用画质。"
+          label="等待转码超时时间（bili_wait_transcode_timeout）"
+          placeholder="120"
+          suffix="秒"
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+        />
+        <Form.Switch
           field="bilibili_danmaku"
           extraText="录制哔哩哔哩弹幕，目前不支持视频按时长分段下的弹幕文件自动分段。仅限下载插件为非 stream-gears 时生效，默认关闭。"
           label="录制弹幕（bilibili_danmaku）"

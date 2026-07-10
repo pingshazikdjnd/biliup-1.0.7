@@ -14,7 +14,7 @@ def download(fname, url, **kwargs):
         if re.match(plugin.VALID_URL_BASE, url):
             pg = plugin(fname, url)
             for k in pg.__dict__:
-                if kwargs.get(k):
+                if kwargs.get(k) is not None:
                     pg.__dict__[k] = kwargs.get(k)
     if not pg:
         pg = general.__plugin__(fname, url)

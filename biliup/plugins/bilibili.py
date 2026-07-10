@@ -39,6 +39,11 @@ class Bililive(DownloadBase):
         ]
         self.bili_anonymous_origin = config.get('bili_anonymous_origin', False)
         self.bili_cdn_fallback = config.get('bili_cdn_fallback', False)
+        self.bili_wait_transcode = config.get('bili_wait_transcode', False)
+        try:
+            self.bili_wait_transcode_timeout = max(0, int(config.get('bili_wait_transcode_timeout', 120)))
+        except (ValueError, TypeError):
+            self.bili_wait_transcode_timeout = 120
 
     async def acheck_stream(self, is_check=False):
 
@@ -151,7 +156,48 @@ class Bililive(DownloadBase):
                     logger.warning(f"{self.plugin_msg}: 探测期依然快速断流，重置惩罚等级回 Level 0 重新循环。")
         # =========================================================================
 
-        stream_urls = await self.aget_stream(self.bili_qn, self.bili_protocol, special_type)
+        # --- 等待转码流逻辑 (替换原第 154 行) ---
+        start_wait_time = time.time()
+        empty_retry_count = 0
+        transcode_qn_whitelist = {80, 150, 250, 400, 401}
+
+        while True:
+            stream_urls = await self.aget_stream(self.bili_qn, self.bili_protocol, special_type)
+
+            # 1. 空流处理：仅在等待转码功能开启时做有限重试，否则直接break交给原有逻辑
+            if not stream_urls:
+                if self.bili_wait_transcode and is_new_live:
+                    empty_retry_count += 1
+                    if empty_retry_count <= 3 and (time.time() - start_wait_time) < self.bili_wait_transcode_timeout:
+                        logger.warning(f"{self.plugin_msg}: 获取流为空 (可能网络抖动)，将在 15 秒后重试 ({empty_retry_count}/3)...")
+                        await asyncio.sleep(15)
+                        continue
+                break  # 功能关闭或重试耗尽，交给原有 155-165 行处理
+
+            # 2. 正常流：重置抖动计数器
+            empty_retry_count = 0
+
+            # 3. 等待转码判定（四个条件全部满足才等待）
+            if (self.bili_wait_transcode
+                    and is_new_live
+                    and self.bili_qn in transcode_qn_whitelist
+                    and self.bili_qn not in stream_urls):
+
+                elapsed = time.time() - start_wait_time
+                if elapsed < self.bili_wait_transcode_timeout:
+                    logger.warning(
+                        f"{self.plugin_msg}: 期望转码画质 {self.bili_qn} 暂未生成 (转码中)，已等待 {int(elapsed)}秒，"
+                        f"将在 15 秒后重试..."
+                    )
+                    await asyncio.sleep(15)
+                    continue
+                else:
+                    logger.warning(
+                        f"{self.plugin_msg}: 等待转码画质 {self.bili_qn} 超时 ({self.bili_wait_transcode_timeout}秒)，"
+                        f"将直接以当前可用最高画质开始录制。"
+                    )
+            break
+        # --- 等待转码流逻辑结束 ---
         if not stream_urls:
             if self.bili_protocol == 'hls_fmp4':
                 if int(time.time()) - live_start_time <= self.bili_hls_timeout:
