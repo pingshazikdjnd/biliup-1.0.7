@@ -98,7 +98,9 @@ class PluginInfo:
             else:
                 self.coroutines[key] = asyncio.create_task(shot(temp))
         self.inverted_index[url] = name
-        self.url_status[url] = 0
+        # 不要覆盖正在下载的状态，避免修改配置时产生重复下载线程
+        if self.url_status.get(url, 0) != 1:
+            self.url_status[url] = 0
 
     def delete(self, url):
         if not url in self.inverted_index:
