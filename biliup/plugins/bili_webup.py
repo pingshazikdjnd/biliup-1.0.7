@@ -46,6 +46,7 @@ class BiliWeb(UploadBase):
         cover_path=None,
         description='',
         credits=[],
+        section_id: Optional[int] = None,
     ):
         """
         :param principal:
@@ -63,6 +64,7 @@ class BiliWeb(UploadBase):
         :param cover_path: 稿件封面路径
         :param description: 视频简介
         :param credits: ???
+        :param section_id: 合集的节ID，设置后上传完成自动添加到对应合集
         """
         super().__init__(principal, data, persistence_path='bili.cookie', postprocessor=postprocessor)
         if tags is None:
@@ -82,6 +84,7 @@ class BiliWeb(UploadBase):
         self.dynamic = dynamic
         self.copyright = copyright
         self.dtime = dtime
+        self.section_id = section_id
 
     def upload(
         self,
@@ -126,7 +129,28 @@ class BiliWeb(UploadBase):
             if self.cover_path:
                 video.cover = bili.cover_up(self.cover_path).replace('http:', '')
             ret = bili.submit(self.submit_api)  # 提交视频
-        logger.info(f"上传成功: {ret}")
+            logger.info(f"上传成功: {ret}")
+
+            # 如果配置了 section_id，自动将视频添加到合集
+            if self.section_id:
+                try:
+                    aid = ret.get('data', {}).get('aid')
+                    if aid:
+                        info = bili.get_video_info(aid)
+                        cid = info['pages'][0]['cid']
+                        title = info['title']
+                        result = bili.add_to_season(self.section_id, [{
+                            'aid': aid,
+                            'cid': cid,
+                            'title': title,
+                            'charging_pay': 0,
+                        }])
+                        logger.info(f"已添加到合集(section_id={self.section_id}): {result}")
+                    else:
+                        logger.warning(f"提交成功但未获取到aid，无法添加到合集: {ret}")
+                except Exception as e:
+                    logger.error(f"添加到合集失败(section_id={self.section_id}): {e}")
+
         return file_list
 
     def creditsToDesc_v2(self):
@@ -745,6 +769,98 @@ class BiliBili:
               f'typeid={typeid}&title={quote(upvideo["title"])}&filename=filename&desc={desc}&cover={cover}' \
               f'&groupid={groupid}&vfea={vfea}'
         return self.__session.get(url=url, timeout=5).json()
+
+    # ==================== 合集(SEASON)相关 ====================
+    # B站"新版合集"(SEASON) 的相关接口，支持：
+    #   - 列出已有合集
+    #   - 获取视频信息
+    #   - 将视频添加到合集
+    #
+    # 使用流程：上传视频后添加到合集
+    #   1. seasons = bili.list_seasons()  # 获取合集列表，找到 season_id 和 section_id
+    #   2. 上传视频，获取 aid
+    #   3. bili.add_to_season(section_id, [{...}])  # 添加到合集
+
+    def list_seasons(self, pn=1, ps=30):
+        """
+        获取用户的合集列表
+
+        返回示例::
+
+            {
+                'seasons': [{
+                    'season': {'id': 7320255, 'title': '我的合集', ...},
+                    'sections': {'sections': [{'id': 8081933, 'title': '正片', ...}]}
+                }, ...],
+                'page': {'pn': 1, 'ps': 30, 'total': 5}
+            }
+
+        获取 section_id 的方式：
+        ``data['seasons'][0]['sections']['sections'][0]['id']``
+
+        :param pn: 页码，从1开始
+        :param ps: 每页数量，默认30
+        :return: 含 seasons 列表和分页信息的 dict
+        """
+        r = self.__session.get(
+            'https://member.bilibili.com/x2/creative/web/seasons',
+            params={'pn': pn, 'ps': ps, 'order': 'mtime', 'sort': 'desc', 'draft': 1},
+            timeout=10
+        ).json()
+        if r['code'] != 0:
+            raise Exception(r)
+        return r['data']
+
+    def get_video_info(self, aid):
+        """
+        获取视频信息（标题、cid 等），添加到合集前需要获取
+
+        :param aid: 视频AV号（纯数字）
+        :return: 视频信息 dict，含 title, pages[0].cid 等
+        """
+        r = self.__session.get(
+            'https://api.bilibili.com/x/web-interface/view',
+            params={'aid': aid}, timeout=10
+        ).json()
+        if r['code'] != 0:
+            raise Exception(r)
+        return r['data']
+
+    def add_to_season(self, section_id, episodes):
+        """
+        将视频添加到合集（新版合集/SEASON）
+
+        添加单个视频的典型用法::
+
+            info = bili.get_video_info(aid)
+            bili.add_to_season(section_id, [{
+                'aid': aid,
+                'cid': info['pages'][0]['cid'],
+                'title': info['title'],
+                'charging_pay': 0,
+            }])
+
+        可以一次添加多个视频，传入 episode dict 列表即可。
+
+        :param section_id: 节ID，通过 list_seasons() 获取
+        :param episodes: 视频列表，每项需含 aid, cid, title, charging_pay
+        :return: API 返回的 JSON
+        :raises Exception: API 返回 code != 0 时抛出
+        """
+        r = self.__session.post(
+            f'https://member.bilibili.com/x2/creative/web/season/section/episodes/add'
+            f'?csrf={self.__bili_jct}',
+            json={
+                'sectionId': section_id,
+                'episodes': episodes,
+                'csrf': self.__bili_jct,
+            },
+            headers={'Content-Type': 'application/json; charset=UTF-8'},
+            timeout=10
+        ).json()
+        if r['code'] != 0:
+            raise Exception(r)
+        return r
 
     def __enter__(self):
         return self
