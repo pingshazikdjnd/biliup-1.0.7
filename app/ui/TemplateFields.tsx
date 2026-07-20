@@ -99,6 +99,21 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
         <Form.Select.Option value="biliup-rs">biliup-rs</Form.Select.Option>
         <Form.Select.Option value="Noop">Noop</Form.Select.Option>
       </Form.Select>
+      <InputNumber
+        field="section_id"
+        label="合集节ID"
+        style={{ width: 250 }}
+        placeholder="填写后上传自动添加到合集"
+        extraText={
+          <div style={{ fontSize: 14 }}>
+            B站合集的节(section)ID，可从合集页面URL或API获取。
+            <br />
+            设置后，视频上传完成会自动添加到对应合集中。
+            <br />
+            留空则不添加到合集。
+          </div>
+        }
+      />
       <Switch field="no_reprint" label="自制声明" />
       <Switch field="is_only_self" label="仅自己可见" />
       <Form.Switch field="charging_pay" label="开启充电面板" />
