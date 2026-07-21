@@ -72,3 +72,21 @@ export function useTypeTree() {
     typeTree: treeData,
   };
 }
+
+export interface Season {
+  season_id: number;
+  title: string;
+  section_id: number;
+}
+
+export function useSeasons(userCookie: string | undefined) {
+  const { data, error, isLoading } = useSWR<Season[]>(
+    userCookie ? `/bili/seasons?user=${userCookie}` : null,
+    fetcher
+  );
+  return {
+    isLoading,
+    isError: error,
+    seasons: data,
+  };
+}

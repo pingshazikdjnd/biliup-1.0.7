@@ -193,6 +193,7 @@ export interface StudioEntity {
 	credits: Credit[];
 	uploader: string;
 	extra_fields?: string;
+	section_id?: number;
 }
 
 export interface LiveStreamerEntity {
