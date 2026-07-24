@@ -206,28 +206,7 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: 'wheels-*/*'
-  Release:
-    name: Release
-    runs-on: ubuntu-latest
-    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    # 注意：如果你之前已经删除了 macos 和 windows 的编译任务，请在此处的 needs 列表中同步移除它们，否则该任务会因为找不到依赖而卡死。
-    needs: [linux, musllinux, windows, macos, sdist] 
-    permissions:
-      # Use to sign the release artifacts
-      id-token: write
-      # Used to upload release artifacts (此处已自带所需的写入权限)
-      contents: write
-      # Used to generate artifact attestation
-      attestations: write
-    steps:
-      - uses: actions/download-artifact@v4
-      
-      - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: 'wheels-*/*'
-          
-      # 【核心修改区：将原有发往 PyPI 的步骤替换为发往 GitHub Releases】
+# 【核心修改区：将原有发往 PyPI 的步骤替换为发往 GitHub Releases】
       - name: Publish to GitHub Releases
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
