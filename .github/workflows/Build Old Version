@@ -1,0 +1,39 @@
+name: Build Old Version (1.0.7.002)
+
+on:
+  workflow_dispatch: # 允许你在网页端手动点击运行
+
+jobs:
+  build-old:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout OLD code
+        uses: actions/checkout@v4
+        with:
+          ref: '1.0.7.002'  # 【核心】：强行指定拉取这个旧标签的代码，不拉取最新代码
+          
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          
+      - name: Build frontend
+        run: |
+          npm install
+          npm run build
+          
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # 强制使用稳定版 Python，避开旧 CI 的 free-threaded 报错
+          
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: --release --out dist
+          manylinux: auto
+          
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: biliup-1.0.7.002-wheel
+          path: dist
