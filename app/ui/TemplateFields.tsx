@@ -23,7 +23,7 @@ import {
 } from '@douyinfe/semi-ui'
 import useSWR from 'swr'
 import { BiliType, fetcher, StudioEntity } from '../lib/api-streamer'
-import { useBiliUsers, useTypeTree } from '../lib/use-streamers'
+import { useBiliUsers, useSeasons, useTypeTree } from '../lib/use-streamers'
 
 const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>> = ({
   formState,
@@ -48,6 +48,11 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
   } = Form
   const { Text } = Typography
   const { typeTree, isError, isLoading } = useTypeTree()
+  const { seasons } = useSeasons(values.user_cookie)
+  const seasonList = seasons?.map(s => ({
+    value: s.section_id,
+    label: s.title,
+  })) ?? []
   const treeData = typeTree?.map((type: BiliType) => {
     return {
       ...type,
@@ -99,6 +104,20 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
         <Form.Select.Option value="biliup-rs">biliup-rs</Form.Select.Option>
         <Form.Select.Option value="Noop">Noop</Form.Select.Option>
       </Form.Select>
+      <Select
+        field="section_id"
+        label="添加到合集"
+        style={{ width: 250 }}
+        optionList={seasonList}
+        placeholder={!values.user_cookie ? '请先选择投稿账号' : (seasonList.length === 0 ? '该账号暂无合集' : '选择合集')}
+        showClear
+        disabled={!values.user_cookie}
+        extraText={
+          <div style={{ fontSize: 14 }}>
+            选择后，视频上传完成会自动添加到对应合集中。
+          </div>
+        }
+      />
       <Switch field="no_reprint" label="自制声明" />
       <Switch field="is_only_self" label="仅自己可见" />
       <Form.Switch field="charging_pay" label="开启充电面板" />

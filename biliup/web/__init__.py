@@ -549,6 +549,38 @@ async def pre_archive(request):
     return web.json_response({"status": 500, 'error': "无可用 cookie 文件"}, status=500)
 
 
+@routes.get('/bili/seasons')
+async def get_seasons(request):
+    """获取用户的合集列表，需要传入 user cookie 文件路径"""
+    file = request.query.get('user')
+    if not file:
+        return web.json_response({"status": 400, 'error': "缺少 user 参数"}, status=400)
+    try:
+        config.load_cookies(file)
+    except FileNotFoundError:
+        return web.json_response({"status": 500, 'error': f"{file} 文件不存在"}, status=500)
+    cookies = config.data.get('user', {}).get('cookies', {})
+    try:
+        bili = BiliBili.__class__(Data())
+        requests.utils.add_dict_to_cookiejar(bili._BiliBili__session.cookies, cookies)
+        seasons_data = bili.list_seasons()
+        result = []
+        for item in seasons_data.get('seasons', []):
+            season = item.get('season', {})
+            sections = item.get('sections', {}).get('sections', [])
+            section_id = sections[0]['id'] if sections else None
+            result.append({
+                'season_id': season.get('id'),
+                'title': season.get('title', ''),
+                'section_id': section_id,
+            })
+        bili.close()
+        return web.json_response(result)
+    except Exception as e:
+        logger.exception('get_seasons')
+        return web.json_response({"status": 500, 'error': str(e)}, status=500)
+
+
 @routes.get('/bili/space/myinfo')
 async def myinfo(request):
     file = request.query['user']
