@@ -1,7 +1,11 @@
 name: Build Old Version (1.0.7.002)
 
 on:
-  workflow_dispatch: # 允许你在网页端手动点击运行
+  workflow_dispatch:
+
+# 【核心新增】：赋予当前工作流修改 Release 的写入权限
+permissions:
+  contents: write 
 
 jobs:
   build-old:
@@ -10,7 +14,7 @@ jobs:
       - name: Checkout OLD code
         uses: actions/checkout@v4
         with:
-          ref: '1.0.7.002'  # 【核心】：强行指定拉取这个旧标签的代码，不拉取最新代码
+          ref: '1.0.7.002' 
           
       - uses: actions/setup-node@v3
         with:
@@ -23,7 +27,7 @@ jobs:
           
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # 强制使用稳定版 Python，避开旧 CI 的 free-threaded 报错
+          python-version: '3.11' 
           
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -32,8 +36,11 @@ jobs:
           args: --release --out dist
           manylinux: auto
           
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: biliup-1.0.7.002-wheel
-          path: dist
+      # 【核心替换】：不再打包成临时 Artifact，而是直接上传到现有的 Release
+      - name: Auto-upload to existing Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 调用 gh 命令行工具，将 dist 目录下的 .whl 文件上传至 1.0.7.002 标签对应的 Release
+          # --clobber 参数表示如果同名文件已存在则强制覆盖，防止报错
+          gh release upload 1.0.7.002 dist/*.whl --clobber
