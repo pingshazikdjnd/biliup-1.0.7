@@ -132,6 +132,7 @@ class UploadStreamers(BaseModel):
     up_close_reply: Mapped[int] = mapped_column(nullable=True)  # 关闭评论
     up_close_danmu: Mapped[int] = mapped_column(nullable=True)  # 精选评论
     extra_fields: Mapped[str] = mapped_column(nullable=True)  # 额外字段
+    section_id: Mapped[int] = mapped_column(nullable=True)  # 合集的节ID，设置后上传完成自动添加到对应合集
     livestreamers: Mapped[List["LiveStreamers"]] = relationship(back_populates="uploadstreamers")
 
 
