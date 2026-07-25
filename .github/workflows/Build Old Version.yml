@@ -1,0 +1,46 @@
+name: Build Old Version (1.0.7.002)
+
+on:
+  workflow_dispatch:
+
+# 【核心新增】：赋予当前工作流修改 Release 的写入权限
+permissions:
+  contents: write 
+
+jobs:
+  build-old:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout OLD code
+        uses: actions/checkout@v4
+        with:
+          ref: '1.0.7.002' 
+          
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          
+      - name: Build frontend
+        run: |
+          npm install
+          npm run build
+          
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' 
+          
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: --release --out dist
+          manylinux: auto
+          
+      # 【核心替换】：不再打包成临时 Artifact，而是直接上传到现有的 Release
+      - name: Auto-upload to existing Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 调用 gh 命令行工具，将 dist 目录下的 .whl 文件上传至 1.0.7.002 标签对应的 Release
+          # --clobber 参数表示如果同名文件已存在则强制覆盖，防止报错
+          gh release upload 1.0.7.002 dist/*.whl --clobber
