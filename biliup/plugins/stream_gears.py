@@ -2,6 +2,8 @@ import time
 
 import stream_gears
 from typing import List, Optional, Union
+import json
+import os
 
 from . import SubmitOption
 from ..engine import Plugin
@@ -15,7 +17,8 @@ class BiliWeb(UploadBase):
             copyright=2, postprocessor=None, dtime=None,
             dynamic='', lines='AUTO', threads=3, tid=122, tags=None, cover_path=None, description='',
             dolby=0, hires=0, no_reprint=0, charging_pay=0, credits=None,
-            user_cookie='cookies.json', copyright_source=None, extra_fields = ""
+            user_cookie='cookies.json', copyright_source=None, extra_fields = "",
+            section_id: Optional[int] = None,
     ):
         super().__init__(principal, data, persistence_path='bili.cookie', postprocessor=postprocessor)
         if credits is None:
@@ -49,6 +52,7 @@ class BiliWeb(UploadBase):
             self.extra_fields = self.data["extra_fields"]
         else:
             self.extra_fields = extra_fields
+        self.section_id = section_id
 
 
     def upload(self, file_list) -> List[UploadBase.FileInfo]:
@@ -103,6 +107,44 @@ class BiliWeb(UploadBase):
             submit=self.submit_api,
         )
         logger.info(f"上传成功: {self.principal}")
+
+        # 如果配置了 section_id，自动将视频添加到合集
+        if self.section_id:
+            try:
+                from .bili_webup import BiliBili, Data
+                video_data = Data()
+                with BiliBili(video_data) as bili:
+                    bili.login(self.persistence_path, self.user_cookie)
+                    # 通过"最近投稿"API获取刚刚上传的视频的aid
+                    arc_list = bili._BiliBili__session.get(
+                        'https://member.bilibili.com/x/web/archives',
+                        params={'pn': 1, 'ps': 5, 'status': 'is_pubing,pubed,not_pubed'},
+                        timeout=10
+                    ).json()
+                    if arc_list.get('code') == 0:
+                        archives = arc_list.get('data', {}).get('arc_audits', [])
+                        if archives:
+                            latest = archives[0]['Archive']
+                            aid = latest['aid']
+                            cid = latest['Videos'][0]['cid'] if latest.get('Videos') else None
+                            title = latest['title']
+                            if aid and cid:
+                                result = bili.add_to_season(self.section_id, [{
+                                    'aid': aid,
+                                    'cid': cid,
+                                    'title': title,
+                                    'charging_pay': 0,
+                                }])
+                                logger.info(f"已添加到合集(section_id={self.section_id}): {result}")
+                            else:
+                                logger.warning(f"获取到的视频信息不完整，无法添加到合集: aid={aid}, cid={cid}")
+                        else:
+                            logger.warning("未找到最近投稿的视频，无法添加到合集")
+                    else:
+                        logger.warning(f"查询最近投稿失败: {arc_list}")
+            except Exception as e:
+                logger.error(f"添加到合集失败(section_id={self.section_id}): {e}")
+
         return file_list
 
     def creditsToDesc_v2(self):
