@@ -107,6 +107,8 @@ class BiliWeb(UploadBase):
                         cookies_dict = {c["name"]: c["value"] for c in cookie_data.get("cookie_info", {}).get("cookies", [])}
                         import requests
                         requests.utils.add_dict_to_cookiejar(bili._BiliBili__session.cookies, cookies_dict)
+                        # 手动给 __bili_jct 赋值，否则 add_to_season 时发送的 csrf 是 None
+                        bili._BiliBili__bili_jct = cookies_dict.get("bili_jct")
 
                     import time
                     print(f"[Biliup合集插件] 准备将视频加入合集 ID: {self.section_id}")
