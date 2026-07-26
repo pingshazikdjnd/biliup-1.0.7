@@ -1,91 +1,167 @@
-name: Build Termux Wheel to Release
+name: Docker
 
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
+  push:
+    # Publish `master` as Docker `latest` image.
+    branches:
+      - master
+
+    # Publish `v1.2.3` tags as releases.
+    tags:
+      - v*
+
+  # Run tests for any PRs.
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/biliup/caution
 
 jobs:
-  build:
-    permissions:
-      contents: write
+  # Run tests.
+  # See also https://docs.docker.com/docker-hub/builds/automated-testing/
+  test:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      
-      - uses: actions/setup-node@v3
+
+      - name: Get PR number, repo URL, and branch name
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            pr_number=$(jq -r .number < "$GITHUB_EVENT_PATH")
+            repo_url=$(jq -r .pull_request.head.repo.clone_url < "$GITHUB_EVENT_PATH")
+            branch_name=$GITHUB_HEAD_REF
+          else
+            pr_number=""
+            repo_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY
+            branch_name="master"
+          fi
+          echo "PR_NUMBER=$pr_number" >> $GITHUB_ENV
+          echo "REPO_URL=$repo_url" >> $GITHUB_ENV
+          echo "BRANCH_NAME=$branch_name" >> $GITHUB_ENV
+
+      - name: Run tests
+        run: |
+          if [ -f docker-compose.test.yml ]; then
+            docker-compose --file docker-compose.test.yml build
+            docker-compose --file docker-compose.test.yml run sut
+          else
+            docker build \
+              --build-arg repo_url=$REPO_URL \
+              --build-arg branch_name=$BRANCH_NAME \
+              . --file Dockerfile
+          fi
+
+
+  build:
+    needs: test
+    name: Build for ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
         with:
-          node-version: '20'
-          
-      - name: Build frontend
-        run: |
-          npm install
-          npm run build
+          driver-opts: network=host
+          install: true
 
-      # 1. 动态获取 Termux 上的 Python 版本 (例如 3.11)
-      - name: Get Termux Python Info
-        id: termux-python
-        run: |
-          BASE_URL="https://packages.termux.dev/apt/termux-main/pool/main/p/python"
-          FNAME=$(curl -s "$BASE_URL/" | grep -oP '(?<=href=")python_[^"]+_aarch64\.deb' | head -n 1)
-          TERMUX_PY_VER=$(echo $FNAME | grep -oP '\d+\.\d+' | head -n 1)
-          
-          echo "filename=$FNAME" >> $GITHUB_OUTPUT
-          echo "version=$TERMUX_PY_VER" >> $GITHUB_OUTPUT
-          echo "Detected Termux Python version: $TERMUX_PY_VER"
-
-      # 2. 将 Actions 主机的 Python 版本锁定为与 Termux 一致
-      - uses: actions/setup-python@v5
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          python-version: ${{ steps.termux-python.outputs.version }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Android NDK
-        uses: nttld/setup-ndk@v1
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          ndk-version: r26d
+          images: ${{ env.IMAGE_NAME }}
 
-      - name: Install dependencies and Android target
-        run: |
-          pip install maturin
-          rustup target add aarch64-linux-android
-
-      - name: Set up CPython interpreter for cross-compilation
-        run: |
-          BASE_URL="https://packages.termux.dev/apt/termux-main/pool/main/p/python"
-          # 使用前面获取的文件名
-          FNAME="${{ steps.termux-python.outputs.filename }}"
-          wget -nv "$BASE_URL/$FNAME"
-          
-          mkdir termux_python
-          dpkg-deb -x $FNAME termux_python
-          cp -a termux_python/data/data/com.termux/files/usr/lib/libpython* $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/24
-          
-          sed -i 's/"abi3-py38",\? *//g' crates/stream-gears/Cargo.toml
-          sed -i '/dependencies = \[/a\    "quickjs >= 1.19.4",' pyproject.toml
-          sed -i 's/aiohttp\[speedups\] >= 3\.9\.5/aiohttp[speedups] <= 3.9.5/' pyproject.toml
-
-      - name: Build wheel for aarch64 (Termux)
-        run: |
-          export NDK_BIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
-          export CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android24-clang
-          export AR_aarch64_linux_android=$NDK_BIN/llvm-ar
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android24-clang
-          
-          # 3. 使用绝对路径并明确告诉 PyO3 我们在为哪个版本的 Python 编译
-          export PYO3_CROSS_LIB_DIR=${{ github.workspace }}/termux_python/data/data/com.termux/files/usr/lib
-          export PYO3_CROSS_INCLUDE_DIR=${{ github.workspace }}/termux_python/data/data/com.termux/files/usr/include/python${{ steps.termux-python.outputs.version }}
-          export PYO3_CROSS_PYTHON_VERSION=${{ steps.termux-python.outputs.version }}
-          
-          maturin build \
-            --release \
-            --strip \
-            --manylinux off \
-            --target aarch64-linux-android \
-            --out dist
-
-      - name: Upload wheel to release
-        uses: softprops/action-gh-release@v2
+      - name: Build and push by digest
+        id: build-and-push
+        uses: docker/build-push-action@v6
         with:
-          files: dist/*.whl
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: false
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build-and-push.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Generate artifact name
+        id: artifact-name
+        run: |
+          # Use bash parameter expansion to replace '/' with '-' in platform name
+          SAFE_PLATFORM="${{ matrix.platform }}"
+          SAFE_PLATFORM="${SAFE_PLATFORM//\//-}"
+          echo "name=digests-${SAFE_PLATFORM}" >> $GITHUB_OUTPUT
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge and tag manifest
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
