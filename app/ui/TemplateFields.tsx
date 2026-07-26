@@ -48,11 +48,22 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
   } = Form
   const { Text } = Typography
   const { typeTree, isError, isLoading } = useTypeTree()
-  const { seasons } = useSeasons(values.user_cookie)
-  const seasonList = seasons?.map(s => ({
-    value: s.section_id,
-    label: s.title,
-  })) ?? []
+  const { seasons, isLoading: seasonsLoading } = useSeasons(values.user_cookie)
+  const seasonOptions = useMemo(() => {
+    const list = seasons?.map(s => ({
+      value: s.section_id,
+      label: s.title,
+    })) ?? []
+    // 如果有已保存的 section_id 但选项列表里没有匹配项（正在加载中），
+    // 添加一个临时选项保证回显
+    if (values.section_id && !list.find(item => item.value === values.section_id)) {
+      list.unshift({
+        value: values.section_id,
+        label: seasonsLoading ? '加载中...' : `合集 (ID: ${values.section_id})`,
+      })
+    }
+    return list
+  }, [seasons, values.section_id, seasonsLoading])
   const treeData = typeTree?.map((type: BiliType) => {
     return {
       ...type,
@@ -108,8 +119,8 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
         field="section_id"
         label="添加到合集"
         style={{ width: 250 }}
-        optionList={seasonList}
-        placeholder={!values.user_cookie ? '请先选择投稿账号' : (seasonList.length === 0 ? '该账号暂无合集' : '选择合集')}
+        optionList={seasonOptions}
+        placeholder={!values.user_cookie ? '请先选择投稿账号' : (seasonsLoading ? '加载合集中...' : (seasonOptions.length === 0 ? '该账号暂无合集' : '选择合集'))}
         showClear
         disabled={!values.user_cookie}
         extraText={
