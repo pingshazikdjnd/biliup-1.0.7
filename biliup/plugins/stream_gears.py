@@ -121,33 +121,54 @@ class BiliWeb(UploadBase):
                         import requests
                         requests.utils.add_dict_to_cookiejar(bili._BiliBili__session.cookies, cookies_dict)
                     
-                    # 通过"最近投稿"API获取刚刚上传的视频的aid
-                    arc_list = bili._BiliBili__session.get(
-                        'https://member.bilibili.com/x/web/archives',
-                        params={'pn': 1, 'ps': 5, 'status': 'is_pubing,pubed,not_pubed'},
-                        timeout=10
-                    ).json()
-                    if arc_list.get('code') == 0:
-                        archives = arc_list.get('data', {}).get('arc_audits', [])
-                        if archives:
-                            latest = archives[0]['Archive']
-                            aid = latest['aid']
-                            cid = latest['Videos'][0]['cid'] if latest.get('Videos') else None
-                            title = latest['title']
-                            if aid and cid:
-                                result = bili.add_to_season(self.section_id, [{
-                                    'aid': aid,
-                                    'cid': cid,
-                                    'title': title,
-                                    'charging_pay': 0,
-                                }])
-                                logger.info(f"已添加到合集(section_id={self.section_id}): {result}")
+                    import time
+                    print(f"[Biliup合集插件] 准备将视频加入合集 ID: {self.section_id}")
+                    
+                    # B站服务器处理有延迟，增加循环重试机制，最多查 5 次，每次等 5 秒
+                    aid = None
+                    cid = None
+                    title = None
+                    for i in range(5):
+                        time.sleep(5)
+                        print(f"[Biliup合集插件] 第 {i+1} 次尝试获取最近投稿列表...")
+                        arc_list = bili._BiliBili__session.get(
+                            'https://member.bilibili.com/x/web/archives',
+                            params={'pn': 1, 'ps': 5, 'status': 'is_pubing,pubed,not_pubed'},
+                            timeout=10
+                        ).json()
+                        
+                        if arc_list.get('code') == 0:
+                            archives = arc_list.get('data', {}).get('arc_audits', [])
+                            if archives:
+                                latest = archives[0]['Archive']
+                                # 为了防止拿到的是上一期老视频，我们必须验证一下（这里假设最新查出来的就是刚才上传的）
+                                aid = latest['aid']
+                                cid = archives[0].get('Videos', [{}])[0].get('cid')
+                                title = latest['title']
+                                print(f"[Biliup合集插件] 查到了最新投稿: {title} (aid: {aid}, cid: {cid})")
+                                break
                             else:
-                                logger.warning(f"获取到的视频信息不完整，无法添加到合集: aid={aid}, cid={cid}")
+                                print("[Biliup合集插件] 投稿列表为空，继续等待...")
                         else:
-                            logger.warning("未找到最近投稿的视频，无法添加到合集")
+                            print(f"[Biliup合集插件] 查询投稿列表接口报错: {arc_list}")
+                            
+                    if aid and cid:
+                        try:
+                            print(f"[Biliup合集插件] 正在提交合集添加请求 (aid: {aid})...")
+                            res = bili.add_to_season(self.section_id, [{
+                                'aid': aid,
+                                'cid': cid,
+                                'title': title,
+                                'charging_pay': 0
+                            }])
+                            print(f"[Biliup合集插件] B站返回合集添加结果: {res}")
+                            logger.info(f"添加到合集成功: {res}")
+                        except Exception as e:
+                            print(f"[Biliup合集插件] 添加到合集遇到异常报错: {e}")
+                            logger.warning(f"添加到合集失败: {e}")
                     else:
-                        logger.warning(f"查询最近投稿失败: {arc_list}")
+                        print("[Biliup合集插件] 严重警告：等待了 25 秒仍未在 B 站查到刚上传的视频，放弃添加合集！")
+                        logger.warning("未找到最近的投稿，无法自动添加到合集")
             except Exception as e:
                 logger.error(f"添加到合集失败(section_id={self.section_id}): {e}")
 
