@@ -114,7 +114,13 @@ class BiliWeb(UploadBase):
                 from .bili_webup import BiliBili, Data
                 video_data = Data()
                 with BiliBili(video_data) as bili:
-                    bili.login(self.persistence_path, self.user_cookie)
+                    # 手动解析 biliup-rs 的 cookie 格式并注入 session，绕过旧版 bili.login 的格式不兼容问题
+                    with open(self.user_cookie, encoding='utf-8') as f:
+                        cookie_data = json.load(f)
+                        cookies_dict = {c["name"]: c["value"] for c in cookie_data.get("cookie_info", {}).get("cookies", [])}
+                        import requests
+                        requests.utils.add_dict_to_cookiejar(bili._BiliBili__session.cookies, cookies_dict)
+                    
                     # 通过"最近投稿"API获取刚刚上传的视频的aid
                     arc_list = bili._BiliBili__session.get(
                         'https://member.bilibili.com/x/web/archives',
