@@ -113,11 +113,12 @@ class BiliWeb(UploadBase):
                     import time
                     print(f"[Biliup合集插件] 准备将视频加入合集 ID: {self.section_id}")
                     
-                    # 循环重试机制，应对B站处理延迟
+                    target_title = self.data["format_title"][:80]
                     aid = None
                     cid = None
                     title = None
-                    for i in range(5):
+                    
+                    for i in range(12): # 最多等待 1 分钟 (12 * 5s)
                         time.sleep(5)
                         print(f"[Biliup合集插件] 第 {i+1} 次尝试获取最近投稿列表...")
                         arc_list = bili._BiliBili__session.get(
@@ -130,8 +131,15 @@ class BiliWeb(UploadBase):
                             archives = arc_list.get('data', {}).get('arc_audits', [])
                             if archives:
                                 latest = archives[0]['Archive']
+                                fetched_title = latest['title']
+                                
+                                # 校验名字，防止拉取到以前的老视频
+                                if fetched_title != target_title:
+                                    print(f"[Biliup合集插件] 最新视频是旧投稿({fetched_title})，目标视频({target_title})尚未出现在列表中，继续等待...")
+                                    continue
+                                    
                                 aid = latest['aid']
-                                title = latest['title']
+                                title = fetched_title
                                 
                                 # B站新版接口中，刚上传的视频 Videos 可能为空，但 cid_list 会立刻返回
                                 cid_list = archives[0].get('cid_list')
@@ -142,10 +150,10 @@ class BiliWeb(UploadBase):
                                 elif videos and len(videos) > 0:
                                     cid = videos[0].get('cid')
                                 else:
-                                    print("[Biliup合集插件] 投稿已出现，但暂未拿到 cid 信息，继续等待...")
+                                    print("[Biliup合集插件] 目标视频已出现，但暂未拿到 cid 信息，继续等待...")
                                     continue
                                     
-                                print(f"[Biliup合集插件] 查到了最新投稿: {title} (aid: {aid}, cid: {cid})")
+                                print(f"[Biliup合集插件] 查到了目标投稿: {title} (aid: {aid}, cid: {cid})")
                                 break
                             else:
                                 print("[Biliup合集插件] 投稿列表为空，继续等待...")
@@ -154,6 +162,11 @@ class BiliWeb(UploadBase):
                             
                     if aid and cid:
                         try:
+                            # 加上伪装防拦截头，防止 B 站 WAF 报 csrf 失败
+                            bili._BiliBili__session.headers.update({
+                                'Origin': 'https://member.bilibili.com',
+                                'Referer': 'https://member.bilibili.com/platform/upload-manager/article'
+                            })
                             print(f"[Biliup合集插件] 正在提交合集添加请求 (aid: {aid})...")
                             res = bili.add_to_season(self.section_id, [{
                                 'aid': aid,
