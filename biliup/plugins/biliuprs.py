@@ -54,10 +54,6 @@ class BiliWeb(UploadBase):
             self.extra_fields = extra_fields
 
     def upload(self, file_list: List[UploadBase.FileInfo]) -> List[UploadBase.FileInfo]:
-        # 记录上传开始前的时间（减去5分钟容差，防止服务器时间偏差）
-        import time
-        self.upload_start_time = int(time.time()) - 300
-        
         if self.credits:
             desc_v2 = self.creditsToDesc_v2()
         else:
@@ -118,6 +114,10 @@ class BiliWeb(UploadBase):
                     print(f"[Biliup合集插件] 准备将视频加入合集 ID: {self.section_id}")
                     
                     target_title = self.data["format_title"][:80]
+                    # 记录此时的时间戳。由于 biliup-rs 刚刚投稿完毕，B站生成的 ctime 绝不可能早于当前时间太久
+                    # 我们减去 120 秒容差以防止本地与服务器时间误差
+                    valid_ctime_threshold = int(time.time()) - 120
+                    
                     aid = None
                     cid = None
                     title = None
@@ -139,8 +139,8 @@ class BiliWeb(UploadBase):
                                 fetched_ctime = latest.get('ctime', 0)
                                 
                                 # 校验名字和创建时间，防止拉取到以前的老视频（同名视频）
-                                if fetched_title != target_title or fetched_ctime < self.upload_start_time:
-                                    print(f"[Biliup合集插件] 最新视频是旧投稿({fetched_title}, ctime:{fetched_ctime})，目标视频({target_title}, ctime应大于{self.upload_start_time})尚未出现在列表中，继续等待...")
+                                if fetched_title != target_title or fetched_ctime < valid_ctime_threshold:
+                                    print(f"[Biliup合集插件] 查到的最新视频是旧投稿({fetched_title}, ctime:{fetched_ctime})，而目标新稿件(ctime应大于{valid_ctime_threshold})暂未出现在列表中，继续等待...")
                                     continue
                                     
                                 aid = latest['aid']
