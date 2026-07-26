@@ -54,6 +54,10 @@ class BiliWeb(UploadBase):
             self.extra_fields = extra_fields
 
     def upload(self, file_list: List[UploadBase.FileInfo]) -> List[UploadBase.FileInfo]:
+        # 记录上传开始前的时间（减去5分钟容差，防止服务器时间偏差）
+        import time
+        self.upload_start_time = int(time.time()) - 300
+        
         if self.credits:
             desc_v2 = self.creditsToDesc_v2()
         else:
@@ -132,10 +136,11 @@ class BiliWeb(UploadBase):
                             if archives:
                                 latest = archives[0]['Archive']
                                 fetched_title = latest['title']
+                                fetched_ctime = latest.get('ctime', 0)
                                 
-                                # 校验名字，防止拉取到以前的老视频
-                                if fetched_title != target_title:
-                                    print(f"[Biliup合集插件] 最新视频是旧投稿({fetched_title})，目标视频({target_title})尚未出现在列表中，继续等待...")
+                                # 校验名字和创建时间，防止拉取到以前的老视频（同名视频）
+                                if fetched_title != target_title or fetched_ctime < self.upload_start_time:
+                                    print(f"[Biliup合集插件] 最新视频是旧投稿({fetched_title}, ctime:{fetched_ctime})，目标视频({target_title}, ctime应大于{self.upload_start_time})尚未出现在列表中，继续等待...")
                                     continue
                                     
                                 aid = latest['aid']
