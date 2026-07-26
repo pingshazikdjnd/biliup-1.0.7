@@ -127,14 +127,22 @@ class BiliWeb(UploadBase):
                         if arc_list.get('code') == 0:
                             archives = arc_list.get('data', {}).get('arc_audits', [])
                             if archives:
-                                videos = archives[0].get('Videos')
-                                if not videos:
-                                    print("[Biliup合集插件] 投稿已出现，但B站暂未生成视频分P信息(Videos为空)，继续等待...")
-                                    continue
                                 latest = archives[0]['Archive']
                                 aid = latest['aid']
-                                cid = videos[0].get('cid')
                                 title = latest['title']
+                                
+                                # B站新版接口中，刚上传的视频 Videos 可能为空，但 cid_list 会立刻返回
+                                cid_list = archives[0].get('cid_list')
+                                videos = archives[0].get('Videos')
+                                
+                                if cid_list and len(cid_list) > 0:
+                                    cid = cid_list[0]
+                                elif videos and len(videos) > 0:
+                                    cid = videos[0].get('cid')
+                                else:
+                                    print("[Biliup合集插件] 投稿已出现，但暂未拿到 cid 信息，继续等待...")
+                                    continue
+                                    
                                 print(f"[Biliup合集插件] 查到了最新投稿: {title} (aid: {aid}, cid: {cid})")
                                 break
                             else:
