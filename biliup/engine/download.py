@@ -93,6 +93,30 @@ class DownloadBase(ABC):
         raise NotImplementedError()
 
     def should_record(self):
+        # 检查磁盘硬水位
+        try:
+            disk_stop_threshold_gb = float(config.get('disk_stop_threshold_gb', 0) or 0)
+        except (ValueError, TypeError):
+            disk_stop_threshold_gb = 0.0
+
+        if disk_stop_threshold_gb > 0:
+            free_bytes = shutil.disk_usage('.').free
+            threshold_bytes = disk_stop_threshold_gb * 1024 * 1024 * 1024
+            if free_bytes < threshold_bytes:
+                free_gb = free_bytes / (1024 ** 3)
+                logger.error(
+                    f"{self.plugin_msg}: 磁盘剩余空间 ({free_gb:.2f} GB) 低于硬水位阈值 ({disk_stop_threshold_gb} GB)，"
+                    f"暂停新开录制以保护系统文件"
+                )
+                from biliup.common.notify import send_notification
+                send_notification(
+                    title=f"biliup 磁盘硬水位告警: {self.fname}",
+                    content=f"主播: {self.fname}\nURL: {self.url}\n磁盘剩余空间 ({free_gb:.2f} GB) 低于硬水位阈值 ({disk_stop_threshold_gb} GB)，已暂停新开录制。",
+                    streamer_name=self.fname,
+                    error_type="disk_stop_threshold_reached"
+                )
+                return False
+
         # 检查房间名
         keywords = config['streamers'].get(self.fname, {}).get('excluded_keywords')
         if self.room_title and keywords:
@@ -391,6 +415,23 @@ class DownloadBase(ABC):
 
             # 最后一次下载完成时间
             end_time = time.localtime()
+
+            # 每段录制完成后、进入下一轮循环前，检测磁盘软水位
+            try:
+                disk_upload_threshold_gb = float(config.get('disk_upload_threshold_gb', 0) or 0)
+            except (ValueError, TypeError):
+                disk_upload_threshold_gb = 0.0
+
+            if disk_upload_threshold_gb > 0:
+                free_bytes = shutil.disk_usage('.').free
+                threshold_bytes = disk_upload_threshold_gb * 1024 * 1024 * 1024
+                if free_bytes < threshold_bytes:
+                    free_gb = free_bytes / (1024 ** 3)
+                    logger.warning(
+                        f"{self.plugin_msg}: 磁盘剩余空间 ({free_gb:.2f} GB) 低于软水位阈值 ({disk_upload_threshold_gb} GB)，"
+                        f"提前结束本轮录制会话以立即触发上传与清理"
+                    )
+                    break
 
         self.download_cover(
             time.strftime(self.gen_download_filename().encode("unicode-escape").decode(), end_time if end_time else time.localtime()
