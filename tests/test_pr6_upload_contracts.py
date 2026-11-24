@@ -205,6 +205,11 @@ class TestPR6UploadContracts(unittest.IsolatedAsyncioTestCase):
                         'Videos': [],
                     },
                     {
+                        'Archive': {'aid': 1004, 'title': 'My Stream Title', 'ctime': now_ts - 8},
+                        'cid_list': [],
+                        'Videos': [{}],
+                    },
+                    {
                         'Archive': {'aid': 1003, 'title': 'My Stream Title', 'ctime': now_ts - 5},
                         'cid_list': [2003],
                         'Videos': [],
@@ -386,23 +391,38 @@ class TestPR6UploadContracts(unittest.IsolatedAsyncioTestCase):
             'lines': 'qn',
             'threads': 6,
             'submit_api': 'client',
+            'description': 'global desc',
+            'dynamic': 'global dyn',
             'dolby': 1,
             'hires': 1,
             'no_reprint': 1,
             'charging_pay': 1,
             'is_only_self': 1,
         })
-        app_mod.context['upload_filename'] = ['dir/busy']
+        busy_key = os.path.normpath('dir/busy')
+        app_mod.context['upload_filename'] = [busy_key]
 
         captured = {}
 
         class FakeManualPlugin:
-            def __init__(self, index, data, lines='AUTO', threads=3, submit_api='web', **kwargs):
+            def __init__(
+                self,
+                index,
+                data,
+                lines='AUTO',
+                threads=3,
+                submit_api='web',
+                description='default desc',
+                dynamic='default dyn',
+                **kwargs,
+            ):
                 captured['index'] = index
                 captured['data'] = dict(data)
                 captured['lines'] = lines
                 captured['threads'] = threads
                 captured['submit_api'] = submit_api
+                captured['description'] = description
+                captured['dynamic'] = dynamic
 
             def upload(self, file_list):
                 captured['files'] = list(file_list)
@@ -417,29 +437,33 @@ class TestPR6UploadContracts(unittest.IsolatedAsyncioTestCase):
             'lines': '',
             'threads': None,
             'submit_api': '',
+            'description': '',
+            'dynamic': '',
         }
-        expected_free = UploadBase.FileInfo(video='dir/free.mp4', danmaku=None)
+        expected_free = UploadBase.FileInfo(video='./free.mp4', danmaku=None)
         with patch.dict(uploader_mod.Plugin.upload_plugins, {'fake_manual': FakeManualPlugin}):
-            res = uploader_mod.biliup_uploader(['dir/busy.mp4', 'dir/free.mp4', 'dir/free.mkv'], dict(params))
+            res = uploader_mod.biliup_uploader(['dir/busy.mp4', './free.mp4', 'free.mkv'], dict(params))
             self.assertEqual(res, [expected_free])
             self.assertIsInstance(captured['files'][0], UploadBase.FileInfo)
             self.assertEqual(captured['lines'], 'qn')
             self.assertEqual(captured['threads'], 6)
             self.assertEqual(captured['submit_api'], 'client')
+            self.assertEqual(captured['description'], '')
+            self.assertEqual(captured['dynamic'], '')
             self.assertEqual(captured['data']['dolby'], 1)
             self.assertEqual(json.loads(captured['data']['extra_fields']), {'is_only_self': 1})
-            self.assertEqual(captured['locked_during_upload'], ['dir/busy', 'dir/free'])
-            self.assertEqual(app_mod.context['upload_filename'], ['dir/busy'])
+            self.assertEqual(captured['locked_during_upload'], [busy_key, 'free'])
+            self.assertEqual(app_mod.context['upload_filename'], [busy_key])
 
             # 异常后也要清理本次注册的锁文件，保留原有 locked 文件
             res_err = uploader_mod.biliup_uploader(['dir/boom.mp4'], dict(params))
             self.assertIsNone(res_err)
-            self.assertEqual(app_mod.context['upload_filename'], ['dir/busy'])
+            self.assertEqual(app_mod.context['upload_filename'], [busy_key])
 
     def test_upload_base_start_skips_file_concurrently_claimed_before_lock(self):
         app_mod.context['upload_filename'] = []
-        file_claimed = UploadBase.FileInfo(video='dir/race.mp4', danmaku=None)
-        file_ok = UploadBase.FileInfo(video='dir/ok.mp4', danmaku=None)
+        file_claimed = UploadBase.FileInfo(video='./race.mp4', danmaku=None)
+        file_ok = UploadBase.FileInfo(video='ok.mp4', danmaku=None)
         seen_uploads = []
 
         class RaceUploader(UploadBase):
@@ -448,8 +472,8 @@ class TestPR6UploadContracts(unittest.IsolatedAsyncioTestCase):
                 return file_list
 
         def _fake_file_list(index):
-            # 模拟 file_list 扫描完成后、start() 进锁占位前，手动上传并发占用了 race.mp4
-            app_mod.context['upload_filename'].append('dir/race')
+            # 模拟 file_list 扫描完成后、start() 进锁占位前，手动上传并发占用了 race.mp4（不同路径写法）
+            app_mod.context['upload_filename'].append('race')
             return [file_claimed, file_ok]
 
         up = RaceUploader('race_streamer', {'format_title': 'race_title'})
@@ -458,7 +482,7 @@ class TestPR6UploadContracts(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(res, [file_ok])
         self.assertEqual(seen_uploads, [[file_ok]])
-        self.assertEqual(app_mod.context['upload_filename'], ['dir/race'])
+        self.assertEqual(app_mod.context['upload_filename'], ['race'])
 
 
 if __name__ == '__main__':

@@ -193,7 +193,7 @@ class UploadBase:
                     current = event_manager.context.setdefault('upload_filename', [])
                     in_flight = set(current)
                     for f in file_list:
-                        base_name = os.path.splitext(f.video)[0]
+                        base_name = os.path.normpath(os.path.splitext(f.video)[0])
                         if base_name in in_flight:
                             logger.debug(f'文件 {f.video} 已在上传队列中，跳过重复上传')
                             continue

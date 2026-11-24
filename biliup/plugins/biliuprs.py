@@ -176,14 +176,17 @@ class BiliWeb(UploadBase):
                                     cid_list = entry.get('cid_list')
                                     videos = entry.get('Videos')
 
+                                    candidate_cid = None
                                     if cid_list and len(cid_list) > 0:
-                                        matched_cid = cid_list[0]
+                                        candidate_cid = cid_list[0]
                                     elif videos and len(videos) > 0:
-                                        matched_cid = videos[0].get('cid')
-                                    else:
+                                        candidate_cid = videos[0].get('cid')
+
+                                    if not candidate_cid:
                                         print("[Biliup合集插件] 目标视频已出现，但暂未拿到 cid 信息，继续等待...")
                                         continue
 
+                                    matched_cid = candidate_cid
                                     matched_entry = archive_info
                                     break
 

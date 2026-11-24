@@ -10,6 +10,7 @@ from .engine.decorators import Plugin
 from .engine.upload import UploadBase
 
 logger = logging.getLogger('biliup')
+_INHERIT_IF_EMPTY_KEYS = frozenset({'lines', 'threads', 'submit_api', 'uploader', 'user_cookie'})
 
 def merge_dict(*dicts):
     """
@@ -76,7 +77,14 @@ def biliup_uploader(filelist, data):
         from .app import context as app_context
         index = data['name']
         data, fmt_ctx = fmt_title_and_desc_m(data)
-        context = {**config, **{k: v for k, v in fmt_ctx.items() if v is not None and v != ''}}
+        context = {
+            **config,
+            **{
+                k: v
+                for k, v in fmt_ctx.items()
+                if v is not None and not (v == '' and k in _INHERIT_IF_EMPTY_KEYS)
+            },
+        }
         platform = context.get("uploader") if context.get("uploader") else "biliup-rs"
         cls = Plugin.upload_plugins.get(platform)
         if cls is None:
@@ -96,7 +104,7 @@ def biliup_uploader(filelist, data):
             seen = set(upload_filename_list)
             for f in filelist:
                 raw_path = f.video if hasattr(f, 'video') else str(f)
-                file_base = os.path.splitext(raw_path)[0]
+                file_base = os.path.normpath(os.path.splitext(raw_path)[0])
                 if file_base in seen:
                     logger.warning(f"文件 {raw_path} 正在上传中，跳过重复上传")
                     continue
@@ -114,7 +122,7 @@ def biliup_uploader(filelist, data):
         kwargs = {}
         for k in sig.parameters:
             v = context.get(k)
-            if v is not None and v != '':
+            if v is not None and not (v == '' and k in _INHERIT_IF_EMPTY_KEYS):
                 kwargs[k] = v
         logger.info("start biliup")
         return cls(index, data, **kwargs).upload(active_files)
