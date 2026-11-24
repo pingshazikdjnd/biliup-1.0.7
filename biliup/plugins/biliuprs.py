@@ -16,7 +16,8 @@ class BiliWeb(UploadBase):
             copyright=2, postprocessor=None, dtime=None,
             dynamic='', lines='AUTO', threads=3, tid=122, tags=None, cover_path=None, description='',
             dolby=0, hires=0, no_reprint=0, is_only_self=0, charging_pay=0, credits=None,
-            user_cookie='cookies.json', copyright_source=None, extra_fields = "", section_id=None
+            user_cookie='cookies.json', copyright_source=None, extra_fields = "", section_id=None,
+            up_close_reply=0, up_selection_reply=0, up_close_danmu=0
     ):
         super().__init__(principal, data, persistence_path='bili.cookie', postprocessor=postprocessor)
         self.section_id = section_id
@@ -45,6 +46,9 @@ class BiliWeb(UploadBase):
         self.no_reprint = no_reprint
         self.is_only_self = is_only_self
         self.charging_pay = charging_pay
+        self.up_close_reply = bool(up_close_reply)
+        self.up_selection_reply = bool(up_selection_reply)
+        self.up_close_danmu = bool(up_close_danmu)
         self.user_cookie = user_cookie
         self.copyright_source = copyright_source
 
@@ -83,6 +87,9 @@ class BiliWeb(UploadBase):
                 "lossless_music": self.hires,
                 "no_reprint": self.no_reprint,
                 "charging_pay": self.charging_pay,
+                "up_close_reply": self.up_close_reply,
+                "up_selection_reply": self.up_selection_reply,
+                "up_close_danmu": self.up_close_danmu,
                 "limit": self.threads,
                 "desc_v2": desc_v2,
                 "extra_fields": self.extra_fields,
@@ -131,7 +138,6 @@ class BiliWeb(UploadBase):
                         # 手动给 __bili_jct 赋值，否则 add_to_season 时发送的 csrf 是 None
                         bili._BiliBili__bili_jct = cookies_dict.get("bili_jct")
 
-                    import time
                     print(f"[Biliup合集插件] 准备将视频加入合集 ID: {self.section_id}")
                     
                     target_title = self.data["format_title"][:80]
@@ -155,32 +161,45 @@ class BiliWeb(UploadBase):
                         if arc_list.get('code') == 0:
                             archives = arc_list.get('data', {}).get('arc_audits', [])
                             if archives:
-                                latest = archives[0]['Archive']
-                                fetched_title = latest['title']
-                                fetched_ctime = latest.get('ctime', 0)
-                                
-                                # 校验名字和创建时间，防止拉取到以前的老视频（同名视频）
-                                if fetched_title != target_title or fetched_ctime < valid_ctime_threshold:
-                                    print(f"[Biliup合集插件] 查到的最新视频是旧投稿({fetched_title}, ctime:{fetched_ctime})，而目标新稿件(ctime应大于{valid_ctime_threshold})暂未出现在列表中，继续等待...")
-                                    continue
-                                    
-                                aid = latest['aid']
-                                title = fetched_title
-                                
-                                # B站新版接口中，刚上传的视频 Videos 可能为空，但 cid_list 会立刻返回
-                                cid_list = archives[0].get('cid_list')
-                                videos = archives[0].get('Videos')
-                                
-                                if cid_list and len(cid_list) > 0:
-                                    cid = cid_list[0]
-                                elif videos and len(videos) > 0:
-                                    cid = videos[0].get('cid')
+                                matched_entry = None
+                                matched_cid = None
+                                for entry in archives:
+                                    archive_info = entry.get('Archive', {})
+                                    fetched_title = archive_info.get('title')
+                                    fetched_ctime = archive_info.get('ctime', 0)
+
+                                    # 校验名字和创建时间，防止拉取到以前的老视频（同名视频）
+                                    if fetched_title != target_title or fetched_ctime < valid_ctime_threshold:
+                                        continue
+
+                                    # B站新版接口中，刚上传的视频 Videos 可能为空，但 cid_list 会立刻返回
+                                    cid_list = entry.get('cid_list')
+                                    videos = entry.get('Videos')
+
+                                    if cid_list and len(cid_list) > 0:
+                                        matched_cid = cid_list[0]
+                                    elif videos and len(videos) > 0:
+                                        matched_cid = videos[0].get('cid')
+                                    else:
+                                        print("[Biliup合集插件] 目标视频已出现，但暂未拿到 cid 信息，继续等待...")
+                                        continue
+
+                                    matched_entry = archive_info
+                                    break
+
+                                if matched_entry and matched_cid:
+                                    aid = matched_entry['aid']
+                                    title = matched_entry['title']
+                                    cid = matched_cid
+                                    print(f"[Biliup合集插件] 查到了目标投稿: {title} (aid: {aid}, cid: {cid})")
+                                    break
                                 else:
-                                    print("[Biliup合集插件] 目标视频已出现，但暂未拿到 cid 信息，继续等待...")
-                                    continue
-                                    
-                                print(f"[Biliup合集插件] 查到了目标投稿: {title} (aid: {aid}, cid: {cid})")
-                                break
+                                    latest_info = archives[0].get('Archive', {})
+                                    print(
+                                        f"[Biliup合集插件] 前 {len(archives)} 条投稿暂未命中目标新稿件"
+                                        f"(最新一条: {latest_info.get('title')}, ctime:{latest_info.get('ctime', 0)}, "
+                                        f"目标: {target_title}, ctime应大于{valid_ctime_threshold})，继续等待..."
+                                    )
                             else:
                                 print("[Biliup合集插件] 投稿列表为空，继续等待...")
                         else:
@@ -232,8 +251,9 @@ class BiliWeb(UploadBase):
                 self.desc = self.desc.replace(
                     "@credit", "@" + credit["username"] + "  ", 1)
                 desc_v2_tmp = desc_v2_tmp[num + 7:]
-            except IndexError:
+            except ValueError:
                 logger.error('简介中的@credit占位符少于credits的数量,替换失败')
+                break
         desc_v2.append({
             "raw_text": " " + desc_v2_tmp,
             "biz_id": "",

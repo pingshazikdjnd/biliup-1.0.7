@@ -1,9 +1,11 @@
 import inspect
 import logging
+import os
 import time
 import json
 
 from biliup.config import config
+from .common.tools import NamedLock
 from .engine.decorators import Plugin
 
 logger = logging.getLogger('biliup')
@@ -64,32 +66,68 @@ def upload(data, target_files=None):
 
 
 def biliup_uploader(filelist, data):
+    if not filelist:
+        logger.warning("biliup_uploader 收到空文件列表，跳过上传")
+        return None
+    registered_names = []
+    app_context = None
     try:
+        from .app import context as app_context
         index = data['name']
-        context = {**data}
+        data, fmt_ctx = fmt_title_and_desc_m(data)
+        context = {**config, **{k: v for k, v in fmt_ctx.items() if v is not None}}
         platform = context.get("uploader") if context.get("uploader") else "biliup-rs"
         cls = Plugin.upload_plugins.get(platform)
         if cls is None:
-            return logger.error(f"No such uploader: {platform}")
-        data, context = fmt_title_and_desc_m(data)
-        data['dolby'] = data.get('dolby', 0)
-        data['hires'] = data.get('hires', 0)
-        data['no_reprint'] = data.get('no_reprint', 0)
-        data['extra_fields'] = json.dumps(merge_dict(data.get('extra_fields', ''), {"is_only_self": data.get('is_only_self', 0)}))
+            logger.error(f"No such uploader: {platform}")
+            return None
+        data['dolby'] = context.get('dolby') or 0
+        data['hires'] = context.get('hires') or 0
+        data['no_reprint'] = context.get('no_reprint') or 0
+        data['charging_pay'] = context.get('charging_pay') or 0
+        data['extra_fields'] = json.dumps(
+            merge_dict(context.get('extra_fields', ''), {"is_only_self": context.get('is_only_self') or 0})
+        )
 
-        data['charging_pay'] = data.get('charging_pay', 0)
+        active_files = []
+        with NamedLock('upload_filename'):
+            upload_filename_list = app_context.setdefault('upload_filename', [])
+            seen = set(upload_filename_list)
+            for f in filelist:
+                raw_path = f.video if hasattr(f, 'video') else str(f)
+                file_base = os.path.splitext(raw_path)[0]
+                if file_base in seen:
+                    logger.warning(f"文件 {raw_path} 正在上传中，跳过重复上传")
+                    continue
+                seen.add(file_base)
+                active_files.append(f)
+                registered_names.append(file_base)
+            upload_filename_list.extend(registered_names)
+
+        if not active_files:
+            logger.warning("所有文件均已在上传中，跳过本次手动上传")
+            return None
+
         sig = inspect.signature(cls)
         kwargs = {}
         for k in sig.parameters:
             v = context.get(k)
-            if v:
+            if v is not None and v != '':
                 kwargs[k] = v
         logger.info("start biliup")
-        return cls(index, data, **kwargs).upload(filelist)
-    except:
+        return cls(index, data, **kwargs).upload(active_files)
+    except Exception:
         logger.exception("Uncaught exception:")
     else:
         logger.info("stop biliup")
+    finally:
+        if registered_names and app_context is not None:
+            registered_set = set(registered_names)
+            with NamedLock('upload_filename'):
+                app_context['upload_filename'] = [
+                    x for x in app_context.get('upload_filename', [])
+                    if x not in registered_set
+                ]
 
 
 def fmt_title_and_desc_m(data):
