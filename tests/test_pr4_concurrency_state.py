@@ -307,7 +307,20 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
         fake_plugin_info.inverted_index = {url: name}
         app_mod.context['PluginInfo'] = fake_plugin_info
 
-        ready_to_lock = asyncio.Event()
+        orig_to_thread = asyncio.to_thread
+        loop = asyncio.get_running_loop()
+        worker_started = asyncio.Event()
+        worker_done = asyncio.Event()
+
+        async def _tracked_to_thread(func, *args, **kwargs):
+            def _wrapped():
+                loop.call_soon_threadsafe(worker_started.set)
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    loop.call_soon_threadsafe(worker_done.set)
+
+            return await orig_to_thread(_wrapped)
 
         class DummyPlatform:
             def __init__(self, n, u):
@@ -317,7 +330,6 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
                 return True
 
             def should_record(self):
-                ready_to_lock.set()
                 return True
 
         # A. 任务在等锁期间被取消，释放锁后不能再派发 PRE_DOWNLOAD
@@ -325,32 +337,34 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
         sent_events = []
         self.assertTrue(lock.acquire(timeout=2))
         try:
-            with patch.object(app_mod.event_manager, 'send_event', side_effect=lambda ev: sent_events.append(ev)):
+            with patch.object(app_mod.asyncio, 'to_thread', side_effect=_tracked_to_thread), \
+                 patch.object(app_mod.event_manager, 'send_event', side_effect=lambda ev: sent_events.append(ev)):
                 check_task = asyncio.create_task(app_mod.singleton_check(DummyPlatform, name, url))
-                await asyncio.wait_for(ready_to_lock.wait(), timeout=2.0)
-                await asyncio.sleep(0.05)
+                await asyncio.wait_for(worker_started.wait(), timeout=2.0)
                 check_task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await check_task
                 lock.release()
-                await asyncio.sleep(0.05)
+                await asyncio.wait_for(worker_done.wait(), timeout=2.0)
         finally:
             if lock.locked():
                 lock.release()
         self.assertEqual([ev for ev in sent_events if ev.type_ == 'pre_download'], [])
 
         # B. 主播 URL 在等锁期间从 inverted_index 移除，释放锁后不能派发旧 URL 的 PRE_DOWNLOAD
-        ready_to_lock.clear()
+        worker_started.clear()
+        worker_done.clear()
         sent_events.clear()
         self.assertTrue(lock.acquire(timeout=2))
         try:
-            with patch.object(app_mod.event_manager, 'send_event', side_effect=lambda ev: sent_events.append(ev)):
+            with patch.object(app_mod.asyncio, 'to_thread', side_effect=_tracked_to_thread), \
+                 patch.object(app_mod.event_manager, 'send_event', side_effect=lambda ev: sent_events.append(ev)):
                 check_task = asyncio.create_task(app_mod.singleton_check(DummyPlatform, name, url))
-                await asyncio.wait_for(ready_to_lock.wait(), timeout=2.0)
-                await asyncio.sleep(0.05)
+                await asyncio.wait_for(worker_started.wait(), timeout=2.0)
                 fake_plugin_info.inverted_index.pop(url, None)
                 lock.release()
                 await asyncio.wait_for(check_task, timeout=2.0)
+                await asyncio.wait_for(worker_done.wait(), timeout=2.0)
         finally:
             if lock.locked():
                 lock.release()
