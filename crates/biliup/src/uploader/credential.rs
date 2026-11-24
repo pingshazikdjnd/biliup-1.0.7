@@ -73,7 +73,7 @@ pub fn bilibili_from_info(login_info: LoginInfo, proxy: Option<&str>) -> Result<
 
 static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn write_login_info_atomic(path: &Path, info: &LoginInfo) -> Result<()> {
+pub fn write_login_info_atomic(path: &Path, info: &LoginInfo) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -91,10 +91,14 @@ pub(crate) fn write_login_info_atomic(path: &Path, info: &LoginInfo) -> Result<(
     let tmp_path: PathBuf = parent.join(format!(".{file_name}.{pid}.{nanos}.{seq}.tmp"));
 
     let write_res = (|| -> std::io::Result<()> {
-        let tmp_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let tmp_file = opts.open(&tmp_path)?;
         let mut writer = std::io::BufWriter::new(&tmp_file);
         serde_json::to_writer_pretty(&mut writer, info)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -475,49 +479,50 @@ impl Credential {
         let urlencoded = serde_urlencoded::to_string(&form)?;
         let sign = Self::sign(&urlencoded, AppKeyStore::BiliTV.appsec());
         form["sign"] = Value::from(sign);
-        let deadline = std::time::Instant::now() + Duration::from_secs(180);
-        loop {
-            if std::time::Instant::now() >= deadline {
-                break Err(Kind::Custom("Qrcode login timeout".to_string()));
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let raw = self
-                .0
-                .client
-                .post("https://passport.bilibili.com/x/passport-tv-login/qrcode/poll")
-                .form(&form)
-                .send()
-                .await?
-                .error_for_status()?;
-            let full = raw.bytes().await?;
+        tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let raw = self
+                    .0
+                    .client
+                    .post("https://passport.bilibili.com/x/passport-tv-login/qrcode/poll")
+                    .form(&form)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let full = raw.bytes().await?;
 
-            let res: ResponseData<ResponseValue> = serde_json::from_slice(&full).map_err(|_| {
-                Kind::Custom(format!(
-                    "error decoding response body, content: {:#?}",
-                    String::from_utf8_lossy(&full)
-                ))
-            })?;
-            match res {
-                ResponseData {
-                    code: 0,
-                    data: Some(ResponseValue::Login(info)),
-                    ..
-                } => {
-                    self.set_cookie(&info.cookie_info);
-                    break Ok(LoginInfo {
-                        platform: Some("BiliTV".to_string()),
-                        ..info
-                    });
-                }
-                ResponseData { code: 86039, .. } => {
-                    // 二维码尚未确认;
-                    // form["ts"] = Value::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-                }
-                _ => {
-                    break Err(Kind::Custom(format!("{res:#?}")));
+                let res: ResponseData<ResponseValue> =
+                    serde_json::from_slice(&full).map_err(|_| {
+                        Kind::Custom(format!(
+                            "error decoding response body, content: {:#?}",
+                            String::from_utf8_lossy(&full)
+                        ))
+                    })?;
+                match res {
+                    ResponseData {
+                        code: 0,
+                        data: Some(ResponseValue::Login(info)),
+                        ..
+                    } => {
+                        self.set_cookie(&info.cookie_info);
+                        break Ok(LoginInfo {
+                            platform: Some("BiliTV".to_string()),
+                            ..info
+                        });
+                    }
+                    ResponseData { code: 86039, .. } => {
+                        // 二维码尚未确认;
+                        // form["ts"] = Value::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+                    }
+                    _ => {
+                        break Err(Kind::Custom(format!("{res:#?}")));
+                    }
                 }
             }
-        }
+        })
+        .await
+        .map_err(|_| Kind::Custom("Qrcode login timeout".to_string()))?
     }
 
     /// 获取 Web 端 buvid3 和 buvid4

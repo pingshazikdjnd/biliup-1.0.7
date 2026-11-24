@@ -195,8 +195,18 @@ impl DownloadActorHandle {
     }
 
     pub fn update_streamer(&self, url: &str) {
-        self.remove_streamer(url);
-        self.add_streamer(url);
+        let Some(extractor) = find_extractor(url) else {
+            return;
+        };
+        let type_id = extractor.as_any().type_id();
+        let mut platform_guard = self.platform_map.write().unwrap();
+        if let Some((cy, _)) = platform_guard.get(&type_id)
+            && cy.write().contains_key(url)
+        {
+            return;
+        }
+        self.actor
+            .add_streamer(platform_guard.deref_mut(), url.to_string());
     }
 
     pub fn remove_streamer(&self, url: &str) {

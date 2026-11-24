@@ -9,6 +9,10 @@ use crate::server::errors::AppResult;
 
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
+use std::sync::LazyLock;
+
+static STREAMER_MUTATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 pub async fn get_streamers_endpoint(
     Extension(streamers_service): Extension<DynLiveStreamersService>,
@@ -35,8 +39,10 @@ pub async fn add_streamer_endpoint(
     Extension(download_actor_handle): Extension<DownloadActorHandle>,
     Json(request): Json<AddLiveStreamerDto>,
 ) -> AppResult<Json<LiveStreamerDto>> {
-    download_actor_handle.add_streamer(&request.url);
-    Ok(Json(streamers_service.add_streamer(request).await?))
+    let _guard = STREAMER_MUTATION_LOCK.lock().await;
+    let created = streamers_service.add_streamer(request).await?;
+    download_actor_handle.add_streamer(&created.url);
+    Ok(Json(created))
 }
 
 pub async fn delete_streamer_endpoint(
@@ -44,6 +50,7 @@ pub async fn delete_streamer_endpoint(
     Extension(download_actor_handle): Extension<DownloadActorHandle>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<()>> {
+    let _guard = STREAMER_MUTATION_LOCK.lock().await;
     let existing = state.get_streamer_by_id(id).await?;
     state.delete_streamer(id).await?;
     download_actor_handle.remove_streamer(&existing.url);
@@ -56,6 +63,7 @@ pub async fn update_streamer_endpoint(
     Path(id): Path<i64>,
     Json(mut request): Json<LiveStreamerEntity>,
 ) -> AppResult<Json<LiveStreamerDto>> {
+    let _guard = STREAMER_MUTATION_LOCK.lock().await;
     let old_url = state.get_streamer_by_id(id).await.ok().map(|s| s.url);
     request.id = id;
     let updated = state.update_streamer(request).await?;
