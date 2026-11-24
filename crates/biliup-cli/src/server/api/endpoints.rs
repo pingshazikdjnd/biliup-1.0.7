@@ -64,13 +64,11 @@ pub async fn update_streamer_endpoint(
     Json(mut request): Json<LiveStreamerEntity>,
 ) -> AppResult<Json<LiveStreamerDto>> {
     let _guard = STREAMER_MUTATION_LOCK.lock().await;
-    let old_url = state.get_streamer_by_id(id).await.ok().map(|s| s.url);
+    let old_url = state.get_streamer_by_id(id).await?.url;
     request.id = id;
     let updated = state.update_streamer(request).await?;
-    if let Some(old) = old_url
-        && old != updated.url
-    {
-        download_actor_handle.remove_streamer(&old);
+    if old_url != updated.url {
+        download_actor_handle.remove_streamer(&old_url);
     }
     download_actor_handle.update_streamer(&updated.url);
     Ok(Json(updated.into_dto()))

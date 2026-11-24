@@ -47,6 +47,19 @@ async fn start_monitor(
                 } else {
                     ("./video/%Y-%m-%d/%H_%M_%S{title}".to_string(), None, None)
                 };
+                let still_present = {
+                    let mut guard = task.write();
+                    if let Some(st) = guard.get_mut(&url) {
+                        *st = StreamStatus::Working;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !still_present {
+                    debug!(url = %url, "streamer removed before download start; skipping");
+                    continue;
+                }
                 let live_streamers_service = live_streamers_service.clone();
                 {
                     let client = client.clone();
@@ -81,7 +94,6 @@ async fn start_monitor(
                         Ok::<_, Box<dyn Error + Send + Sync>>(())
                     });
                 }
-                task.change(&url, StreamStatus::Working);
             }
             (Ok(_site), StreamStatus::Pending) => {
                 println!("Pending");

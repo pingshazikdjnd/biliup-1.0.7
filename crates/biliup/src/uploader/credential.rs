@@ -16,7 +16,7 @@ use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs8::DecodePublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 // const APP_KEY: &str = "ae57252b0c09105d";
@@ -72,8 +72,13 @@ pub fn bilibili_from_info(login_info: LoginInfo, proxy: Option<&str>) -> Result<
 }
 
 static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static COOKIE_COMMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub fn write_login_info_atomic(path: &Path, info: &LoginInfo) -> Result<()> {
+fn write_login_info_atomic_inner(
+    path: &Path,
+    info: &LoginInfo,
+    expected_token: Option<(u64, &str)>,
+) -> Result<bool> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -112,11 +117,41 @@ pub fn write_login_info_atomic(path: &Path, info: &LoginInfo) -> Result<()> {
         return Err(err.into());
     }
 
+    let _commit_guard = COOKIE_COMMIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some((expected_mid, expected_refresh)) = expected_token {
+        let matches_disk = std::fs::File::options()
+            .read(true)
+            .open(path)
+            .ok()
+            .and_then(|f| serde_json::from_reader::<_, LoginInfo>(std::io::BufReader::new(f)).ok())
+            .map(|cur| {
+                cur.token_info.mid == expected_mid
+                    && cur.token_info.refresh_token == expected_refresh
+            })
+            .unwrap_or(false);
+        if !matches_disk {
+            let _ = std::fs::remove_file(&tmp_path);
+            warn!(
+                "cookie file {} changed during token refresh; skipping stale overwrite",
+                path.display()
+            );
+            return Ok(false);
+        }
+    }
+
     if let Err(err) = std::fs::rename(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err.into());
     }
 
+    Ok(true)
+}
+
+pub fn write_login_info_atomic(path: &Path, info: &LoginInfo) -> Result<()> {
+    write_login_info_atomic_inner(path, info, None)?;
     Ok(())
 }
 
@@ -131,8 +166,10 @@ pub async fn login_by_cookies(file: impl AsRef<Path>, proxy: Option<&str>) -> Re
     let need_refresh = client.validate_tokens(&login_info).await?;
 
     if need_refresh {
+        let original_mid = login_info.token_info.mid;
+        let original_refresh = login_info.token_info.refresh_token.clone();
         let new_info = client.renew_tokens(login_info).await?;
-        write_login_info_atomic(path, &new_info)?;
+        write_login_info_atomic_inner(path, &new_info, Some((original_mid, &original_refresh)))?;
         bilibili_from_info(new_info, proxy)
     } else {
         info!("无需更新cookie");
@@ -751,6 +788,55 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftover_tmps.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_login_info_atomic_skips_stale_refresh_overwrite() {
+        use super::write_login_info_atomic_inner;
+
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_cas_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cookies.json");
+
+        let newer_account = LoginInfo {
+            cookie_info: json!({"cookies": [{"name": "SESSDATA", "value": "newer"}]}),
+            sso: vec![],
+            token_info: TokenInfo {
+                access_token: "newer_access".to_string(),
+                expires_in: 3600,
+                mid: 99999,
+                refresh_token: "newer_refresh".to_string(),
+            },
+            platform: Some("BiliTV".to_string()),
+        };
+        write_login_info_atomic(&target, &newer_account).unwrap();
+
+        let stale_refreshed = LoginInfo {
+            cookie_info: json!({"cookies": [{"name": "SESSDATA", "value": "stale"}]}),
+            sso: vec![],
+            token_info: TokenInfo {
+                access_token: "stale_access".to_string(),
+                expires_in: 3600,
+                mid: 11111,
+                refresh_token: "stale_refresh_new".to_string(),
+            },
+            platform: Some("BiliTV".to_string()),
+        };
+
+        let written =
+            write_login_info_atomic_inner(&target, &stale_refreshed, Some((11111, "stale_old")))
+                .unwrap();
+        assert!(!written);
+
+        let loaded: LoginInfo =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(loaded.token_info.mid, 99999);
+        assert_eq!(loaded.token_info.access_token, "newer_access");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
