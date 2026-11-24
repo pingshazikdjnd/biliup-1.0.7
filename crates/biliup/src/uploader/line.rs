@@ -13,8 +13,8 @@ use crate::uploader::bilibili::{BiliBili, Video};
 // use crate::uploader::line::cos::Cos;
 // use crate::uploader::line::kodo::Kodo;
 use crate::uploader::line::upos::Upos;
-use std::time::Instant;
-use tracing::info;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
 // pub mod cos;
 // pub mod kodo;
@@ -108,28 +108,41 @@ pub struct Probe {
 
 impl Probe {
     pub async fn probe(client: &reqwest::Client) -> Result<Line> {
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
         let res: Self = client
             .get("https://member.bilibili.com/preupload?r=probe")
+            .timeout(PROBE_TIMEOUT)
             .send()
             .await?
             .json()
             .await?;
-        // let client = res.ping(client);
         let mut choice_line: Line = Default::default();
+        let mut found = false;
         for mut line in res.lines {
             let instant = Instant::now();
-            if Probe::ping(&res.probe, &format!("https:{}", line.probe_url), client)
+            match Probe::ping(&res.probe, &format!("https:{}", line.probe_url), client)
+                .timeout(PROBE_TIMEOUT)
                 .send()
-                .await?
-                .status()
-                .is_success()
+                .await
             {
-                line.cost = instant.elapsed().as_millis();
-                info!("{}: {}", line.query, line.cost);
-                if choice_line.cost > line.cost {
-                    choice_line = line
+                Ok(resp) if resp.status().is_success() => {
+                    line.cost = instant.elapsed().as_millis();
+                    info!("{}: {}", line.query, line.cost);
+                    if !found || choice_line.cost > line.cost {
+                        choice_line = line;
+                        found = true;
+                    }
                 }
-            };
+                Ok(resp) => {
+                    warn!("probe {} returned status {}", line.query, resp.status());
+                }
+                Err(err) => {
+                    warn!("probe {} failed: {}", line.query, err);
+                }
+            }
+        }
+        if !found {
+            return Err(Custom("All upload lines probe failed".to_string()));
         }
         Ok(choice_line)
     }

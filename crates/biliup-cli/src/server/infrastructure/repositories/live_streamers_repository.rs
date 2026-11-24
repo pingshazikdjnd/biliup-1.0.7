@@ -4,7 +4,6 @@ use crate::server::core::live_streamers::{
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use anyhow::Context;
 use async_trait::async_trait;
-use sqlx::query_as;
 
 #[derive(Clone)]
 pub struct SqliteLiveStreamersRepository {
@@ -22,42 +21,62 @@ impl LiveStreamersRepository for SqliteLiveStreamersRepository {
     async fn create_streamer(&self, dto: AddLiveStreamerDto) -> anyhow::Result<LiveStreamerEntity> {
         let split_time = dto.split_time.map(|t| t as i64);
         let split_size = dto.split_size.map(|s| s as i64);
-        query_as!(
-            LiveStreamerEntity,
+        sqlx::query_as::<_, LiveStreamerEntity>(
             r#"
         insert into live_streamers (url, remark, filename, split_time, split_size, upload_id)
-        values ($1 , $2 , $3, $4 , $5, $6)
-        returning id, url as "url!", remark as "remark!", filename as "filename!", split_time, split_size, upload_id
+        values (?, ?, ?, ?, ?, ?)
+        returning id, url, remark, filename, split_time, split_size, upload_id
             "#,
-            dto.url,
-            dto.remark,
-            dto.filename,
-            split_time,
-            split_size,
-            dto.upload_id
         )
+        .bind(dto.url)
+        .bind(dto.remark)
+        .bind(dto.filename)
+        .bind(split_time)
+        .bind(split_size)
+        .bind(dto.upload_id)
         .fetch_one(&self.pool)
         .await
         .context("an unexpected error occurred while creating the streamer")
     }
 
     async fn delete_streamer(&self, id: i64) -> anyhow::Result<()> {
-        todo!()
+        sqlx::query("delete from live_streamers where id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("an unexpected error occurred while deleting the streamer")?;
+        Ok(())
     }
 
     async fn update_streamer(
         &self,
         entity: LiveStreamerEntity,
     ) -> anyhow::Result<LiveStreamerEntity> {
-        todo!()
+        sqlx::query_as::<_, LiveStreamerEntity>(
+            r#"
+        update live_streamers
+        set url = ?, remark = ?, filename = ?, split_time = ?, split_size = ?, upload_id = ?
+        where id = ?
+        returning id, url, remark, filename, split_time, split_size, upload_id
+            "#,
+        )
+        .bind(entity.url)
+        .bind(entity.remark)
+        .bind(entity.filename)
+        .bind(entity.split_time)
+        .bind(entity.split_size)
+        .bind(entity.upload_id)
+        .bind(entity.id)
+        .fetch_one(&self.pool)
+        .await
+        .context("an unexpected error occurred while updating the streamer")
     }
 
     async fn get_streamers(&self) -> anyhow::Result<Vec<LiveStreamerEntity>> {
-        query_as!(
-            LiveStreamerEntity,
+        sqlx::query_as::<_, LiveStreamerEntity>(
             r#"
-       select id, url as "url!", remark as "remark!", filename as "filename!", split_time, split_size, upload_id from live_streamers
-            "#
+        select id, url, remark, filename, split_time, split_size, upload_id from live_streamers
+            "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -65,38 +84,30 @@ impl LiveStreamersRepository for SqliteLiveStreamersRepository {
     }
 
     async fn get_streamer_by_url(&self, url: &str) -> anyhow::Result<LiveStreamerEntity> {
-        query_as!(
-            LiveStreamerEntity,
+        sqlx::query_as::<_, LiveStreamerEntity>(
             r#"
-        select
-            id, url as "url!", remark as "remark!", filename as "filename!", split_time, split_size, upload_id
-        from
-            live_streamers
-        where
-            url=$1
+        select id, url, remark, filename, split_time, split_size, upload_id
+        from live_streamers
+        where url = ?
             "#,
-            url
         )
+        .bind(url)
         .fetch_one(&self.pool)
         .await
-        .context("an unexpected error occurred while creating the streamer")
+        .context("an unexpected error occurred retrieving streamer by url")
     }
 
     async fn get_streamer_by_id(&self, id: i64) -> anyhow::Result<LiveStreamerEntity> {
-        query_as!(
-            LiveStreamerEntity,
+        sqlx::query_as::<_, LiveStreamerEntity>(
             r#"
-        select
-            id, url as "url!", remark as "remark!", filename as "filename!", split_time, split_size, upload_id
-        from
-            live_streamers
-        where
-            id=$1
+        select id, url, remark, filename, split_time, split_size, upload_id
+        from live_streamers
+        where id = ?
             "#,
-            id
         )
-            .fetch_one(&self.pool)
-            .await
-            .context("an unexpected error occurred while creating the streamer")
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .context("an unexpected error occurred retrieving streamer by id")
     }
 }

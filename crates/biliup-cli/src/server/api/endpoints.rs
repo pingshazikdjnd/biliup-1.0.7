@@ -44,17 +44,28 @@ pub async fn delete_streamer_endpoint(
     Extension(download_actor_handle): Extension<DownloadActorHandle>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<()>> {
-    download_actor_handle.remove_streamer(&state.get_streamer_by_id(id).await?.url);
-    Ok(Json(state.delete_streamer(id).await?))
+    let existing = state.get_streamer_by_id(id).await?;
+    state.delete_streamer(id).await?;
+    download_actor_handle.remove_streamer(&existing.url);
+    Ok(Json(()))
 }
 
 pub async fn update_streamer_endpoint(
     State(state): State<DynLiveStreamersRepository>,
     Extension(download_actor_handle): Extension<DownloadActorHandle>,
-    Json(request): Json<LiveStreamerEntity>,
+    Path(id): Path<i64>,
+    Json(mut request): Json<LiveStreamerEntity>,
 ) -> AppResult<Json<LiveStreamerDto>> {
-    download_actor_handle.update_streamer(&request.url);
-    Ok(Json(state.update_streamer(request).await?.into_dto()))
+    let old_url = state.get_streamer_by_id(id).await.ok().map(|s| s.url);
+    request.id = id;
+    let updated = state.update_streamer(request).await?;
+    if let Some(old) = old_url
+        && old != updated.url
+    {
+        download_actor_handle.remove_streamer(&old);
+    }
+    download_actor_handle.update_streamer(&updated.url);
+    Ok(Json(updated.into_dto()))
 }
 
 pub async fn add_upload_streamer_endpoint(
@@ -73,8 +84,10 @@ pub async fn delete_template_endpoint(
 
 pub async fn update_template_endpoint(
     Extension(streamers_service): Extension<DynUploadStreamersRepository>,
-    Json(request): Json<StudioEntity>,
+    Path(id): Path<i64>,
+    Json(mut request): Json<StudioEntity>,
 ) -> AppResult<Json<StudioEntity>> {
+    request.id = id;
     Ok(Json(streamers_service.update_streamer(request).await?))
 }
 

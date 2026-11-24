@@ -26,6 +26,8 @@ pub enum AppError {
     ApplicationStartup(String),
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    PayloadTooLarge(String),
     #[error("unexpected error has occurred")]
     InternalServerError,
     #[error("{0}")]
@@ -51,6 +53,8 @@ impl IntoResponse for AppError {
         let (status, error_message) = match self {
             Self::InternalServerErrorWithContext(err) => (StatusCode::INTERNAL_SERVER_ERROR, err),
             Self::NotFound(err) => (StatusCode::NOT_FOUND, err),
+            Self::BadRequest(err) => (StatusCode::BAD_REQUEST, err),
+            Self::PayloadTooLarge(err) => (StatusCode::PAYLOAD_TOO_LARGE, err),
             Self::ObjectConflict(err) => (StatusCode::CONFLICT, err),
             Self::InvalidLoginAttempt => (
                 StatusCode::BAD_REQUEST,
