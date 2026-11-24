@@ -19,6 +19,45 @@ top = false
 - 🔧已修复的问题
 - ⚠️需要手动操作的更新信息
 
+## 1.0.7.008
+### What's Changed
+- 💡 新增可配置双水位磁盘保护（`disk_upload_threshold_gb` 软水位主动触发上传清理、`disk_stop_threshold_gb` 硬水位告警暂停录制）
+- 💡 新增 QQ 邮箱 / SMTP 告警通知（支持 465 SSL / 587 STARTTLS，30 分钟冷却防轰炸）与上传错误智能分级熔断
+- 💡 WebUI 主页改为内置 Semi UI 更新日志页面，展示本分支 1.0.7.001 ~ 1.0.7.008 完整更新记录
+- 🔧 修复上传子进程非零退出或上传异常时误删录像的问题，修复 Webhook 告警错误详情与超时
+- 🔧 加固 WebUI `--password` 全路径鉴权（`/api/`、`/url-status`、`/v1/`、`/bili/`、`/static/`、`/ws/logs`）、Cookie 路径白名单与 `/bili/proxy` SSRF/大小限制
+- 🔧 消除全局 `client.headers` Cookie 污染并修复 `Config.save()` 原子写入防止截断 `config.yaml`
+- 🔧 修复 `NamedLock` 并发竞态、上传锁跨线程释放、录制中 `.part` 保护、自定义文件名数据库匹配与 `Config.load_from_db` 原子重载
+- 🔧 消除 `/streamers` N+1 请求风暴与多账号会话串号，修复合集 `section_id` 校验与上传器返回契约
+- 🔧 修复下载调度重入、Windows 文件名 `%` 转义、`OverrideModal` 状态及 Bilibili/虎牙/抖音/快手/TwitCasting/猫耳/克拉克拉/Nico/YouTube/斗鱼插件问题
+- 🔧 加固 `/ws/logs` 完整行增量读取与文件轮转检测、前端鉴权与 `dtime` 同步、B 站接口 HTTPS 升级、运维热重载与 Dockerfile 构建源
+- 🔧 Rust 层加固：Cookie 刷新只读加载 + Unix `0600` 原子替换与乐观防覆盖、扫码 180s 总超时、分页防除零/下溢、测速超时容错、PyO3 释放 GIL 及 `biliup-cli` Server Axum 0.8 / SQLx 0.8 适配
+- ⚠️ 开启 `--password` 的用户升级后请重新登录一次 WebUI；小容量磁盘用户建议在「空间配置」按需配置磁盘水位与邮件/Webhook 告警
+
+**Full Changelog**: [1.0.7.007...1.0.7.008](https://github.com/pingshazikdjnd/biliup-1.0.7/compare/1.0.7.007...1.0.7.008)
+
+## 1.0.7.007
+- 🔧 修复若干已知 Bug
+
+## 1.0.7.006
+- 🔧 修复 [issues/3](https://github.com/pingshazikdjnd/biliup-1.0.7/issues/3) Bug
+
+## 1.0.7.005
+- 🔧 修复合集无法使用 Bug
+
+## 1.0.7.004
+- 💡 发布 1.0.7.003 编译版本
+
+## 1.0.7.003
+- 💡 添加合集功能，合集改为下拉自选
+
+## 1.0.7.002
+- 🔧 修复 [issues/1](https://github.com/pingshazikdjnd/biliup-1.0.7/issues/1) Bug
+
+## 1.0.7.001
+- 💡 主要 CDN 十分钟内断流自动切换回退 CDN API 循环兜底，稳定录播超十分钟后恢复主 CDN
+- 💡 新增等待转码流录制功能，开播时等待目标清晰度出现后再开始录播
+
 ## 0.4.82
 ### What's Changed
 - perf: 优化B站弹幕录制 by @unknown-o in [#1126](https://github.com/biliup/biliup/pull/1126)
