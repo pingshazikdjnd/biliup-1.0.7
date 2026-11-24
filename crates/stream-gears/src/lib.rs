@@ -136,107 +136,144 @@ fn download_with_callback(
 }
 
 #[pyfunction]
-fn login_by_cookies(file: String, proxy: Option<String>) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async { login::login_by_cookies(&file, proxy.as_deref()).await });
-    match result {
-        Ok(_) => Ok(true),
-        Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "{}, {}",
-            err.root_cause(),
-            err
-        ))),
-    }
-}
-
-#[pyfunction]
-fn send_sms(country_code: u32, phone: u64, proxy: Option<String>) -> PyResult<String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result =
-        rt.block_on(async { login::send_sms(country_code, phone, proxy.as_deref()).await });
-    match result {
-        Ok(res) => Ok(res.to_string()),
-        Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "{}",
-            err
-        ))),
-    }
-}
-
-#[pyfunction]
-fn login_by_sms(code: u32, ret: String, proxy: Option<String>) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async {
-        login::login_by_sms(code, serde_json::from_str(&ret).unwrap(), proxy.as_deref()).await
-    });
-    match result {
-        Ok(_) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
-#[pyfunction]
-fn get_qrcode(proxy: Option<String>) -> PyResult<String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async { login::get_qrcode(proxy.as_deref()).await });
-    match result {
-        Ok(res) => Ok(res.to_string()),
-        Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "{}",
-            err
-        ))),
-    }
-}
-
-#[pyfunction]
-fn login_by_qrcode(ret: String, proxy: Option<String>) -> PyResult<String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let info = Credential::new(proxy.as_deref())
-            .login_by_qrcode(serde_json::from_str(&ret).unwrap())
-            .await?;
-        let res = serde_json::to_string_pretty(&info)?;
-        Ok::<_, anyhow::Error>(res)
+fn login_by_cookies(py: Python<'_>, file: String, proxy: Option<String>) -> PyResult<bool> {
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
+        let result = rt.block_on(async { login::login_by_cookies(&file, proxy.as_deref()).await });
+        match result {
+            Ok(_) => Ok(true),
+            Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{}, {}",
+                err.root_cause(),
+                err
+            ))),
+        }
     })
-    .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("{:#?}", err)))
+}
+
+#[pyfunction]
+fn send_sms(
+    py: Python<'_>,
+    country_code: u32,
+    phone: u64,
+    proxy: Option<String>,
+) -> PyResult<String> {
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
+        let result =
+            rt.block_on(async { login::send_sms(country_code, phone, proxy.as_deref()).await });
+        match result {
+            Ok(res) => Ok(res.to_string()),
+            Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{}",
+                err
+            ))),
+        }
+    })
+}
+
+#[pyfunction]
+fn login_by_sms(
+    py: Python<'_>,
+    code: u32,
+    ret: String,
+    proxy: Option<String>,
+) -> PyResult<bool> {
+    let payload: serde_json::Value = serde_json::from_str(&ret)
+        .map_err(|err| pyo3::exceptions::PyValueError::new_err(format!("invalid sms payload: {err}")))?;
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
+        let result = rt.block_on(async {
+            login::login_by_sms(code, payload, proxy.as_deref()).await
+        });
+        match result {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    })
+}
+
+#[pyfunction]
+fn get_qrcode(py: Python<'_>, proxy: Option<String>) -> PyResult<String> {
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
+        let result = rt.block_on(async { login::get_qrcode(proxy.as_deref()).await });
+        match result {
+            Ok(res) => Ok(res.to_string()),
+            Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{}",
+                err
+            ))),
+        }
+    })
+}
+
+#[pyfunction]
+fn login_by_qrcode(py: Python<'_>, ret: String, proxy: Option<String>) -> PyResult<String> {
+    let payload: serde_json::Value = serde_json::from_str(&ret)
+        .map_err(|err| pyo3::exceptions::PyValueError::new_err(format!("invalid qrcode payload: {err}")))?;
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
+        rt.block_on(async {
+            let info = Credential::new(proxy.as_deref())
+                .login_by_qrcode(payload)
+                .await?;
+            let res = serde_json::to_string_pretty(&info)?;
+            Ok::<_, anyhow::Error>(res)
+        })
+        .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("{:#?}", err)))
+    })
 }
 
 #[pyfunction]
 fn login_by_web_cookies(
+    py: Python<'_>,
     sess_data: String,
     bili_jct: String,
     proxy: Option<String>,
 ) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async {
-        login::login_by_web_cookies(&sess_data, &bili_jct, proxy.as_deref()).await
-    });
-    match result {
-        Ok(_) => Ok(true),
-        Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "{}",
-            err
-        ))),
-    }
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
+        let result = rt.block_on(async {
+            login::login_by_web_cookies(&sess_data, &bili_jct, proxy.as_deref()).await
+        });
+        match result {
+            Ok(_) => Ok(true),
+            Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{}",
+                err
+            ))),
+        }
+    })
 }
 
 #[pyfunction]
 fn login_by_web_qrcode(
+    py: Python<'_>,
     sess_data: String,
     dede_user_id: String,
     proxy: Option<String>,
 ) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async {
-        login::login_by_web_qrcode(&sess_data, &dede_user_id, proxy.as_deref()).await
-    });
-    match result {
-        Ok(_) => Ok(true),
-        Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "{}",
-            err
-        ))),
-    }
+    py.allow_threads(|| {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
+        let result = rt.block_on(async {
+            login::login_by_web_qrcode(&sess_data, &dede_user_id, proxy.as_deref()).await
+        });
+        match result {
+            Ok(_) => Ok(true),
+            Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{}",
+                err
+            ))),
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

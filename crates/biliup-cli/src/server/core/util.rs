@@ -48,17 +48,19 @@ impl<T: Copy> Cycle<T> {
         }
     }
 
-    pub fn get(&self, i: &mut usize) -> (String, T) {
-        match self.map.read().unwrap().get_index(*i) {
-            Some((k, v)) => {
-                *i += 1;
-                (k.clone(), *v)
-            }
-            None => {
-                *i = 0;
-                self.get(i)
-            }
+    pub fn get(&self, i: &mut usize) -> Option<(String, T)> {
+        let guard = self.map.read().unwrap();
+        if guard.is_empty() {
+            *i = 0;
+            return None;
         }
+        if *i >= guard.len() {
+            *i = 0;
+        }
+        guard.get_index(*i).map(|(k, v)| {
+            *i += 1;
+            (k.clone(), *v)
+        })
     }
 
     pub fn get_all(&self) -> IndexMap<String, T> {
@@ -111,4 +113,26 @@ where
             e
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cycle;
+    use indexmap::indexmap;
+
+    #[test]
+    fn test_cycle_get_wraps_and_handles_empty() {
+        let cycle = Cycle::new(indexmap! {
+            "a".to_string() => 1u8,
+            "b".to_string() => 2u8,
+        });
+        let mut idx = 0;
+        assert_eq!(cycle.get(&mut idx), Some(("a".to_string(), 1)));
+        assert_eq!(cycle.get(&mut idx), Some(("b".to_string(), 2)));
+        assert_eq!(cycle.get(&mut idx), Some(("a".to_string(), 1)));
+
+        cycle.write().clear();
+        assert_eq!(cycle.get(&mut idx), None);
+        assert_eq!(idx, 0);
+    }
 }

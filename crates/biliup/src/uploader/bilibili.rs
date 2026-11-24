@@ -355,7 +355,7 @@ impl BiliBili {
         let ret: serde_json::Value = self
             .client
             .post(format!(
-                "http://member.bilibili.com/x/vu/web/edit?t={ts}&csrf={}",
+                "https://member.bilibili.com/x/vu/web/edit?t={ts}&csrf={}",
                 self.get_csrf()?
             ))
             .json(studio)
@@ -428,7 +428,7 @@ impl BiliBili {
             .timeout(Duration::new(60, 0))
             .build()?
             .get(format!(
-                "http://member.bilibili.com/x/client/archive/view?access_key={}&{vid}",
+                "https://member.bilibili.com/x/client/archive/view?access_key={}&{vid}",
                 self.login_info.token_info.access_token
             ))
             .send()
@@ -603,27 +603,20 @@ impl BiliBili {
             let page = first_page["page"].take();
             let page_size = page["ps"].as_u64().ok_or("all_studios ps error")?;
             let count = page["count"].as_u64().ok_or("all_studios count error")?;
-            (page_size as u32, count as u32)
+            (
+                u32::try_from(page_size).unwrap_or(u32::MAX),
+                u32::try_from(count).unwrap_or(u32::MAX),
+            )
         };
 
-        let total_pages = {
-            let mut pages = count / page_size;
-            if pages * page_size < count {
-                pages += 1;
-            }
-            pages
-        };
-
-        let fetch_pages = match max_pages {
-            Some(mp) => std::cmp::min(total_pages - from_page + 1, mp),
-            None => total_pages - from_page + 1,
-        };
-        let to_page = from_page - 1 + fetch_pages;
+        let to_page = calc_recent_archives_to_page(count, page_size, from_page, max_pages);
 
         let mut all_pages = vec![first_page];
-        for page_num in from_page + 1..=to_page {
-            let page = self.archives(status, page_num).await?;
-            all_pages.push(page);
+        if to_page > from_page {
+            for page_num in (from_page + 1)..=to_page {
+                let page = self.archives(status, page_num).await?;
+                all_pages.push(page);
+            }
         }
 
         Ok(all_pages)
@@ -667,5 +660,49 @@ impl<T: Serialize> Display for ResponseData<T> {
             "{}",
             serde_json::to_string(self).map_err(std::fmt::Error::custom)?
         )
+    }
+}
+
+fn calc_recent_archives_to_page(
+    count: u32,
+    page_size: u32,
+    from_page: u32,
+    max_pages: Option<u32>,
+) -> u32 {
+    if count == 0 || page_size == 0 || from_page == 0 {
+        return from_page;
+    }
+    let total_pages = count.div_ceil(page_size);
+    if from_page > total_pages {
+        return from_page;
+    }
+    let remaining_pages = total_pages - from_page + 1;
+    let fetch_pages = match max_pages {
+        Some(0) => 0,
+        Some(mp) => std::cmp::min(remaining_pages, mp),
+        None => remaining_pages,
+    };
+    if fetch_pages <= 1 {
+        return from_page;
+    }
+    from_page.saturating_add(fetch_pages - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calc_recent_archives_to_page;
+
+    #[test]
+    fn test_recent_archives_pagination_guards() {
+        assert_eq!(calc_recent_archives_to_page(0, 20, 1, None), 1);
+        assert_eq!(calc_recent_archives_to_page(10, 0, 1, None), 1);
+        assert_eq!(calc_recent_archives_to_page(10, 20, 0, None), 0);
+        assert_eq!(calc_recent_archives_to_page(10, 20, 5, None), 5);
+        assert_eq!(calc_recent_archives_to_page(50, 20, 1, Some(0)), 1);
+        assert_eq!(calc_recent_archives_to_page(50, 20, 1, Some(1)), 1);
+        assert_eq!(calc_recent_archives_to_page(50, 20, 1, Some(2)), 2);
+        assert_eq!(calc_recent_archives_to_page(50, 20, 1, None), 3);
+        assert_eq!(calc_recent_archives_to_page(50, 20, 2, None), 3);
+        assert_eq!(calc_recent_archives_to_page(50, 20, 3, Some(10)), 3);
     }
 }

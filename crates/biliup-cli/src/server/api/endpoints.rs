@@ -9,6 +9,10 @@ use crate::server::errors::AppResult;
 
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
+use std::sync::LazyLock;
+
+static STREAMER_MUTATION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 pub async fn get_streamers_endpoint(
     Extension(streamers_service): Extension<DynLiveStreamersService>,
@@ -35,8 +39,10 @@ pub async fn add_streamer_endpoint(
     Extension(download_actor_handle): Extension<DownloadActorHandle>,
     Json(request): Json<AddLiveStreamerDto>,
 ) -> AppResult<Json<LiveStreamerDto>> {
-    download_actor_handle.add_streamer(&request.url);
-    Ok(Json(streamers_service.add_streamer(request).await?))
+    let _guard = STREAMER_MUTATION_LOCK.lock().await;
+    let created = streamers_service.add_streamer(request).await?;
+    download_actor_handle.add_streamer(&created.url);
+    Ok(Json(created))
 }
 
 pub async fn delete_streamer_endpoint(
@@ -44,17 +50,28 @@ pub async fn delete_streamer_endpoint(
     Extension(download_actor_handle): Extension<DownloadActorHandle>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<()>> {
-    download_actor_handle.remove_streamer(&state.get_streamer_by_id(id).await?.url);
-    Ok(Json(state.delete_streamer(id).await?))
+    let _guard = STREAMER_MUTATION_LOCK.lock().await;
+    let existing = state.get_streamer_by_id(id).await?;
+    state.delete_streamer(id).await?;
+    download_actor_handle.remove_streamer(&existing.url);
+    Ok(Json(()))
 }
 
 pub async fn update_streamer_endpoint(
     State(state): State<DynLiveStreamersRepository>,
     Extension(download_actor_handle): Extension<DownloadActorHandle>,
-    Json(request): Json<LiveStreamerEntity>,
+    Path(id): Path<i64>,
+    Json(mut request): Json<LiveStreamerEntity>,
 ) -> AppResult<Json<LiveStreamerDto>> {
-    download_actor_handle.update_streamer(&request.url);
-    Ok(Json(state.update_streamer(request).await?.into_dto()))
+    let _guard = STREAMER_MUTATION_LOCK.lock().await;
+    let old_url = state.get_streamer_by_id(id).await?.url;
+    request.id = id;
+    let updated = state.update_streamer(request).await?;
+    if old_url != updated.url {
+        download_actor_handle.remove_streamer(&old_url);
+    }
+    download_actor_handle.update_streamer(&updated.url);
+    Ok(Json(updated.into_dto()))
 }
 
 pub async fn add_upload_streamer_endpoint(
@@ -73,8 +90,10 @@ pub async fn delete_template_endpoint(
 
 pub async fn update_template_endpoint(
     Extension(streamers_service): Extension<DynUploadStreamersRepository>,
-    Json(request): Json<StudioEntity>,
+    Path(id): Path<i64>,
+    Json(mut request): Json<StudioEntity>,
 ) -> AppResult<Json<StudioEntity>> {
+    request.id = id;
     Ok(Json(streamers_service.update_streamer(request).await?))
 }
 

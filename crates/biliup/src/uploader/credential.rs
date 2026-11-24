@@ -1,8 +1,9 @@
 use crate::client::StatefulClient;
 use futures::Future;
 use reqwest::header;
-use std::io::Seek;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Kind, Result};
 use crate::uploader::bilibili::{BiliBili, ResponseData};
@@ -15,7 +16,7 @@ use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs8::DecodePublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 // const APP_KEY: &str = "ae57252b0c09105d";
@@ -70,19 +71,105 @@ pub fn bilibili_from_info(login_info: LoginInfo, proxy: Option<&str>) -> Result<
     })
 }
 
+static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static COOKIE_COMMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn write_login_info_atomic_inner(
+    path: &Path,
+    info: &LoginInfo,
+    expected_token: Option<(u64, &str)>,
+) -> Result<bool> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("cookies.json");
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = ATOMIC_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path: PathBuf = parent.join(format!(".{file_name}.{pid}.{nanos}.{seq}.tmp"));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let tmp_file = opts.open(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(&tmp_file);
+        serde_json::to_writer_pretty(&mut writer, info)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        writer.flush()?;
+        tmp_file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+
+    let _commit_guard = COOKIE_COMMIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some((expected_mid, expected_refresh)) = expected_token {
+        let matches_disk = std::fs::File::options()
+            .read(true)
+            .open(path)
+            .ok()
+            .and_then(|f| serde_json::from_reader::<_, LoginInfo>(std::io::BufReader::new(f)).ok())
+            .map(|cur| {
+                cur.token_info.mid == expected_mid
+                    && cur.token_info.refresh_token == expected_refresh
+            })
+            .unwrap_or(false);
+        if !matches_disk {
+            let _ = std::fs::remove_file(&tmp_path);
+            warn!(
+                "cookie file {} changed during token refresh; skipping stale overwrite",
+                path.display()
+            );
+            return Ok(false);
+        }
+    }
+
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+
+    Ok(true)
+}
+
+pub fn write_login_info_atomic(path: &Path, info: &LoginInfo) -> Result<()> {
+    write_login_info_atomic_inner(path, info, None)?;
+    Ok(())
+}
+
 pub async fn login_by_cookies(file: impl AsRef<Path>, proxy: Option<&str>) -> Result<BiliBili> {
-    // let path = file.as_ref();
-    let mut file = std::fs::File::options().read(true).write(true).open(file)?;
-    let login_info: LoginInfo = serde_json::from_reader(std::io::BufReader::new(&file))?;
+    let path = file.as_ref();
+    let login_info: LoginInfo = {
+        let file = std::fs::File::options().read(true).open(path)?;
+        serde_json::from_reader(std::io::BufReader::new(file))?
+    };
 
     let client: Credential = Credential::new(proxy);
     let need_refresh = client.validate_tokens(&login_info).await?;
 
     if need_refresh {
+        let original_mid = login_info.token_info.mid;
+        let original_refresh = login_info.token_info.refresh_token.clone();
         let new_info = client.renew_tokens(login_info).await?;
-        file.rewind()?;
-        file.set_len(0)?;
-        serde_json::to_writer_pretty(std::io::BufWriter::new(&file), &new_info)?;
+        write_login_info_atomic_inner(path, &new_info, Some((original_mid, &original_refresh)))?;
         bilibili_from_info(new_info, proxy)
     } else {
         info!("无需更新cookie");
@@ -429,45 +516,50 @@ impl Credential {
         let urlencoded = serde_urlencoded::to_string(&form)?;
         let sign = Self::sign(&urlencoded, AppKeyStore::BiliTV.appsec());
         form["sign"] = Value::from(sign);
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let raw = self
-                .0
-                .client
-                .post("http://passport.bilibili.com/x/passport-tv-login/qrcode/poll")
-                .form(&form)
-                .send()
-                .await?
-                .error_for_status()?;
-            let full = raw.bytes().await?;
+        tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let raw = self
+                    .0
+                    .client
+                    .post("https://passport.bilibili.com/x/passport-tv-login/qrcode/poll")
+                    .form(&form)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let full = raw.bytes().await?;
 
-            let res: ResponseData<ResponseValue> = serde_json::from_slice(&full).map_err(|_| {
-                Kind::Custom(format!(
-                    "error decoding response body, content: {:#?}",
-                    String::from_utf8_lossy(&full)
-                ))
-            })?;
-            match res {
-                ResponseData {
-                    code: 0,
-                    data: Some(ResponseValue::Login(info)),
-                    ..
-                } => {
-                    self.set_cookie(&info.cookie_info);
-                    break Ok(LoginInfo {
-                        platform: Some("BiliTV".to_string()),
-                        ..info
-                    });
-                }
-                ResponseData { code: 86039, .. } => {
-                    // 二维码尚未确认;
-                    // form["ts"] = Value::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-                }
-                _ => {
-                    break Err(Kind::Custom(format!("{res:#?}")));
+                let res: ResponseData<ResponseValue> =
+                    serde_json::from_slice(&full).map_err(|_| {
+                        Kind::Custom(format!(
+                            "error decoding response body, content: {:#?}",
+                            String::from_utf8_lossy(&full)
+                        ))
+                    })?;
+                match res {
+                    ResponseData {
+                        code: 0,
+                        data: Some(ResponseValue::Login(info)),
+                        ..
+                    } => {
+                        self.set_cookie(&info.cookie_info);
+                        break Ok(LoginInfo {
+                            platform: Some("BiliTV".to_string()),
+                            ..info
+                        });
+                    }
+                    ResponseData { code: 86039, .. } => {
+                        // 二维码尚未确认;
+                        // form["ts"] = Value::from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+                    }
+                    _ => {
+                        break Err(Kind::Custom(format!("{res:#?}")));
+                    }
                 }
             }
-        }
+        })
+        .await
+        .map_err(|_| Kind::Custom("Qrcode login timeout".to_string()))?
     }
 
     /// 获取 Web 端 buvid3 和 buvid4
@@ -502,7 +594,7 @@ impl Credential {
         Ok(self
             .0
             .client
-            .post("http://passport.bilibili.com/x/passport-tv-login/qrcode/auth_code")
+            .post("https://passport.bilibili.com/x/passport-tv-login/qrcode/auth_code")
             .form(&form)
             .send()
             .await?
@@ -545,7 +637,7 @@ impl Credential {
     ) -> Result<LoginInfo> {
         info!("login_by_web_qrcode");
         let qrcode: Value = self.0.client
-            .get("http://passport.bilibili.com/qrcode/getLoginUrl")
+            .get("https://passport.bilibili.com/qrcode/getLoginUrl")
             .header(USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0 Iceweasel/38.2.1 BiliApp")
             .send()
             .await?
@@ -563,7 +655,7 @@ impl Credential {
             .send()
             .await?.error_for_status()?;
         self.0.client
-            .post("http://passport.bilibili.com/qrcode/getLoginInfo")
+            .post("https://passport.bilibili.com/qrcode/getLoginInfo")
             .header(USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0 Iceweasel/38.2.1 BiliApp")
             .form(&[("oauthKey", oauth_key)])
             .send()
@@ -653,5 +745,99 @@ impl Credential {
 impl Default for Credential {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LoginInfo, TokenInfo, write_login_info_atomic};
+    use serde_json::json;
+
+    #[test]
+    fn test_write_login_info_atomic_replaces_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_atomic_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cookies.json");
+        std::fs::write(&target, r#"{"old": true}"#).unwrap();
+
+        let info = LoginInfo {
+            cookie_info: json!({"cookies": [{"name": "SESSDATA", "value": "abc"}]}),
+            sso: vec!["https://passport.bilibili.com".to_string()],
+            token_info: TokenInfo {
+                access_token: "new_token".to_string(),
+                expires_in: 3600,
+                mid: 12345,
+                refresh_token: "new_refresh".to_string(),
+            },
+            platform: Some("BiliTV".to_string()),
+        };
+
+        write_login_info_atomic(&target, &info).unwrap();
+
+        let loaded: LoginInfo =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(loaded.token_info.access_token, "new_token");
+        assert_eq!(loaded.token_info.mid, 12345);
+
+        let leftover_tmps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover_tmps.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_login_info_atomic_skips_stale_refresh_overwrite() {
+        use super::write_login_info_atomic_inner;
+
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_cas_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cookies.json");
+
+        let newer_account = LoginInfo {
+            cookie_info: json!({"cookies": [{"name": "SESSDATA", "value": "newer"}]}),
+            sso: vec![],
+            token_info: TokenInfo {
+                access_token: "newer_access".to_string(),
+                expires_in: 3600,
+                mid: 99999,
+                refresh_token: "newer_refresh".to_string(),
+            },
+            platform: Some("BiliTV".to_string()),
+        };
+        write_login_info_atomic(&target, &newer_account).unwrap();
+
+        let stale_refreshed = LoginInfo {
+            cookie_info: json!({"cookies": [{"name": "SESSDATA", "value": "stale"}]}),
+            sso: vec![],
+            token_info: TokenInfo {
+                access_token: "stale_access".to_string(),
+                expires_in: 3600,
+                mid: 11111,
+                refresh_token: "stale_refresh_new".to_string(),
+            },
+            platform: Some("BiliTV".to_string()),
+        };
+
+        let written =
+            write_login_info_atomic_inner(&target, &stale_refreshed, Some((11111, "stale_old")))
+                .unwrap();
+        assert!(!written);
+
+        let loaded: LoginInfo =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(loaded.token_info.mid, 99999);
+        assert_eq!(loaded.token_info.access_token, "newer_access");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

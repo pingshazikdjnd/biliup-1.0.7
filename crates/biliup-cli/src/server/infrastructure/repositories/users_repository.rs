@@ -2,7 +2,6 @@ use crate::server::core::users::{User, UsersRepository};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use anyhow::Context;
 use async_trait::async_trait;
-use sqlx::{query, query_as};
 
 #[derive(Clone)]
 pub struct SqliteUsersStreamersRepository {
@@ -18,29 +17,27 @@ impl SqliteUsersStreamersRepository {
 #[async_trait]
 impl UsersRepository for SqliteUsersStreamersRepository {
     async fn create_user(&self, user: User) -> anyhow::Result<User> {
-        query_as!(
-            User,
+        sqlx::query_as::<_, User>(
             r#"
         insert into users (name, value, platform)
-        values ($1, $2, $3)
-        returning id, name as "name!", value as "value!", platform as "platform!"
+        values (?, ?, ?)
+        returning id, name, value, platform
             "#,
-            user.name,
-            user.value,
-            user.platform
         )
+        .bind(user.name)
+        .bind(user.value)
+        .bind(user.platform)
         .fetch_one(&self.pool)
         .await
         .context("an unexpected error occured while creating the user")
     }
 
     async fn get_users(&self) -> anyhow::Result<Vec<User>> {
-        query_as!(
-            User,
+        sqlx::query_as::<_, User>(
             r#"
-        select *
+        select id, name, value, platform
         from users
-            "#
+            "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -48,16 +45,11 @@ impl UsersRepository for SqliteUsersStreamersRepository {
     }
 
     async fn delete_user(&self, id: i64) -> anyhow::Result<()> {
-        query!(
-            r#"
-       delete from users
-       where id = $1
-            "#,
-            id
-        )
-        .execute(&self.pool)
-        .await
-        .context("an unexpected error occurred while deleting user")?;
+        sqlx::query("delete from users where id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("an unexpected error occurred while deleting user")?;
         Ok(())
     }
 

@@ -41,25 +41,25 @@ impl ApplicationController {
         let app = Router::new()
             // `GET /` goes to `root`
             .route("/v1/streamers", get(get_streamers_endpoint))
-            .route("/v1/streamers/:id", get(get_streamer_endpoint))
-            .route("/v1/streamers/:id", delete(delete_streamer_endpoint))
-            .route("/v1/streamers/:id", put(update_streamer_endpoint))
+            .route("/v1/streamers/{id}", get(get_streamer_endpoint))
+            .route("/v1/streamers/{id}", delete(delete_streamer_endpoint))
+            .route("/v1/streamers/{id}", put(update_streamer_endpoint))
             .route("/v1/streamers", post(add_streamer_endpoint))
             .route("/v1/upload/streamers", get(get_upload_streamers_endpoint))
             // .route(
-            //     "/v1/upload/streamers/:id",
+            //     "/v1/upload/streamers/{id}",
             //     ,
             // )
             .route(
-                "/v1/upload/streamers/:id",
+                "/v1/upload/streamers/{id}",
                 delete(delete_template_endpoint)
                     .put(update_template_endpoint)
                     .get(get_upload_streamer_endpoint),
             )
-            // .route("/v1/upload/streamers/:id", )
+            // .route("/v1/upload/streamers/{id}", )
             .route("/v1/upload/streamers", post(add_upload_streamer_endpoint))
             .route("/v1/users", get(get_users_endpoint).post(add_user_endpoint))
-            .route("/v1/users/:id", delete(delete_user_endpoint))
+            .route("/v1/users/{id}", delete(delete_user_endpoint))
             .route("/bili/archive/pre", get(archive_pre_endpoint))
             .route("/bili/space/myinfo", get(get_myinfo_endpoint))
             .route("/bili/proxy", get(get_proxy_endpoint))

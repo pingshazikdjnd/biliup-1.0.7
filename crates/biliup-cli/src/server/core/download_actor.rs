@@ -26,7 +26,9 @@ async fn start_monitor(
 ) {
     let n = &mut 0;
     loop {
-        let (url, status) = task.get(n);
+        let Some((url, status)) = task.get(n) else {
+            break;
+        };
         if status != StreamStatus::Working {
             task.change(&url, StreamStatus::Inspecting);
         }
@@ -45,6 +47,19 @@ async fn start_monitor(
                 } else {
                     ("./video/%Y-%m-%d/%H_%M_%S{title}".to_string(), None, None)
                 };
+                let still_present = {
+                    let mut guard = task.write();
+                    if let Some(st) = guard.get_mut(&url) {
+                        *st = StreamStatus::Working;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !still_present {
+                    debug!(url = %url, "streamer removed before download start; skipping");
+                    continue;
+                }
                 let live_streamers_service = live_streamers_service.clone();
                 {
                     let client = client.clone();
@@ -79,7 +94,6 @@ async fn start_monitor(
                         Ok::<_, Box<dyn Error + Send + Sync>>(())
                     });
                 }
-                task.change(&url, StreamStatus::Working);
             }
             (Ok(_site), StreamStatus::Pending) => {
                 println!("Pending");
@@ -193,23 +207,42 @@ impl DownloadActorHandle {
     }
 
     pub fn update_streamer(&self, url: &str) {
-        self.remove_streamer(url);
-        self.add_streamer(url);
+        let Some(extractor) = find_extractor(url) else {
+            return;
+        };
+        let type_id = extractor.as_any().type_id();
+        let mut platform_guard = self.platform_map.write().unwrap();
+        if let Some((cy, _)) = platform_guard.get(&type_id)
+            && cy.write().contains_key(url)
+        {
+            return;
+        }
+        self.actor
+            .add_streamer(platform_guard.deref_mut(), url.to_string());
     }
 
     pub fn remove_streamer(&self, url: &str) {
-        find_extractor(url).and_then(|extractor| {
-            self.platform_map
-                .read()
-                .unwrap()
-                .get(&extractor.as_any().type_id())
-                .and_then(|(cy, join_handle)| {
-                    let mut guard = cy.write();
-                    if guard.len() <= 1 {
-                        join_handle.abort()
-                    }
-                    guard.remove(url)
-                })
-        });
+        let Some(extractor) = find_extractor(url) else {
+            return;
+        };
+        let type_id = extractor.as_any().type_id();
+        let handle_to_abort = {
+            let mut platform_guard = self.platform_map.write().unwrap();
+            let should_remove = if let Some((cy, _)) = platform_guard.get(&type_id) {
+                let mut cy_guard = cy.write();
+                cy_guard.shift_remove(url);
+                cy_guard.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                platform_guard.remove(&type_id).map(|(_, handle)| handle)
+            } else {
+                None
+            }
+        };
+        if let Some(handle) = handle_to_abort {
+            handle.abort();
+        }
     }
 }
