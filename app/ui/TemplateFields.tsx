@@ -353,6 +353,11 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
             label={{ text: '定时发布' }}
             checkedText="｜"
             uncheckedText="〇"
+            onChange={checked => {
+              if (checked && !formApi.getValue('dtime')) {
+                formApi.setValue('dtime', selectedHours * 3600 + selectedMinutes * 60)
+              }
+            }}
           />
           <span style={{ paddingLeft: 12, fontSize: 12 }}>
             (当前+2小时 ≤ 可选时间 ≤
@@ -389,7 +394,11 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
               list={allowedHoursList}
               type={1}
               selectedIndex={allowedHoursList.findIndex(item => item.value === selectedHours)}
-              onSelect={item => setSelectedHours(item.value)}
+              onSelect={item => {
+                const nextHours = Number(item.value)
+                setSelectedHours(nextHours)
+                formApi.setValue('dtime', nextHours * 3600 + selectedMinutes * 60)
+              }}
             />
             <ScrollItem
               mode="wheel"
@@ -397,7 +406,11 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
               list={allowedMinutesList}
               type={2}
               selectedIndex={allowedMinutesList.findIndex(item => item.value === selectedMinutes)}
-              onSelect={item => setSelectedMinutes(item.value)}
+              onSelect={item => {
+                const nextMinutes = Number(item.value)
+                setSelectedMinutes(nextMinutes)
+                formApi.setValue('dtime', selectedHours * 3600 + nextMinutes * 60)
+              }}
             />
           </ScrollList>
         ) : null}

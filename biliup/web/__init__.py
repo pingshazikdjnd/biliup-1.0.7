@@ -896,19 +896,25 @@ async def websocket_logs(request):
             if current_size < file_size:
                 await ws.send_str("日志文件被截断，重新加载...")
                 last_lines = read_last_n_lines(log_file, 50)
+                file_size = os.path.getsize(log_file)
                 for line in last_lines:
                     await ws.send_str(line)
-                file_size = current_size
                 continue
 
-            # 如果文件增长，读取新内容
+            # 如果文件增长，按二进制逐字节增量读取到最后一个换行符边界，避免多字节 UTF-8 半截写入报错
             if current_size > file_size:
-                with open(log_file, 'r', encoding='utf-8') as f:
+                lines_to_send = []
+                with open(log_file, 'rb') as f:
                     f.seek(file_size)
-                    new_content = f.read()
-                    for line in new_content.splitlines():
-                        await ws.send_str(line)
-                file_size = current_size
+                    raw_data = f.read()
+                    last_newline = raw_data.rfind(b'\n')
+                    if last_newline != -1:
+                        f.seek(file_size + last_newline + 1)
+                        file_size = f.tell()
+                        complete_bytes = raw_data[:last_newline + 1]
+                        lines_to_send = complete_bytes.decode('utf-8', errors='replace').splitlines()
+                for line in lines_to_send:
+                    await ws.send_str(line)
     except Exception as e:
         if not ws.closed:
             await ws.send_str(f"监控日志文件错误: {str(e)}")

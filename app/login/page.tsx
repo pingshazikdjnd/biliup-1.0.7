@@ -2,7 +2,7 @@
 
 import { Form, Button, Card, Toast, Typography } from "@douyinfe/semi-ui";
 import { IconUser, IconLock } from "@douyinfe/semi-icons";
-import { useAuth } from '../lib/auth-context';
+import { checkBasicAuth, useAuth } from '../lib/auth-context';
 import { useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
 
@@ -12,20 +12,18 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   
   useEffect(() => {
+    let active = true;
     // 检查是否需要认证
     const auth = localStorage.getItem('auth');
-    fetch('/api/basic', {
-      headers: {
-        'Authorization': `Basic ${auth}` // 使用测试凭据
-      }
-    }).then(response => {
-      if (response.status !== 401) {
-        // 如果不需要认证，直接跳转到主页
+    checkBasicAuth(auth).then(ok => {
+      if (active && ok) {
+        // 如果不需要认证或凭据有效，直接跳转到主页
         router.push('/');
       }
-    }).catch(() => {
-      // 如果发生错误，默认需要认证，保持在登录页面
     });
+    return () => {
+      active = false;
+    };
   }, [router]);
   
   const handleSubmit = async (values: { username: string; password: string }) => {

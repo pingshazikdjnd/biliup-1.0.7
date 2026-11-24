@@ -11,6 +11,32 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+const API_SERVER = process.env.NEXT_PUBLIC_API_SERVER ?? '';
+
+export function encodeBasicAuth(username: string, password: string): string {
+  const bytes = new TextEncoder().encode(`${username}:${password}`);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+export function buildAuthHeaders(auth: string | null): Record<string, string> {
+  return auth ? { Authorization: `Basic ${auth}` } : {};
+}
+
+export async function checkBasicAuth(auth: string | null): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_SERVER}/api/basic`, {
+      headers: buildAuthHeaders(auth),
+    });
+    return response.ok;
+  } catch (error) {
+    return false;
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const router = useRouter();
@@ -38,37 +64,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const checkAuthRequired = async () => {
-    try {
-      const auth = localStorage.getItem('auth');
-      const response = await fetch('/api/basic', {
-        headers: {
-          'Authorization': `Basic ${auth}` // 使用测试凭据
-        }
-      });
-      // 如果返回401，说明需要认证
-      return response.status === 401;
-    } catch (error) {
-      // 如果发生错误，默认需要认证
-      return true;
-    }
+    const auth = localStorage.getItem('auth');
+    const ok = await checkBasicAuth(auth);
+    return !ok;
   };
 
   const verifyCredentials = async (credentials: string) => {
-    try {
-      const response = await fetch('/api/basic', {
-        headers: {
-          'Authorization': `Basic ${credentials}`
-        }
-      });
-      return response.ok;
-    } catch (error) {
-      return false;
-    }
+    return checkBasicAuth(credentials);
   };
 
   const login = async (username: string, password: string) => {
     try {
-      const credentials = btoa(`${username}:${password}`);
+      const credentials = encodeBasicAuth(username, password);
       const valid = await verifyCredentials(credentials);
       
       if (valid) {
