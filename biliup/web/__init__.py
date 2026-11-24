@@ -806,6 +806,74 @@ def read_last_n_lines(file_path, n=50):
         return [line.decode('utf-8', errors='replace') for line in lines[-n:]]
 
 
+WS_LOG_MAX_CHUNK_BYTES = 1024 * 1024  # 单次增量读取上限（1MB），避免超长无换行日志耗尽内存
+
+
+def _utf8_safe_prefix_len(data: bytes) -> int:
+    """返回不包含末尾被截断多字节 UTF-8 序列的前缀长度（最多回退 3 字节）。"""
+    length = len(data)
+    if length == 0:
+        return 0
+    start = length - 1
+    while start >= max(0, length - 4) and (data[start] & 0xC0) == 0x80:
+        start -= 1
+    if start < 0:
+        return length
+    lead = data[start]
+    if lead < 0x80:
+        expected = 1
+    elif (lead & 0xE0) == 0xC0:
+        expected = 2
+    elif (lead & 0xF0) == 0xE0:
+        expected = 3
+    elif (lead & 0xF8) == 0xF0:
+        expected = 4
+    else:
+        return length
+    if length - start < expected:
+        return start
+    return length
+
+
+def _read_last_n_complete_lines(file_path, n=50):
+    """单次二进制读取最后 n 行完整日志（仅消费到最后一个换行符边界），
+    返回 (lines, consumed_offset, observed_size, file_id)。"""
+    with open(file_path, 'rb') as f:
+        st = os.fstat(f.fileno())
+        observed_size = st.st_size
+        file_id = (st.st_dev, st.st_ino)
+        if observed_size == 0:
+            return [], 0, 0, file_id
+
+        block_size = 4096
+        pos = observed_size
+        consumed_offset = 0
+        while pos > 0:
+            read_size = min(block_size, pos)
+            pos -= read_size
+            f.seek(pos)
+            chunk = f.read(read_size)
+            nl_idx = chunk.rfind(b'\n')
+            if nl_idx != -1:
+                consumed_offset = pos + nl_idx + 1
+                break
+
+        if consumed_offset == 0:
+            return [], 0, observed_size, file_id
+
+        read_pos = consumed_offset
+        data = b''
+        lines = []
+        while read_pos > 0 and len(lines) <= n:
+            read_size = min(block_size, read_pos)
+            read_pos -= read_size
+            f.seek(read_pos)
+            data = f.read(read_size) + data
+            lines = data.splitlines()
+
+        return [line.decode('utf-8', errors='replace') for line in lines[-n:]], consumed_offset, observed_size, file_id
+
+
 @routes.get('/v1/static-token')
 async def get_static_token(request):
     """签发仅限单文件短时有效的静态资源访问令牌（用于视频播放）"""
@@ -845,13 +913,11 @@ async def websocket_logs(request):
 
     log_file = file_param
 
-    # 发送初始内容（最后50行）
+    # 发送初始内容（最后50行完整日志）
     try:
-        # 使用高效方法读取最后50行
-        last_lines = read_last_n_lines(log_file, 50)
+        last_lines, file_size, last_observed_size, file_id = _read_last_n_complete_lines(log_file, 50)
         for line in last_lines:
             await ws.send_str(line)
-        file_size = os.path.getsize(log_file)
     except FileNotFoundError:
         await ws.send_str(f"日志文件 {log_file} 不存在")
         await ws.close()
@@ -885,30 +951,49 @@ async def websocket_logs(request):
                 logger.debug("WebSocket连接已关闭")
                 break
 
-            # 检查文件是否存在
-            if not os.path.exists(log_file):
+            # 检查文件是否存在并获取元信息
+            try:
+                st = os.stat(log_file)
+            except FileNotFoundError:
                 await ws.send_str(f"日志文件 {log_file} 不再存在")
                 break
 
-            current_size = os.path.getsize(log_file)
+            current_size = st.st_size
+            current_id = (st.st_dev, st.st_ino)
+            file_replaced = file_id[1] != 0 and current_id != file_id
 
-            # 如果文件被截断，重新读取前50行
-            if current_size < file_size:
+            # 如果文件被截断或发生轮转替换，重新读取最后50行完整日志
+            if file_replaced or current_size < last_observed_size or current_size < file_size:
                 await ws.send_str("日志文件被截断，重新加载...")
-                last_lines = read_last_n_lines(log_file, 50)
+                last_lines, file_size, last_observed_size, file_id = _read_last_n_complete_lines(log_file, 50)
                 for line in last_lines:
                     await ws.send_str(line)
-                file_size = current_size
                 continue
 
-            # 如果文件增长，读取新内容
+            last_observed_size = current_size
+
+            # 如果文件增长，按二进制逐块增量读取到最后一个换行符边界，避免多字节 UTF-8 半截写入报错
             if current_size > file_size:
-                with open(log_file, 'r', encoding='utf-8') as f:
+                lines_to_send = []
+                with open(log_file, 'rb') as f:
                     f.seek(file_size)
-                    new_content = f.read()
-                    for line in new_content.splitlines():
-                        await ws.send_str(line)
-                file_size = current_size
+                    raw_data = f.read(WS_LOG_MAX_CHUNK_BYTES)
+                    last_newline = raw_data.rfind(b'\n')
+                    if last_newline != -1:
+                        consume_len = last_newline + 1
+                        f.seek(file_size + consume_len)
+                        file_size = f.tell()
+                        complete_bytes = raw_data[:consume_len]
+                        lines_to_send = complete_bytes.decode('utf-8', errors='replace').splitlines()
+                    elif len(raw_data) >= WS_LOG_MAX_CHUNK_BYTES:
+                        safe_len = _utf8_safe_prefix_len(raw_data)
+                        if safe_len == 0:
+                            safe_len = len(raw_data)
+                        f.seek(file_size + safe_len)
+                        file_size = f.tell()
+                        lines_to_send = [raw_data[:safe_len].decode('utf-8', errors='replace')]
+                for line in lines_to_send:
+                    await ws.send_str(line)
     except Exception as e:
         if not ws.closed:
             await ws.send_str(f"监控日志文件错误: {str(e)}")

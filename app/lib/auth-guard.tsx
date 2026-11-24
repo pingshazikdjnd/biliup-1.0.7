@@ -1,6 +1,6 @@
 "use client";
 
-import { useAuth } from './auth-context';
+import { checkBasicAuth, useAuth } from './auth-context';
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import { Spin } from '@douyinfe/semi-ui';
@@ -11,33 +11,27 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
   const [checked, setChecked] = useState(false);
 
   useEffect(() => {
-    // 如果用户未认证，则检查是否需要认证
+    let active = true;
     if (!isAuthenticated) {
-      // 检查是否需要认证
       const auth = localStorage.getItem('auth');
-      fetch('/api/basic', {
-        headers: {
-          'Authorization': `Basic ${auth}` // 使用测试凭据
-        }
-      }).then(response => {
-        if (response.status !== 401) {
-          // 如果不需要认证，直接显示内容
+      checkBasicAuth(auth).then(ok => {
+        if (!active) return;
+        if (ok) {
           setChecked(true);
         } else {
-          // 如果需要认证，重定向到登录页面
           router.push('/login');
         }
-      }).catch(() => {
-        // 如果发生错误，默认需要认证
-        router.push('/login');
       });
     } else {
       setChecked(true);
     }
+    return () => {
+      active = false;
+    };
   }, [isAuthenticated, router]);
 
   // 如果用户已认证或不需要认证且已检查，显示子组件
-  if ((isAuthenticated || checked) && checked) {
+  if (isAuthenticated || checked) {
     return <>{children}</>;
   }
 

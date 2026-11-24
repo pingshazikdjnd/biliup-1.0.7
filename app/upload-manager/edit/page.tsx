@@ -17,6 +17,8 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
 import useSWR from 'swr'
 import { useTypeTree } from '@/app/lib/use-streamers'
+import { AuthGuard } from '@/app/lib/auth-guard'
+import ProtectedLayout from '@/app/lib/protected-layout'
 
 const Edit = () => {
   const { Paragraph } = Typography
@@ -67,26 +69,27 @@ const Edit = () => {
       <div style={{ display: 'flex', flexDirection: 'row-reverse', paddingRight: 12 }}>
         <Button
           onClick={async () => {
-            let values = await api.current?.validate()
             try {
+              const values = await api.current?.validate()
+              if (!values) return
               const studioEntity = {
                 template_name: values?.template_name,
                 user_cookie: values?.user_cookie,
                 copyright: values?.copyright,
                 id: values?.id,
                 copyright_source: values?.copyright_source ?? '',
-                tid: values?.tid[1],
+                tid: values?.tid?.[1],
                 cover_path: values?.cover_path ?? '',
                 title: values?.title ?? '',
                 description: values?.description ?? '',
                 dynamic: values?.dynamic ?? '',
                 tags: values?.tags ?? [],
                 // interactive: values?.interactive ?? 0,
-                dolby: values?.sound.includes('dolby') ? 1 : 0,
-                hires: values?.sound.includes('hires') ? 1 : 0,
-                up_selection_reply: values?.interaction.includes('up_selection_reply') ? 1 : 0,
-                up_close_reply: values?.interaction.includes('up_close_reply') ? 1 : 0,
-                up_close_danmu: values?.interaction.includes('up_close_danmu') ? 1 : 0,
+                dolby: values?.sound?.includes('dolby') ? 1 : 0,
+                hires: values?.sound?.includes('hires') ? 1 : 0,
+                up_selection_reply: values?.interaction?.includes('up_selection_reply') ? 1 : 0,
+                up_close_reply: values?.interaction?.includes('up_close_reply') ? 1 : 0,
+                up_close_danmu: values?.interaction?.includes('up_close_danmu') ? 1 : 0,
                 charging_pay: values?.charging_pay ? 1 : 0,
                 no_reprint: values?.no_reprint ? 1 : 0,
                 is_only_self: values?.is_only_self ? 1 : 0,
@@ -104,8 +107,8 @@ const Edit = () => {
             } catch (e: any) {
               // error handling
               Notification.error({
-                title: '创建失败',
-                content: <Paragraph style={{ maxWidth: 450 }}>{e.message}</Paragraph>,
+                title: '更新失败',
+                content: <Paragraph style={{ maxWidth: 450 }}>{e?.message || '请检查表单填写内容'}</Paragraph>,
                 // theme: 'light',
                 // duration: 0,
                 style: { width: 'min-content' },
@@ -135,9 +138,13 @@ const Edit = () => {
 
 const EditTemplate: React.FC = () => {
   return (
-    <Suspense>
-      <Edit></Edit>
-    </Suspense>
+    <AuthGuard>
+      <ProtectedLayout>
+        <Suspense>
+          <Edit></Edit>
+        </Suspense>
+      </ProtectedLayout>
+    </AuthGuard>
   )
 }
 

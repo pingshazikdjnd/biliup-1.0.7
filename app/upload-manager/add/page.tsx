@@ -8,6 +8,8 @@ import { sendRequest, StudioEntity } from '../../lib/api-streamer'
 import useSWRMutation from 'swr/mutation'
 import { useRouter } from 'next/navigation'
 import TemplateFields from '../../ui/TemplateFields'
+import { AuthGuard } from '@/app/lib/auth-guard'
+import ProtectedLayout from '@/app/lib/protected-layout'
 
 export default function Add() {
   const { Paragraph } = Typography
@@ -28,8 +30,9 @@ export default function Add() {
   }, [])
 
   return (
-    <>
-      <div style={{ display: 'flex', flexDirection: 'row-reverse', paddingRight: 12 }}>
+    <AuthGuard>
+      <ProtectedLayout>
+        <div style={{ display: 'flex', flexDirection: 'row-reverse', paddingRight: 12 }}>
         <Button
           onClick={() => {
             api.current?.submitForm()
@@ -59,18 +62,18 @@ export default function Add() {
                 copyright: values.copyright,
                 id: values.id,
                 copyright_source: values.copyright_source ?? '',
-                tid: values.tid[1],
+                tid: values?.tid?.[1],
                 cover_path: values.cover_path ?? '',
                 title: values.title ?? '',
                 description: values.description ?? '',
                 dynamic: values.dynamic ?? '',
                 tags: values.tags ?? [],
                 // interactive: values.interactive ?? 0,
-                dolby: values.sound?.includes('dolby') ? 1 : 0,
-                hires: values.sound?.includes('hires') ? 1 : 0,
-                up_selection_reply: values.interaction?.includes('up_selection_reply') ? 1 : 0,
-                up_close_reply: values.interaction?.includes('up_close_reply') ? 1 : 0,
-                up_close_danmu: values.interaction?.includes('up_close_danmu') ? 1 : 0,
+                dolby: values?.sound?.includes('dolby') ? 1 : 0,
+                hires: values?.sound?.includes('hires') ? 1 : 0,
+                up_selection_reply: values?.interaction?.includes('up_selection_reply') ? 1 : 0,
+                up_close_reply: values?.interaction?.includes('up_close_reply') ? 1 : 0,
+                up_close_danmu: values?.interaction?.includes('up_close_danmu') ? 1 : 0,
                 charging_pay: values.charging_pay ? 1 : 0,
                 no_reprint: values.no_reprint ? 1 : 0,
                 is_only_self: values.is_only_self ? 1 : 0,
@@ -90,7 +93,7 @@ export default function Add() {
               // error handling
               Notification.error({
                 title: '创建失败',
-                content: <Paragraph style={{ maxWidth: 450 }}>{e.message}</Paragraph>,
+                content: <Paragraph style={{ maxWidth: 450 }}>{e?.message || '未知错误'}</Paragraph>,
                 // theme: 'light',
                 // duration: 0,
                 style: { width: 'min-content' },
@@ -104,6 +107,7 @@ export default function Add() {
           labelPosition={labelPosition}
         />
       </main>
-    </>
+      </ProtectedLayout>
+    </AuthGuard>
   )
 }
