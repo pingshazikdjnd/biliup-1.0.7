@@ -4,6 +4,7 @@ import copy
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import quote
 
 from aiohttp import WSServerHandshakeError
@@ -148,6 +149,57 @@ class TestPR8WebsocketLogs(unittest.IsolatedAsyncioTestCase):
             async with client.ws_connect(f'/ws/logs?file=../secret.log&authorization={auth_q}') as ws:
                 err_msg = await asyncio.wait_for(ws.receive_str(), timeout=3)
                 self.assertIn('不允许访问', err_msg)
+
+    async def test_websocket_logs_initial_partial_utf8_truncation_after_partial_and_bounded_chunk(self):
+        # 1. 首次连接时文件末尾存在半截多字节 UTF-8：不提前发乱码，补齐后完整输出
+        partial_tail = '完整中文尾行\n'.encode('utf-8')
+        with open(self._log_path, 'wb') as f:
+            f.write(b'old\n')
+            f.write(partial_tail[:2])
+
+        app = await self._create_app(password=None)
+        async with TestClient(TestServer(app)) as client:
+            async with client.ws_connect('/ws/logs?file=ds_update.log') as ws:
+                self.assertEqual(await asyncio.wait_for(ws.receive_str(), timeout=3), 'old')
+
+                with open(self._log_path, 'ab') as f:
+                    f.write(partial_tail[2:])
+                    f.flush()
+                self.assertEqual(await asyncio.wait_for(ws.receive_str(), timeout=3), '完整中文尾行')
+
+                # 2. 写入大量无换行内容（file_size 未推进），再截断为略大于原 file_size 的新文件
+                with open(self._log_path, 'wb') as f:
+                    f.write(b'old\n')
+                    f.flush()
+                self.assertIn('截断', await asyncio.wait_for(ws.receive_str(), timeout=3))
+                self.assertEqual(await asyncio.wait_for(ws.receive_str(), timeout=3), 'old')
+
+                with open(self._log_path, 'ab') as f:
+                    f.write(b'x' * 100)
+                    f.flush()
+                # 等待至少一次轮询观察到 104 字节
+                await asyncio.sleep(0.7)
+
+                # 截断并写入 7 字节 (>4 但 <104)，必须触发截断重载而不是漏前缀只发 'og'
+                with open(self._log_path, 'wb') as f:
+                    f.write(b'newlog\n')
+                    f.flush()
+                self.assertIn('截断', await asyncio.wait_for(ws.receive_str(), timeout=3))
+                self.assertEqual(await asyncio.wait_for(ws.receive_str(), timeout=3), 'newlog')
+
+                # 3. 单行超长无换行超过 WS_LOG_MAX_CHUNK_BYTES 时，在 UTF-8 安全边界分片推进不乱码
+                with patch.object(web_mod, 'WS_LOG_MAX_CHUNK_BYTES', 10):
+                    # 4个中文字符 = 12 字节 > 10，前10字节会切在4个字符的中间，安全边界应只消费前9字节（3字符）
+                    with open(self._log_path, 'ab') as f:
+                        f.write('一二三四\n'.encode('utf-8'))
+                        f.flush()
+                    part1 = await asyncio.wait_for(ws.receive_str(), timeout=3)
+                    part2 = await asyncio.wait_for(ws.receive_str(), timeout=3)
+                    self.assertEqual(part1, '一二三')
+                    self.assertEqual(part2, '四')
+                    self.assertNotIn('\ufffd', part1 + part2)
+
+                await ws.close()
 
 
 if __name__ == '__main__':

@@ -42,11 +42,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const router = useRouter();
 
   useEffect(() => {
+    let active = true;
     // 检查是否存在保存的认证信息
     const auth = localStorage.getItem('auth');
     if (auth) {
       // 验证凭据是否仍然有效
       verifyCredentials(auth).then(valid => {
+        if (!active || localStorage.getItem('auth') !== auth) return;
         setIsAuthenticated(valid);
         if (!valid) {
           localStorage.removeItem('auth');
@@ -55,12 +57,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } else {
       // 如果没有保存的认证信息，检查是否需要认证
       checkAuthRequired().then(required => {
+        if (!active || localStorage.getItem('auth') !== null) return;
         if (!required) {
           // 如果不需要认证，设置为已认证状态
           setIsAuthenticated(true);
         }
       });
     }
+    return () => {
+      active = false;
+    };
   }, []);
 
   const checkAuthRequired = async () => {
