@@ -342,8 +342,10 @@ async def streamers(request):
         org_url = org.url
         db.delete(org)
         db.commit()
-        config.load_from_db(db)
-        context['PluginInfo'].delete(org_url)
+        try:
+            config.load_from_db(db)
+        finally:
+            context['PluginInfo'].delete(org_url)
     return web.HTTPOk()
 
 

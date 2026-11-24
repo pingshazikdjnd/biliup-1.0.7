@@ -170,8 +170,16 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(os.path.exists(f'{streamer}_1.flv'))
         self.assertTrue(os.path.exists(f'{streamer}_1.xml'))
 
+        # 兼容 list 类型的 url 配置且列表内其他地址处于录制中（不能抛 TypeError）
+        config['streamers'][streamer]['url'] = [url, 'https://live.test/rec_2']
+        fake_plugin_info.url_status = {url: 0, 'https://live.test/rec_2': 1}
+        with patch.object(upload_mod, 'SessionLocal', self._TestSession):
+            res_list_url = upload_mod.UploadBase.file_list(streamer)
+        self.assertEqual(res_list_url, [upload_mod.UploadBase.FileInfo(video=f'{streamer}_0.flv', danmaku=None)])
+        self.assertTrue(os.path.exists(f'{streamer}_1.flv.part'))
+
         # 录制结束后（url_status=0），.part 正常去后缀并被识别
-        fake_plugin_info.url_status = {url: 0}
+        fake_plugin_info.url_status = {url: 0, 'https://live.test/rec_2': 0}
         with open(f'{streamer}_1.flv.part', 'wb') as f:
             f.write(b'y' * 2048)
 
@@ -234,6 +242,7 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
         url = 'https://live.test/async'
         fake_plugin_info = MagicMock()
         fake_plugin_info.url_status = {url: 0}
+        fake_plugin_info.inverted_index = {url: name}
         app_mod.context['PluginInfo'] = fake_plugin_info
 
         lock = NamedLock(f'upload_file_list_{name}')
@@ -250,6 +259,16 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
                 return True
 
         sent_events = []
+        watchdog_triggered = threading.Event()
+
+        def _watchdog_release():
+            watchdog_triggered.set()
+            if lock.locked():
+                lock.release()
+
+        watchdog = threading.Timer(3.0, _watchdog_release)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             with patch.object(app_mod.event_manager, 'send_event', side_effect=lambda ev: sent_events.append(ev)):
                 check_task = asyncio.create_task(app_mod.singleton_check(DummyPlatform, name, url))
@@ -270,20 +289,80 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(heartbeat_ran)
                 self.assertFalse(check_task.done())
         finally:
+            watchdog.cancel()
             if lock.locked():
                 lock.release()
 
+        self.assertFalse(watchdog_triggered.is_set(), 'watchdog fired — singleton_check blocked event loop')
         with patch.object(app_mod.event_manager, 'send_event', side_effect=lambda ev: sent_events.append(ev)):
             await asyncio.wait_for(check_task, timeout=2.0)
 
         self.assertTrue(any(ev.type_ == 'pre_download' for ev in sent_events))
 
+    async def test_singleton_check_cancelled_or_removed_url_skips_pre_download(self):
+        name = 'cancel_or_removed_streamer'
+        url = 'https://live.test/cancel_removed'
+        fake_plugin_info = MagicMock()
+        fake_plugin_info.url_status = {url: 0}
+        fake_plugin_info.inverted_index = {url: name}
+        app_mod.context['PluginInfo'] = fake_plugin_info
+
+        ready_to_lock = asyncio.Event()
+
+        class DummyPlatform:
+            def __init__(self, n, u):
+                pass
+
+            async def acheck_stream(self, is_check=False):
+                return True
+
+            def should_record(self):
+                ready_to_lock.set()
+                return True
+
+        # A. 任务在等锁期间被取消，释放锁后不能再派发 PRE_DOWNLOAD
+        lock = NamedLock(f'upload_file_list_{name}')
+        sent_events = []
+        self.assertTrue(lock.acquire(timeout=2))
+        try:
+            with patch.object(app_mod.event_manager, 'send_event', side_effect=lambda ev: sent_events.append(ev)):
+                check_task = asyncio.create_task(app_mod.singleton_check(DummyPlatform, name, url))
+                await asyncio.wait_for(ready_to_lock.wait(), timeout=2.0)
+                await asyncio.sleep(0.05)
+                check_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await check_task
+                lock.release()
+                await asyncio.sleep(0.05)
+        finally:
+            if lock.locked():
+                lock.release()
+        self.assertEqual([ev for ev in sent_events if ev.type_ == 'pre_download'], [])
+
+        # B. 主播 URL 在等锁期间从 inverted_index 移除，释放锁后不能派发旧 URL 的 PRE_DOWNLOAD
+        ready_to_lock.clear()
+        sent_events.clear()
+        self.assertTrue(lock.acquire(timeout=2))
+        try:
+            with patch.object(app_mod.event_manager, 'send_event', side_effect=lambda ev: sent_events.append(ev)):
+                check_task = asyncio.create_task(app_mod.singleton_check(DummyPlatform, name, url))
+                await asyncio.wait_for(ready_to_lock.wait(), timeout=2.0)
+                await asyncio.sleep(0.05)
+                fake_plugin_info.inverted_index.pop(url, None)
+                lock.release()
+                await asyncio.wait_for(check_task, timeout=2.0)
+        finally:
+            if lock.locked():
+                lock.release()
+        self.assertEqual([ev for ev in sent_events if ev.type_ == 'pre_download'], [])
+
     def test_config_load_from_db_atomicity_and_falsy_zero_override(self):
         with self._TestSession() as db:
-            db.add(Configuration(
+            cfg_row = Configuration(
                 key='config',
                 value=json.dumps({'dolby': 1, 'no_reprint': 1, 'lines': 'AUTO'}),
-            ))
+            )
+            db.add(cfg_row)
             tpl = UploadStreamers(
                 template_name='tpl0',
                 tags=['tag1'],
@@ -304,14 +383,30 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
             config.data['PluginInfo'] = fake_pi
 
             stop_evt = threading.Event()
+            reader_started = threading.Event()
             read_errors = []
+            read_count = 0
 
             def concurrent_reader():
+                nonlocal read_count
+                reader_started.set()
                 while not stop_evt.is_set():
                     try:
-                        # 原子替换期间始终可见完整的 streamers 与 PluginInfo
-                        _ = config.data['streamers']
-                        _ = config.data['PluginInfo']
+                        # 获取单次引用快照并校验跨字段一致性不变量
+                        snap = config.data
+                        if snap['PluginInfo'] is not fake_pi:
+                            raise AssertionError('PluginInfo lost or mismatched')
+                        streamer_cfg = snap['streamers']['atomic_streamer']
+                        expected = {
+                            'AUTO': (0, 'bili_web'),
+                            'WS': (1, 'biliup-rs'),
+                        }.get(snap.get('lines'))
+                        if expected is None or (streamer_cfg.get('dolby'), streamer_cfg.get('uploader')) != expected:
+                            raise AssertionError(
+                                f"Inconsistent state observed: lines={snap.get('lines')}, "
+                                f"dolby={streamer_cfg.get('dolby')}, uploader={streamer_cfg.get('uploader')}"
+                            )
+                        read_count += 1
                     except Exception as exc:
                         read_errors.append(exc)
                         break
@@ -319,14 +414,26 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
             config.load_from_db(db)
             reader = threading.Thread(target=concurrent_reader)
             reader.start()
+            self.assertTrue(reader_started.wait(timeout=2))
             try:
-                for _ in range(50):
+                # 在两套关联配置之间交替重载，最终回到 falsy 0 覆盖状态
+                for i in range(40):
+                    if i % 2 == 0:
+                        cfg_row.value = json.dumps({'dolby': 1, 'no_reprint': 1, 'lines': 'WS'})
+                        tpl.dolby = 1
+                        tpl.uploader = 'biliup-rs'
+                    else:
+                        cfg_row.value = json.dumps({'dolby': 1, 'no_reprint': 1, 'lines': 'AUTO'})
+                        tpl.dolby = 0
+                        tpl.uploader = 'bili_web'
+                    db.commit()
                     config.load_from_db(db)
             finally:
                 stop_evt.set()
                 reader.join(timeout=5)
 
             self.assertEqual(read_errors, [])
+            self.assertGreaterEqual(read_count, 1)
             self.assertIs(config.data['PluginInfo'], fake_pi)
             self.assertEqual(config['streamers']['atomic_streamer']['dolby'], 0)
             self.assertEqual(config['streamers']['atomic_streamer']['no_reprint'], 0)
@@ -351,7 +458,12 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
                 url='https://live.test/web1',
                 upload_streamers_id=tpl.id,
             )
-            db.add(ls)
+            ls_keep = LiveStreamers(
+                remark='web_streamer_2',
+                url='https://live.test/web2',
+                upload_streamers_id=tpl.id,
+            )
+            db.add_all([ls, ls_keep])
             db.commit()
             tpl_id = tpl.id
             ls_id = ls.id
@@ -386,9 +498,11 @@ class TestPR4ConcurrencyAndState(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('web_streamer', config['streamers'])
             fake_pi.delete.assert_called_with('https://live.test/web1')
 
-            # 4. DELETE /v1/upload/streamers/{id} 返回 200 并触发同步
+            # 4. DELETE /v1/upload/streamers/{id} 同步更新仍关联该模板的主播内存配置
+            self.assertIn('title', config['streamers']['web_streamer_2'])
             del_tpl_resp = await client.delete(f'/v1/upload/streamers/{tpl_id}')
             self.assertEqual(del_tpl_resp.status, 200)
+            self.assertNotIn('title', config['streamers']['web_streamer_2'])
 
 
 if __name__ == '__main__':

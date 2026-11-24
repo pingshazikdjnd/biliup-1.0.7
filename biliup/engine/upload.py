@@ -46,6 +46,25 @@ class UploadBase:
         return max
 
     @staticmethod
+    def _is_streamer_recording(index) -> bool:
+        from biliup.handler import event_manager
+        plugin_info = event_manager.context.get('PluginInfo')
+        if plugin_info is None:
+            return False
+        url_status = getattr(plugin_info, 'url_status', {}) or {}
+        streamer_url = config.get('streamers', {}).get(index, {}).get('url')
+        if isinstance(streamer_url, (list, tuple, set)):
+            if any(url_status.get(u) == 1 for u in streamer_url):
+                return True
+        elif streamer_url and url_status.get(streamer_url) == 1:
+            return True
+        inverted_index = getattr(plugin_info, 'inverted_index', {}) or {}
+        for u, s_name in inverted_index.items():
+            if s_name == index and url_status.get(u) == 1:
+                return True
+        return False
+
+    @staticmethod
     def file_list(index) -> List[FileInfo]:
         from biliup.handler import event_manager
         media_extensions = ['.mp4', '.flv', '.3gp', '.webm', '.mkv', '.ts']
@@ -73,21 +92,6 @@ class UploadBase:
 
         file_list = sorted(file_list, key=lambda x: get_file_create_timestamp(x))
 
-        # 判断当前主播是否处于录制中
-        is_recording = False
-        plugin_info = event_manager.context.get('PluginInfo')
-        if plugin_info is not None:
-            url_status = getattr(plugin_info, 'url_status', {}) or {}
-            streamer_url = config.get('streamers', {}).get(index, {}).get('url')
-            if streamer_url and url_status.get(streamer_url) == 1:
-                is_recording = True
-            else:
-                inverted_index = getattr(plugin_info, 'inverted_index', {}) or {}
-                for u, s_name in inverted_index.items():
-                    if s_name == index and url_status.get(u) == 1:
-                        is_recording = True
-                        break
-
         # 正在上传的文件列表
         upload_filename: list = event_manager.context['upload_filename']
 
@@ -96,12 +100,11 @@ class UploadBase:
         for i, file in enumerate(file_list):
             old_name = file
             if file.endswith('.part'):
-                if is_recording:
+                if UploadBase._is_streamer_recording(index):
                     skipped_part_names.add(os.path.splitext(file[:-5])[0])
                     logger.debug(f'{index} 正在录制中，跳过 .part 文件: {file}')
                     continue
                 file = os.path.splitext(file)[0]
-                file_list[i] = file
 
             name, ext = os.path.splitext(file)
             # 过滤正在上传的
@@ -112,8 +115,13 @@ class UploadBase:
                 continue
 
             if old_name != file:
+                if UploadBase._is_streamer_recording(index):
+                    skipped_part_names.add(name)
+                    logger.debug(f'{index} 正在录制中，跳过 .part 文件: {old_name}')
+                    continue
                 logger.info(f'{old_name} 已更名为 {file}')
                 shutil.move(old_name, file)
+                file_list[i] = file
 
             file_size = os.path.getsize(file) / 1024 / 1024
             threshold = config.get('filtering_threshold', 0)
