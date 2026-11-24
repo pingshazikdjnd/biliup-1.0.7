@@ -15,7 +15,8 @@ class BiliWeb(UploadBase):
             copyright=2, postprocessor=None, dtime=None,
             dynamic='', lines='AUTO', threads=3, tid=122, tags=None, cover_path=None, description='',
             dolby=0, hires=0, no_reprint=0, charging_pay=0, credits=None,
-            user_cookie='cookies.json', copyright_source=None, extra_fields = ""
+            user_cookie='cookies.json', copyright_source=None, extra_fields = "",
+            up_close_reply=0, up_selection_reply=0, up_close_danmu=0
     ):
         super().__init__(principal, data, persistence_path='bili.cookie', postprocessor=postprocessor)
         if credits is None:
@@ -42,6 +43,9 @@ class BiliWeb(UploadBase):
         self.hires = hires
         self.no_reprint = no_reprint
         self.charging_pay = charging_pay
+        self.up_close_reply = bool(up_close_reply)
+        self.up_selection_reply = bool(up_selection_reply)
+        self.up_close_danmu = bool(up_close_danmu)
         self.user_cookie = user_cookie
         self.copyright_source = copyright_source
 
@@ -80,8 +84,9 @@ class BiliWeb(UploadBase):
         dtime = None
         if self.dtime:
             dtime = int(time.time() + self.dtime)
+        video_path = [f.video if hasattr(f, 'video') else f for f in file_list]
         stream_gears.upload(
-            video_path=file_list,
+            video_path=video_path,
             cookie_file=self.user_cookie,
             title=self.data["format_title"][:80],
             tid=self.tid,
@@ -95,6 +100,9 @@ class BiliWeb(UploadBase):
             lossless_music=self.hires,
             no_reprint=self.no_reprint,
             charging_pay=self.charging_pay,
+            up_close_reply=self.up_close_reply,
+            up_selection_reply=self.up_selection_reply,
+            up_close_danmu=self.up_close_danmu,
             limit=self.threads,
             desc_v2=desc_v2,
             dtime=dtime,
@@ -124,8 +132,9 @@ class BiliWeb(UploadBase):
                 self.desc = self.desc.replace(
                     "@credit", "@" + credit["username"] + "  ", 1)
                 desc_v2_tmp = desc_v2_tmp[num + 7:]
-            except IndexError:
+            except ValueError:
                 logger.error('简介中的@credit占位符少于credits的数量,替换失败')
+                break
         desc_v2.append({
             "raw_text": " " + desc_v2_tmp,
             "biz_id": "",

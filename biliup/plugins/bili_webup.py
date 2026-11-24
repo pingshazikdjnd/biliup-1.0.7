@@ -32,7 +32,7 @@ class BiliWeb(UploadBase):
         self,
         principal,
         data,
-        user,
+        user=None,
         user_cookie='cookies.json',
         submit_api: Optional[str] = 'web',
         copyright: int = 2,
@@ -47,6 +47,9 @@ class BiliWeb(UploadBase):
         description='',
         credits=[],
         section_id: Optional[int] = None,
+        up_close_reply=0,
+        up_selection_reply=0,
+        up_close_danmu=0,
     ):
         """
         :param principal:
@@ -71,7 +74,7 @@ class BiliWeb(UploadBase):
             tags = []
         else:
             tags = [str(tag).format(streamer=self.data['name']) for tag in tags]
-        self.user = user # 旧版本的登录用户
+        self.user = user or {}  # 旧版本的登录用户
         self.user_cookie = user_cookie # 新版本的登录用户cookie文件
         self.lines = lines
         self.submit_api = submit_api or 'web'
@@ -85,6 +88,9 @@ class BiliWeb(UploadBase):
         self.copyright = copyright
         self.dtime = dtime
         self.section_id = section_id
+        self.up_close_reply = bool(up_close_reply)
+        self.up_selection_reply = bool(up_selection_reply)
+        self.up_close_danmu = bool(up_close_danmu)
 
     def upload(
         self,
@@ -100,6 +106,9 @@ class BiliWeb(UploadBase):
         logger.info(f"开始上传视频 {database_row_id}")
         video = Data()
         video.dynamic = self.dynamic
+        video.up_close_reply = self.up_close_reply
+        video.up_selection_reply = self.up_selection_reply
+        video.up_close_danmu = self.up_close_danmu
         with BiliBili(video) as bili:
             bili.app_key = self.user.get('app_key')
             bili.appsec = self.user.get('appsec')
@@ -172,8 +181,9 @@ class BiliWeb(UploadBase):
                     self.desc = self.desc.replace(
                         "@credit", "@"+credit["username"]+"  ", 1)
                     desc_v2_tmp = desc_v2_tmp[num+7:]
-                except IndexError:
+                except ValueError:
                     logger.error('简介中的@credit占位符少于credits的数量,替换失败')
+                    break
             desc_v2.append({
                 "raw_text": " "+desc_v2_tmp,
                 "biz_id": "",
@@ -390,14 +400,20 @@ class BiliBili:
             data = bytes(int(1024 * 0.1 * 1024))
         for line in ret['lines']:
             start = time.perf_counter()
-            test = self.__session.request(method, f"https:{line['probe_url']}", data=data, timeout=30)
+            try:
+                test = self.__session.request(method, f"https:{line['probe_url']}", data=data, timeout=30)
+            except requests.RequestException as e:
+                logger.warning(f"线路探测失败 {line.get('query')}: {e}")
+                continue
             cost = time.perf_counter() - start
             print(line['query'], cost)
             if test.status_code != 200:
-                return
+                continue
             if not min_cost or min_cost > cost:
                 auto_os = line
                 min_cost = cost
+        if auto_os is None:
+            raise RuntimeError("All upload probe lines failed")
         auto_os['cost'] = min_cost
         return auto_os
 
@@ -637,6 +653,7 @@ class BiliBili:
             'profile': 'ugcupos/bup'
         }
         attempt = 0
+        last_err = None
         while attempt <= 5:  # 一旦放弃就会丢失前面所有的进度，多试几次吧
             try:
                 r = self.__session.post(url, params=p, json={"parts": parts}, headers=headers, timeout=15).json()
@@ -644,10 +661,13 @@ class BiliBili:
                     logger.info(f'{filename} uploaded >> {total_size / 1000 / 1000 / cost:.2f}MB/s. {r}')
                     return {"title": splitext(filename)[0], "filename": splitext(basename(upos_uri))[0], "desc": ""}
                 raise IOError(r)
-            except IOError:
+            except (IOError, requests.RequestException, ValueError) as e:
+                last_err = e
                 attempt += 1
                 logger.info(f"请求合并分片时出现问题，尝试重连，次数：" + str(attempt))
-                time.sleep(15)
+                if attempt <= 5:
+                    time.sleep(15)
+        raise RuntimeError(f"upos merge failed after retries: {last_err}")
 
     @staticmethod
     async def _upload(params, file, chunk_size, afunc, tasks=3):
@@ -664,12 +684,16 @@ class BiliBili:
                 params['start'] = params['chunk'] * chunk_size
                 params['end'] = params['start'] + params['size']
                 clone = params.copy()
+                last_err = None
                 for i in range(10):
                     try:
                         await afunc(session, chunks_data, clone)
                         break
                     except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                        last_err = e
                         logger.error(f"retry chunk{clone['chunk']} >> {i + 1}. {e}")
+                else:
+                    raise RuntimeError(f"Chunk {clone['chunk']} upload failed after 10 retries: {last_err}")
 
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(*[upload_chunk() for _ in range(tasks)])
@@ -890,6 +914,9 @@ class Data:
     tag: Union[list, str] = ''
     videos: list = field(default_factory=list)
     dtime: Any = None
+    up_close_reply: bool = False
+    up_selection_reply: bool = False
+    up_close_danmu: bool = False
     open_subtitle: InitVar[bool] = False
 
     # interactive: int = 0

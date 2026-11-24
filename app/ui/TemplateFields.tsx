@@ -140,7 +140,7 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
               <br />
               简介：{'\u007B'}streamer{'\u007D'}主播直播间地址：{'\u007B'}url{'\u007D'} 【@credit】
               <br />
-              其中的&quot;@credits&quot;会依次替换为下面输入的@
+              其中的&quot;@credit&quot;会依次替换为下面输入的@
             </div>
             <Button icon={<IconPlusCircle />} onClick={add} theme="light">
               添加行
