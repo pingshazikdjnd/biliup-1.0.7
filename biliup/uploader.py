@@ -25,7 +25,7 @@ def merge_dict(*dicts):
             result.update(d)
     return result
 
-def upload(data):
+def upload(data, target_files=None):
     """
     上传入口
     :param platform:
@@ -39,7 +39,8 @@ def upload(data):
         platform = context.get("uploader") if context.get("uploader") else "bili_web"
         cls = Plugin.upload_plugins.get(platform)
         if cls is None:
-            return logger.error(f"No such uploader: {platform}")
+            logger.error(f"No such uploader: {platform}")
+            raise RuntimeError(f"No such uploader: {platform}")
         data, context = fmt_title_and_desc(data)
         data['dolby'] = config.get('dolby', 0)
         data['hires'] = config.get('hires', 0)
@@ -53,9 +54,13 @@ def upload(data):
             v = context.get(k)
             if v:
                 kwargs[k] = v
-        return cls(index, data, **kwargs).start()
-    except:
+        uploader_instance = cls(index, data, **kwargs)
+        if target_files is not None:
+            return uploader_instance.start(allowed_files=target_files)
+        return uploader_instance.start()
+    except Exception:
         logger.exception("Uncaught exception:")
+        raise
 
 
 def biliup_uploader(filelist, data):
