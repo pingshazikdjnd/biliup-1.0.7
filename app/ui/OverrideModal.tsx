@@ -113,15 +113,32 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
     if (values) {
       const isPlainObject = (val: any): val is Record<string, any> =>
         Boolean(val) && typeof val === 'object' && !Array.isArray(val)
+      const valuesEqual = (a: any, b: any): boolean => {
+        if (a === b) return true
+        if (a == null || b == null || typeof a !== typeof b) return false
+        if (typeof a === 'object') {
+          try {
+            return JSON.stringify(a) === JSON.stringify(b)
+          } catch {
+            return false
+          }
+        }
+        return false
+      }
+
+      const initialOverride = isPlainObject(entity?.override) ? entity!.override : {}
+      const initialOverrideText = entity?.override ? JSON.stringify(entity.override, null, 2) : ''
 
       const nextValues = { ...values }
       const rawOverrideText = nextValues.override_text
       delete nextValues.override_text
+      const normalizedOverrideText = typeof rawOverrideText === 'string' ? rawOverrideText : ''
+      const overrideTextChanged = normalizedOverrideText !== initialOverrideText
 
       let baseOverride: Record<string, any> = {}
-      if (typeof rawOverrideText === 'string' && rawOverrideText.trim() !== '') {
+      if (normalizedOverrideText.trim() !== '') {
         try {
-          const parsed = JSON.parse(rawOverrideText)
+          const parsed = JSON.parse(normalizedOverrideText)
           if (!isPlainObject(parsed)) {
             throw new Error('Override must be a JSON object')
           }
@@ -139,10 +156,15 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
       Object.keys(nextValues).forEach(key => {
         if (!entityFields.has(key)) {
           const val = nextValues[key]
+          const origVal = initialOverride[key]
           if (isPlainObject(val)) {
             const existing = isPlainObject(overrideConfig[key]) ? overrideConfig[key] : {}
+            const origObj = isPlainObject(origVal) ? origVal : {}
             const merged: Record<string, any> = { ...existing }
             Object.entries(val).forEach(([subKey, subVal]) => {
+              if (overrideTextChanged && valuesEqual(subVal, origObj[subKey])) {
+                return
+              }
               if (subVal !== undefined && subVal !== null && subVal !== '') {
                 merged[subKey] = subVal
               } else {
@@ -154,6 +176,8 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
             } else {
               delete overrideConfig[key]
             }
+          } else if (overrideTextChanged && valuesEqual(val, origVal)) {
+            // 用户直接清空或修改了 override_text，未改动的表单旧值不再回写覆盖
           } else if (val !== undefined && val !== null && val !== '') {
             overrideConfig[key] = val
           } else {

@@ -88,7 +88,7 @@ class TestPR7SchedulerAndFilename(unittest.IsolatedAsyncioTestCase):
             k: (v if k == 'PluginInfo' else copy.deepcopy(v))
             for k, v in config.data.items()
         }
-        self._pending_snapshot = set(app_mod.context.get('pending_download_urls', set()))
+        self._pending_snapshot = set(app_mod.pending_download_urls)
         self._plugin_info_snapshot = app_mod.context.get('PluginInfo')
         config.data.clear()
         config.data.update({
@@ -97,13 +97,14 @@ class TestPR7SchedulerAndFilename(unittest.IsolatedAsyncioTestCase):
             'upload_filename': [],
             'file_upload_count': {},
             'sync_downloader_map': {},
-            'pending_download_urls': set(),
         })
+        app_mod.pending_download_urls.clear()
 
     async def asyncTearDown(self):
         os.chdir(self._orig_cwd)
         self._tmpdir.cleanup()
-        app_mod.context['pending_download_urls'] = set(self._pending_snapshot)
+        app_mod.pending_download_urls.clear()
+        app_mod.pending_download_urls.update(self._pending_snapshot)
         if self._plugin_info_snapshot is not None:
             app_mod.context['PluginInfo'] = self._plugin_info_snapshot
         else:
@@ -144,10 +145,13 @@ class TestPR7SchedulerAndFilename(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(check_calls, 1)
         pre_events = [e for e in sent_events if e.type_ == handler_mod.PRE_DOWNLOAD]
         self.assertEqual(len(pre_events), 1)
-        self.assertIn(url, app_mod.context['pending_download_urls'])
+        self.assertIn(url, app_mod.pending_download_urls)
+        # pending_download_urls must stay out of context/config so /v1/status stays JSON-serializable
+        self.assertNotIn('pending_download_urls', app_mod.context)
+        json.dumps({k: v for k, v in app_mod.context.items() if k != 'PluginInfo'})
 
         # If send_event(PRE_DOWNLOAD) raises, pending_download_urls is cleaned up
-        app_mod.context['pending_download_urls'].clear()
+        app_mod.pending_download_urls.clear()
 
         def _send_fail(ev):
             if ev.type_ == handler_mod.PRE_DOWNLOAD:
@@ -156,26 +160,26 @@ class TestPR7SchedulerAndFilename(unittest.IsolatedAsyncioTestCase):
         with patch.object(app_mod.event_manager, 'send_event', side_effect=_send_fail):
             with self.assertRaises(RuntimeError):
                 await app_mod.singleton_check(FakePlatform, name, url)
-        self.assertNotIn(url, app_mod.context['pending_download_urls'])
+        self.assertNotIn(url, app_mod.pending_download_urls)
 
         # pre_processor transitions pending -> url_status = 1 atomically
-        app_mod.context['pending_download_urls'].add(url)
+        app_mod.pending_download_urls.add(url)
         gen = handler_mod.pre_processor.__wrapped__(name, url)
         ev = next(gen)
         self.assertEqual(ev.type_, handler_mod.DOWNLOAD)
         self.assertEqual(app_mod.context['PluginInfo'].url_status[url], 1)
-        self.assertNotIn(url, app_mod.context['pending_download_urls'])
+        self.assertNotIn(url, app_mod.pending_download_urls)
 
         # Duplicate pre_processor sees url_status == 1 and exits early
         self.assertEqual(list(handler_mod.pre_processor.__wrapped__(name, url)), [])
 
         # process() resets url_status and discards pending in finally
-        app_mod.context['pending_download_urls'].add(url)
+        app_mod.pending_download_urls.add(url)
         with patch.object(handler_mod, 'biliup_download', side_effect=RuntimeError('dl fail')):
             with patch.object(handler_mod, 'check_timerange', return_value=True):
                 list(handler_mod.process.__wrapped__(name, url))
         self.assertEqual(app_mod.context['PluginInfo'].url_status[url], 0)
-        self.assertNotIn(url, app_mod.context['pending_download_urls'])
+        self.assertNotIn(url, app_mod.pending_download_urls)
 
         # If preprocessor fails, pre_processor resets url_status instead of leaking 1
         config.data['streamers'][name]['preprocessor'] = 'echo fail'
@@ -184,6 +188,13 @@ class TestPR7SchedulerAndFilename(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(RuntimeError):
                     list(handler_mod.pre_processor.__wrapped__(name, url))
         self.assertEqual(app_mod.context['PluginInfo'].url_status[url], 0)
+
+        # Deleted streamer is rejected by pre_processor and pending flag is cleared
+        app_mod.pending_download_urls.add(url)
+        app_mod.context['PluginInfo'].inverted_index.pop(url, None)
+        self.assertEqual(list(handler_mod.pre_processor.__wrapped__(name, url)), [])
+        self.assertEqual(app_mod.context['PluginInfo'].url_status[url], 0)
+        self.assertNotIn(url, app_mod.pending_download_urls)
 
     async def test_shot_advances_index_in_finally_when_exception_occurs(self):
         event = SimpleNamespace(url_list=['url_1', 'url_2'])
@@ -256,6 +267,11 @@ class TestPR7Plugins(unittest.IsolatedAsyncioTestCase):
         config.data.update(self._config_snapshot)
 
     async def test_bilibili_dynamic_override_penalty_transcode_and_parsers(self):
+        # bili_qn=0 (lowest quality) must be preserved, not coerced to 25000
+        config.data['bili_qn'] = 0
+        bili_zero = bilibili_mod.Bililive('up0', 'https://live.bilibili.com/12340')
+        self.assertEqual(bili_zero.bili_qn, 0)
+
         config.data.update({
             'bili_liveapi': 'https://global.api/',
             'bili_fallback_api': 'https://global.fb/',
@@ -505,13 +521,30 @@ class TestPR7Plugins(unittest.IsolatedAsyncioTestCase):
             'niconico-purge-credentials': True,
         }
         nico = nico_mod.Nico('nico', 'https://live.nicovideo.jp/watch/lv123')
-        ok_resp = MagicMock(status_code=200, text='"name":"RoomTitle","description":"Desc"')
+        ok_resp = MagicMock(
+            status_code=200,
+            text='"name":"RoomTitle","description":"Desc",&quot;status&quot;:&quot;ON_AIR&quot;',
+        )
 
         with patch.object(nico_mod.biliup.common.util.client, 'get', new=AsyncMock(return_value=ok_resp)):
             with patch.object(nico_mod.subprocess, 'Popen') as popen_mock:
                 self.assertTrue(await nico.acheck_stream(is_check=True))
                 popen_mock.assert_not_called()
                 self.assertEqual(nico.room_title, 'RoomTitle')
+
+        ended_resp = MagicMock(
+            status_code=200,
+            text='"name":"RoomTitle","description":"Desc","status":"ENDED"',
+        )
+        with patch.object(nico_mod.biliup.common.util.client, 'get', new=AsyncMock(return_value=ended_resp)):
+            self.assertFalse(await nico.acheck_stream(is_check=True))
+
+        no_status_resp = MagicMock(status_code=200, text='"name":"RoomTitle","description":"Desc"')
+        with patch.object(nico_mod.biliup.common.util.client, 'get', new=AsyncMock(return_value=no_status_resp)):
+            self.assertFalse(await nico.acheck_stream(is_check=True))
+
+        with patch.object(nico_mod.biliup.common.util.client, 'get', new=AsyncMock(side_effect=RuntimeError('net err'))):
+            self.assertFalse(await nico.acheck_stream(is_check=True))
 
         bad_resp = MagicMock(status_code=404, text='')
         with patch.object(nico_mod.biliup.common.util.client, 'get', new=AsyncMock(return_value=bad_resp)):

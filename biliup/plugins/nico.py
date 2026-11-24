@@ -23,14 +23,33 @@ class Nico(DownloadBase):
             if response.status_code != 200:
                 logger.debug(f"Nico - {self.url}: status_code {response.status_code}")
                 return False
+            html = response.text
             # 正则表达式
             pattern = r'"name":"(.*?)","description":"(.*?)"'
             # 执行匹配
-            matches = re.findall(pattern, response.text)
+            matches = re.findall(pattern, html)
             if matches:
                 self.room_title = matches[0][0]
         except Exception as e:
-            logger.info(f"获取标题失败: {e}")
+            logger.info(f"Nico - {self.url} 获取页面失败: {e}")
+            return False
+
+        status_match = re.search(
+            r'(?:"|&quot;)(?:programStatus|status)(?:"|&quot;)\s*:\s*(?:"|&quot;)(ON_AIR|ENDED|RELEASED|BEFORE_RELEASE)(?:"|&quot;)',
+            html,
+        )
+        if status_match:
+            if status_match.group(1) != 'ON_AIR':
+                logger.debug(f"Nico - {self.url}: 直播状态为 {status_match.group(1)}，未开播")
+                return False
+        else:
+            is_live_jsonld = (
+                bool(re.search(r'(?:"|&quot;)isLiveBroadcast(?:"|&quot;)\s*:\s*true', html, re.IGNORECASE))
+                and not bool(re.search(r'(?:"|&quot;)endDate(?:"|&quot;)\s*:', html))
+            )
+            if not is_live_jsonld:
+                logger.debug(f"Nico - {self.url}: 页面未检测到开播状态")
+                return False
 
         if is_check:
             return True

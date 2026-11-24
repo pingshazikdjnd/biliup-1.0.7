@@ -31,7 +31,8 @@ class Bililive(DownloadBase):
         user_conf = config.get('user') or {}
         self.bili_cookie = user_conf.get('bili_cookie')
         self.bili_cookie_file = user_conf.get('bili_cookie_file')
-        self.bili_qn = int(config.get('bili_qn') or 25000)
+        raw_qn = config.get('bili_qn')
+        self.bili_qn = int(25000 if raw_qn in (None, '') else raw_qn)
         self.bili_protocol = config.get('bili_protocol') or 'stream'
         self.bili_cdn = config.get('bili_cdn') or []
         hls_timeout = config.get('bili_hls_transcode_timeout', 60)
@@ -77,7 +78,7 @@ class Bililive(DownloadBase):
 
     async def acheck_stream(self, is_check=False):
         try:
-            self.bili_qn = int(self.bili_qn) if self.bili_qn is not None else 25000
+            self.bili_qn = int(25000 if self.bili_qn in (None, '') else self.bili_qn)
         except (ValueError, TypeError):
             self.bili_qn = 25000
         try:

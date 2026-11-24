@@ -30,20 +30,19 @@ def create_event_manager():
     app.context['file_upload_count'] = {}
     # 边录边传的下载器使用的map
     app.context['sync_downloader_map'] = {}
-    # 待派发或正在预处理中的下载 URL，防止 PRE_DOWNLOAD -> DOWNLOAD 窗口重入
-    app.context['pending_download_urls'] = set()
     return app
 
 
 event_manager = create_event_manager()
 context = event_manager.context
+# 模块级待派发/预处理中的下载 URL 集合：不放入 context/config，避免 /v1/status JSON 序列化 500 及配置重载丢失
+pending_download_urls = set()
 
 
 async def singleton_check(platform, name, url):
     from biliup.handler import PRE_DOWNLOAD, UPLOAD
     context['url_upload_count'].setdefault(url, 0)
-    pending = context.setdefault('pending_download_urls', set())
-    if context['PluginInfo'].url_status.get(url) == 1 or url in pending:
+    if context['PluginInfo'].url_status.get(url) == 1 or url in pending_download_urls:
         logger.debug(f'{url} 正在下载或待下载中，跳过检测')
         return
 
@@ -66,15 +65,14 @@ async def singleton_check(platform, name, url):
                         url_status = getattr(plugin_info, 'url_status', None)
                         if url_status is not None and url_status.get(url) == 1:
                             return
-                    pending_urls = context.setdefault('pending_download_urls', set())
-                    if url in pending_urls:
+                    if url in pending_download_urls:
                         return
-                    pending_urls.add(url)
+                    pending_download_urls.add(url)
                 try:
                     event_manager.send_event(Event(PRE_DOWNLOAD, args=(name, url,)))
                 except Exception:
                     with NamedLock('download_dispatch'):
-                        context.setdefault('pending_download_urls', set()).discard(url)
+                        pending_download_urls.discard(url)
                     raise
 
         try:
@@ -97,8 +95,7 @@ async def shot(event):
         skip = False
         try:
             await singleton_check(event, context['PluginInfo'].inverted_index[cur], cur)
-            pending = context.setdefault('pending_download_urls', set())
-            is_busy = context['PluginInfo'].url_status.get(cur) == 1 or cur in pending
+            is_busy = context['PluginInfo'].url_status.get(cur) == 1 or cur in pending_download_urls
             skip = is_busy and (index + 1) < len(event.url_list)
         except Exception:
             logger.exception('shot')
@@ -140,10 +137,11 @@ class PluginInfo:
             self.url_status[url] = 0
 
     def delete(self, url):
-        if not url in self.inverted_index:
-            return
-        del self.inverted_index[url]
-        context.setdefault('pending_download_urls', set()).discard(url)
+        with NamedLock('download_dispatch'):
+            if url not in self.inverted_index:
+                return
+            del self.inverted_index[url]
+            pending_download_urls.discard(url)
         exec_del = False
         for key, value in self.checker.items():
             if url in value.url_list:
