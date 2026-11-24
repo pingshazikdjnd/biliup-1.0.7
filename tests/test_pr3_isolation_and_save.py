@@ -269,6 +269,39 @@ class TestPR3IsolationAndSave(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after_content, before_content)
         self.assertEqual([n for n in os.listdir('.') if n.startswith('.config.yaml.')], [])
 
+        # 4. 保留原文件权限 (shutil.copymode) 与软链接目标原子替换
+        with patch('biliup.config.shutil.copymode') as mock_copymode:
+            config.save()
+            mock_copymode.assert_called_once()
+            self.assertEqual(mock_copymode.call_args[0][0], 'config.yaml')
+
+        os.makedirs('linked_dir', exist_ok=True)
+        real_target = os.path.abspath(os.path.join('linked_dir', 'real_config.yaml'))
+        with open(real_target, 'w', encoding='utf-8') as f:
+            yaml.safe_dump({'keep_target': True}, f)
+        if os.path.exists('config.yaml'):
+            os.remove('config.yaml')
+
+        used_real_symlink = False
+        try:
+            os.symlink(real_target, 'config.yaml')
+            used_real_symlink = True
+        except OSError:
+            pass
+
+        if used_real_symlink:
+            config.save()
+            self.assertTrue(os.path.islink('config.yaml'))
+        else:
+            with patch('biliup.config.os.path.islink', side_effect=lambda p: p == 'config.yaml'), \
+                    patch('biliup.config.os.path.realpath', return_value=real_target):
+                config.save()
+
+        with open(real_target, 'r', encoding='utf-8') as f:
+            linked_saved = yaml.safe_load(f)
+        self.assertTrue(linked_saved['keep_target'])
+        self.assertEqual(linked_saved['lines'], 'bda2')
+
 
 if __name__ == '__main__':
     unittest.main()

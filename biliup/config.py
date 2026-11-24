@@ -134,9 +134,11 @@ class Config(UserDict):
         else:
             import tempfile
             import yaml
+            target_path = os.path.realpath('config.yaml') if os.path.islink('config.yaml') else 'config.yaml'
+            target_dir = os.path.dirname(target_path) or '.'
             old_data = {}
-            if os.path.exists('config.yaml'):
-                with open('config.yaml', 'r', encoding='utf-8') as stream:
+            if os.path.exists(target_path):
+                with open(target_path, 'r', encoding='utf-8') as stream:
                     loaded = yaml.safe_load(stream)
                     if isinstance(loaded, dict):
                         old_data = loaded
@@ -159,7 +161,7 @@ class Config(UserDict):
                 with tempfile.NamedTemporaryFile(
                     mode='w',
                     encoding='utf-8',
-                    dir='.',
+                    dir=target_dir,
                     prefix='.config.yaml.',
                     suffix='.tmp',
                     delete=False,
@@ -168,7 +170,12 @@ class Config(UserDict):
                     yaml.safe_dump(old_data, tmp, default_flow_style=False, allow_unicode=True)
                     tmp.flush()
                     os.fsync(tmp.fileno())
-                os.replace(tmp_path, 'config.yaml')
+                if os.path.exists(target_path):
+                    try:
+                        shutil.copymode(target_path, tmp_path)
+                    except OSError:
+                        pass
+                os.replace(tmp_path, target_path)
             except Exception:
                 if tmp_path and os.path.exists(tmp_path):
                     try:
