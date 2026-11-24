@@ -3,8 +3,8 @@ FROM node:lts AS webui
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 RUN set -eux; \
-	git clone --depth 1 --branch "$branch_name" "$repo_url"; \
-	cd biliup; \
+	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
+	cd /biliup; \
 	npm install; \
 	npm run build
 
@@ -33,25 +33,20 @@ RUN set -eux; \
 	apt-mark manual curl; \
 	\
 	arch="$(dpkg --print-architecture)"; arch="${arch##*-}"; \
-	url='https://github.com/yt-dlp/FFmpeg-Builds/releases/download/autobuild-2023-10-31-14-21/'; \
+	url='https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/'; \
 	case "$arch" in \
 		'amd64') \
-			url="${url}ffmpeg-N-112565-g55f28eb627-linux64-gpl.tar.xz"; \
+			url="${url}ffmpeg-master-latest-linux64-gpl.tar.xz"; \
 		;; \
 		'arm64') \
-			url="${url}ffmpeg-N-112565-g55f28eb627-linuxarm64-gpl.tar.xz"; \
+			url="${url}ffmpeg-master-latest-linuxarm64-gpl.tar.xz"; \
 		;; \
 		*) \
 			useApt=true; \
 		;; \
 	esac; \
 	\
-	if [ "$useApt" = true ] ; then \
-		apt-get install -y --no-install-recommends \
-			ffmpeg \
-		; \
-	else \
-		wget -O ffmpeg.tar.xz "$url" --progress=dot:giga; \
+	if [ "$useApt" = false ] && wget -O ffmpeg.tar.xz "$url" --progress=dot:giga; then \
 		tar -xJf ffmpeg.tar.xz -C /usr/local --strip-components=1; \
 		rm -rf \
 			/usr/local/doc \
@@ -61,6 +56,11 @@ RUN set -eux; \
 		rm -rf \
 			ffmpeg*; \
 		chmod a+x /usr/local/* ; \
+	else \
+		rm -rf ffmpeg*; \
+		apt-get install -y --no-install-recommends \
+			ffmpeg \
+		; \
 	fi; \
 	\
 	# Clean up \
@@ -78,8 +78,8 @@ RUN set -eux; \
 	savedAptMark="$(apt-mark showmanual)"; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends git g++; \
-	git clone --depth 1 --branch "$branch_name" "$repo_url"; \
-	cd biliup && \
+	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
+	cd /biliup && \
 	pip3 install --no-cache-dir quickjs && \
 	pip3 install -e . && \
 	\

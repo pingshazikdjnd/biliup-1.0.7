@@ -98,7 +98,7 @@ def delete_stream_info(db: Session, name: str) -> int:
         delete(StreamerInfo).where(StreamerInfo.name == name))
     db.commit()
     # db.refresh(result)
-    return result.rowcount()
+    return result.rowcount
 
 
 def delete_stream_info_by_date(db: Session, name: str, date: time.struct_time) -> int:
@@ -112,7 +112,7 @@ def delete_stream_info_by_date(db: Session, name: str, date: time.struct_time) -
     )
     result = db.execute(stmt)
     db.commit()
-    return result.rowcount()
+    return result.rowcount
 
 
 def update_cover_path(db: Session, database_row_id: int, live_cover_path: str):
@@ -173,15 +173,36 @@ def migrate_via_alembic():
     alembic_cfg = config.Config()
     # 获取脚本路径
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migration")
-    versions_scripts_path = os.path.join(script_path, 'versions')
-    if not os.path.exists(versions_scripts_path):
-        os.makedirs(versions_scripts_path, 0o700)
+    pkg_versions_path = os.path.join(script_path, 'versions')
+    versions_scripts_path = pkg_versions_path
+    use_fallback = False
+    try:
+        os.makedirs(versions_scripts_path, 0o700, exist_ok=True)
+        probe_path = os.path.join(versions_scripts_path, f'.write_probe_{os.getpid()}')
+        with open(probe_path, 'wb'):
+            pass
+        os.remove(probe_path)
+    except OSError:
+        use_fallback = True
+    if use_fallback:
+        versions_scripts_path = os.path.abspath(os.path.join('.', 'data', 'migration_versions'))
+        os.makedirs(versions_scripts_path, 0o700, exist_ok=True)
+        version_locs = [versions_scripts_path]
+        if os.path.isdir(pkg_versions_path):
+            version_locs.append(pkg_versions_path)
+        alembic_cfg.set_main_option('version_path_separator', 'os')
+        alembic_cfg.set_main_option('version_locations', os.pathsep.join(version_locs))
     alembic_cfg.set_main_option('script_location', script_path)
     command.stamp(alembic_cfg, 'head', purge=True)  # 将当前标记为最新版
+    revision_kwargs = {
+        'autogenerate': True,
+        'process_revision_directives': process_revision_directives,
+    }
+    if use_fallback:
+        revision_kwargs['version_path'] = versions_scripts_path
     scripts = command.revision(  # 自动生成迁移脚本
         alembic_cfg,
-        autogenerate=True,
-        process_revision_directives=process_revision_directives
+        **revision_kwargs,
     )
     if not scripts:
         print("数据库已是最新版本")
