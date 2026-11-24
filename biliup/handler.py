@@ -204,7 +204,7 @@ def process_upload(stream_info):
                     logger.warning(f"上传次数达到阈值: {name}")
                     send_notification(
                         title=f"biliup 上传达到重试上限告警: {name}",
-                        content=f"主播: {name}\nURL: {url}\n上传重试次数已达到阈值 ({upload_count + 1}/{max_upload_limit})，已停止自动重试。最后一次错误: {e}",
+                        content=f"主播: {name}\nURL: {url}\n部分或全部待传文件重试次数已达到阈值 ({upload_count + 1}/{max_upload_limit})，达到上限的文件将停止自动重试（其余未达上限文件仍会在后续重试）。最后一次错误: {e}",
                         streamer_name=name,
                         error_type="max_upload_limit_reached"
                     )
