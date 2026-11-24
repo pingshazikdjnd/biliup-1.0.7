@@ -230,7 +230,7 @@ class BiliBili:
         }
         params["sign"] = hashlib.md5(
             f"{urllib.parse.urlencode(params)}59b43e04ad6965f34319062b478f83dd".encode()).hexdigest()
-        response = self.__session.post("http://passport.bilibili.com/x/passport-tv-login/qrcode/auth_code", data=params,
+        response = self.__session.post("https://passport.bilibili.com/x/passport-tv-login/qrcode/auth_code", data=params,
                                        timeout=5)
         r = response.json()
         if r and r["code"] == 0:
@@ -247,12 +247,12 @@ class BiliBili:
             f"{urllib.parse.urlencode(params)}59b43e04ad6965f34319062b478f83dd".encode()).hexdigest()
         for i in range(0, 120):
             await asyncio.sleep(1)
-            response = self.__session.post("http://passport.bilibili.com/x/passport-tv-login/qrcode/poll", data=params,
+            response = self.__session.post("https://passport.bilibili.com/x/passport-tv-login/qrcode/poll", data=params,
                                            timeout=5)
             r = response.json()
             if r and r["code"] == 0:
                 return r
-        raise "Qrcode timeout"
+        raise TimeoutError("Qrcode timeout")
 
     def tid_archive(self, cookies):
         requests.utils.add_dict_to_cookiejar(self.__session.cookies, cookies)
@@ -261,7 +261,7 @@ class BiliBili:
 
     def myinfo(self, cookies):
         requests.utils.add_dict_to_cookiejar(self.__session.cookies, cookies)
-        response = self.__session.get('http://api.bilibili.com/x/space/myinfo')
+        response = self.__session.get('https://api.bilibili.com/x/space/myinfo')
         return response.json()
 
     def login(self, persistence_path, user_cookie):
@@ -704,7 +704,7 @@ class BiliBili:
         self.__session.get('https://member.bilibili.com/x/geetest/pre/add', timeout=5)
 
         if submit_api is None:
-            total_info = self.__session.get('http://api.bilibili.com/x/space/myinfo', timeout=15).json()
+            total_info = self.__session.get('https://api.bilibili.com/x/space/myinfo', timeout=15).json()
             if total_info.get('data') is None:
                 logger.error(total_info)
             total_info = total_info.get('data')
@@ -737,7 +737,7 @@ class BiliBili:
             self.login_by_password(**self.account)
             self.store()
         while True:
-            ret = self.__session.post(f'http://member.bilibili.com/x/vu/client/add?access_key={self.access_token}',
+            ret = self.__session.post(f'https://member.bilibili.com/x/vu/client/add?access_key={self.access_token}',
                                       timeout=5, json=asdict(self.video)).json()
             if ret['code'] == -101:
                 logger.info(f'刷新token{ret}')

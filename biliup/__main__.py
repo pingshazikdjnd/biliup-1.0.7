@@ -14,6 +14,20 @@ from biliup.common.reload import AutoReload
 from biliup.common.log import DebugLevelFilter
 
 
+def _deep_merge_dict(base: dict, override: dict) -> dict:
+    """递归合并嵌套字典并跳过 None，避免浅 update 覆盖整棵配置子树。"""
+    if not isinstance(override, dict):
+        return base
+    for key, value in override.items():
+        if value is None:
+            continue
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge_dict(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
 def arg_parser():
     daemon = Daemon('watch_process.pid', lambda: main(args))
     parser = argparse.ArgumentParser(description='Stream download and upload, not only for bilibili.')
@@ -64,7 +78,7 @@ def arg_parser():
                     config.save_to_db(db)
             config.load_from_db(db)
         # db.remove()
-        LOG_CONF.update(config.get('LOGGING', {}))
+        _deep_merge_dict(LOG_CONF, config.get('LOGGING') or {})
         if args.verbose:
             LOG_CONF['loggers']['biliup']['level'] = args.verbose
             LOG_CONF['root']['level'] = args.verbose

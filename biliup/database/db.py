@@ -98,7 +98,7 @@ def delete_stream_info(db: Session, name: str) -> int:
         delete(StreamerInfo).where(StreamerInfo.name == name))
     db.commit()
     # db.refresh(result)
-    return result.rowcount()
+    return result.rowcount
 
 
 def delete_stream_info_by_date(db: Session, name: str, date: time.struct_time) -> int:
@@ -112,7 +112,7 @@ def delete_stream_info_by_date(db: Session, name: str, date: time.struct_time) -
     )
     result = db.execute(stmt)
     db.commit()
-    return result.rowcount()
+    return result.rowcount
 
 
 def update_cover_path(db: Session, database_row_id: int, live_cover_path: str):
@@ -174,8 +174,19 @@ def migrate_via_alembic():
     # 获取脚本路径
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migration")
     versions_scripts_path = os.path.join(script_path, 'versions')
-    if not os.path.exists(versions_scripts_path):
-        os.makedirs(versions_scripts_path, 0o700)
+    use_fallback = False
+    try:
+        os.makedirs(versions_scripts_path, 0o700, exist_ok=True)
+        probe_path = os.path.join(versions_scripts_path, f'.write_probe_{os.getpid()}')
+        with open(probe_path, 'wb'):
+            pass
+        os.remove(probe_path)
+    except OSError:
+        use_fallback = True
+    if use_fallback:
+        versions_scripts_path = os.path.abspath(os.path.join('.', 'data', 'migration_versions'))
+        os.makedirs(versions_scripts_path, 0o700, exist_ok=True)
+        alembic_cfg.set_main_option('version_locations', versions_scripts_path)
     alembic_cfg.set_main_option('script_location', script_path)
     command.stamp(alembic_cfg, 'head', purge=True)  # 将当前标记为最新版
     scripts = command.revision(  # 自动生成迁移脚本

@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import contextlib
 import hashlib
 import hmac
@@ -180,7 +181,8 @@ async def get_basic_config(request):
 @routes.get('/url-status')
 async def url_status(request):
     from biliup.app import context
-    return web.json_response(context['KernelFunc'].get_url_status())
+    plugin_info = context.get('PluginInfo')
+    return web.json_response(plugin_info.url_status if plugin_info is not None else {})
 
 @routes.post('/api/setbasic')
 async def set_basic_config(request):
@@ -221,21 +223,26 @@ async def root_handler(request):
 @routes.get('/api/login_by_cookie')
 async def cookie_login(request):
     if config.data.get("toml"):
-        print("trying to login by cookie")
+        logger.debug("trying to login by cookie")
         try:
             await asyncio.to_thread(stream_gears.login_by_cookies)
-        except Exception as e:
-            return web.HTTPBadRequest(text="login failed" + str(e))
+        except Exception:
+            logger.exception("cookie_login failed (toml)")
+            return web.HTTPBadRequest(text="login failed")
     else:
-        cookie = config.data.get('user', {}).get('cookies', {})
+        cookie = (config.data.get('user') or {}).get('cookies') or {}
+        if not cookie:
+            return web.HTTPBadRequest(text="login failed: missing cookies")
         try:
             def _do_login():
                 with _bili_client() as bili:
-                    bili.login_by_cookies(cookie)
+                    return bili.login_by_cookies(cookie)
 
-            await asyncio.to_thread(_do_login)
-        except Exception as e:
-            print(e)
+            ok = await asyncio.to_thread(_do_login)
+            if not ok:
+                return web.HTTPBadRequest(text="login failed")
+        except Exception:
+            logger.exception("cookie_login failed")
             return web.HTTPBadRequest(text="login failed")
     return web.json_response({"status": 200})
 
@@ -270,34 +277,60 @@ def check_similar_remark(json_data):
 @routes.get('/v1/get_qrcode')
 async def qrcode_get(request):
     try:
-        r = eval(stream_gears.get_qrcode(None))
-    except Exception as e:
+        raw = await asyncio.to_thread(stream_gears.get_qrcode, None)
+        r = json.loads(raw)
+    except Exception:
         logger.exception("get qrcode error")
         return web.HTTPBadRequest(text="get qrcode failed")
     return web.json_response(r)
 
 
-pool = concurrent.futures.ProcessPoolExecutor()
+_qr_pool = None
+_qr_pool_lock = threading.Lock()
+
+
+def _get_qr_pool():
+    global _qr_pool
+    with _qr_pool_lock:
+        if _qr_pool is None:
+            _qr_pool = concurrent.futures.ProcessPoolExecutor(max_workers=2)
+        return _qr_pool
+
+
+def _shutdown_qr_pool():
+    global _qr_pool
+    with _qr_pool_lock:
+        pool_ref = _qr_pool
+        _qr_pool = None
+    if pool_ref is not None:
+        pool_ref.shutdown(wait=False, cancel_futures=True)
+
+
+atexit.register(_shutdown_qr_pool)
 
 
 @routes.post('/v1/login_by_qrcode')
 async def qrcode_login(request):
     post_data = await request.json()
     try:
-        loop = asyncio.get_event_loop()
-        # loop
-        task = loop.run_in_executor(pool, stream_gears.login_by_qrcode, json.dumps(post_data), None)
+        loop = asyncio.get_running_loop()
+        qr_pool = _get_qr_pool()
+        task = loop.run_in_executor(qr_pool, stream_gears.login_by_qrcode, json.dumps(post_data), None)
         res = await asyncio.wait_for(task, 180)
         data = json.loads(res)
-        filename = f'data/{data["token_info"]["mid"]}.json'
+        mid = str(data["token_info"]["mid"])
+        if not mid.isdigit():
+            raise ValueError("invalid mid")
+        os.makedirs('data', exist_ok=True)
+        filename = f'data/{mid}.json'
         with open(filename, 'w', encoding='utf-8') as file:
             file.write(res)
         return web.json_response({
             'filename': filename
         })
-    except Exception as e:
+    except Exception:
         logger.exception('login_by_qrcode')
-        return web.HTTPBadRequest(text="login failed" + str(e))
+        return web.HTTPBadRequest(text="login failed")
 
 @routes.get('/api/check_tag')
 async def tag_check(request):
@@ -1063,6 +1096,11 @@ def create_app(password=None, static_dir=None):
         cors.add(route)
 
     setup_middlewares(app)
+
+    async def _on_cleanup(_app):
+        _shutdown_qr_pool()
+
+    app.on_cleanup.append(_on_cleanup)
     return app
 
 
