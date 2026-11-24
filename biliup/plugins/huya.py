@@ -1,4 +1,5 @@
 import base64
+import contextvars
 import hashlib
 import random
 import time
@@ -32,6 +33,7 @@ HUYA_MOBILE_BASE_URL = "https://m.huya.com"
 HUYA_MP_BASE_URL = "https://mp.huya.com"
 HUYA_WUP_BASE_URL = "https://wup.huya.com"
 HUYA_WEB_ROOM_DATA_REGEX = r"var TT_ROOM_DATA = (.*?);"
+_rid_request_headers: contextvars.ContextVar = contextvars.ContextVar('_rid_request_headers', default=None)
 
 @Plugin.download(regexp=r'https?://(?:(?:www|m)\.)?huya\.com')
 class Huya(DownloadBase):
@@ -52,8 +54,11 @@ class Huya(DownloadBase):
 
         try:
             if not self.__room_id.isdigit():
-                client.headers.update(self.fake_headers)
-                self.__room_id = await _get_real_rid(self.url)
+                token = _rid_request_headers.set(self.fake_headers)
+                try:
+                    self.__room_id = await _get_real_rid(self.url)
+                finally:
+                    _rid_request_headers.reset(token)
                 logger.debug(f"{self.plugin_msg}: {_get_real_rid.cache_info()}")
             self.fake_headers['referer'] = self.url
             room_profile = await self.get_room_profile(self.huya_mobile_api)
@@ -574,7 +579,8 @@ def _raise_for_room_block(text: str):
 
 @alru_cache(maxsize=None)
 async def _get_real_rid(url) -> str:
-    resp = await client.get(url)
+    req_headers = _rid_request_headers.get()
+    resp = await client.get(url, headers=req_headers)
     resp.raise_for_status()
     _raise_for_room_block(resp.text)
     room_data = match1(resp.text, HUYA_WEB_ROOM_DATA_REGEX)

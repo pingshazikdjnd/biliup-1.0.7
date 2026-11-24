@@ -518,12 +518,13 @@ class DownloadBase(ABC):
 
     async def acheck_url_healthy(self, url):
         async def __client_get(url, stream: bool = False):
-            client.headers.update(self.fake_headers)
+            request_headers = self.stream_headers.copy()
+            self.update_headers(request_headers)
             if stream:
-                async with client.stream("GET", url, timeout=60, follow_redirects=False) as response:
+                async with client.stream("GET", url, timeout=60, follow_redirects=False, headers=request_headers) as response:
                     pass
             else:
-                response = await client.get(url)
+                response = await client.get(url, headers=request_headers)
             if response.status_code not in (301, 302):
                 response.raise_for_status()
             return response
