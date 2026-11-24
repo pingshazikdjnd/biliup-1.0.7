@@ -344,6 +344,22 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
             execv_mock.assert_called_once()
             self.assertFalse(os.path.exists(pidfile))
 
+        # 使用 'biliup --password restart restart' 启动时：仅子命令 'restart' 转为 'start' 并清理 PID，密码值不受影响
+        with open(pidfile, 'w', encoding='utf-8') as f:
+            f.write(f'{os.getpid()}\n')
+        with patch.object(reload_mod.sys, 'platform', 'linux'), \
+                patch.object(reload_mod.sys, 'argv', ['biliup', '--password', 'restart', 'restart']), \
+                patch('biliup.IS_FROZEN', False), \
+                patch.object(reload_mod.os, 'execv', create=True) as execv_mock, \
+                patch.object(web_mod, '_shutdown_qr_pool') as shutdown_mock:
+            reload_mod._restart_process()
+            shutdown_mock.assert_called_once()
+            execv_mock.assert_called_once_with(
+                sys.executable,
+                [sys.executable, '-m', 'biliup', '--password', 'restart', 'start'],
+            )
+            self.assertFalse(os.path.exists(pidfile))
+
 
 if __name__ == '__main__':
     unittest.main()

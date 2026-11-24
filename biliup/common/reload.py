@@ -100,11 +100,37 @@ class AutoReload(Timer):
                 return
 
 
+_VALUE_FLAGS = {'-H', '-P', '--static-dir', '--password', '--config'}
+
+
+def _normalize_restart_args(argv_tail):
+    """将子命令位置的 'restart' 转为 'start'，避免 execv 后 Daemon.restart() 杀死自身；跳过带值选项参数。"""
+    normalized = []
+    has_start_subcmd = False
+    skip_next = False
+    for arg in argv_tail:
+        if skip_next:
+            normalized.append(arg)
+            skip_next = False
+        elif arg in _VALUE_FLAGS:
+            normalized.append(arg)
+            skip_next = True
+        elif arg == 'restart':
+            normalized.append('start')
+            has_start_subcmd = True
+        else:
+            if arg == 'start':
+                has_start_subcmd = True
+            normalized.append(arg)
+    return normalized, has_start_subcmd
+
+
 def _build_restart_cmd():
     from biliup import IS_FROZEN
+    args, _ = _normalize_restart_args(sys.argv[1:])
     if IS_FROZEN:
-        return [sys.executable, *sys.argv[1:]]
-    return [sys.executable, '-m', 'biliup', *sys.argv[1:]]
+        return [sys.executable, *args]
+    return [sys.executable, '-m', 'biliup', *args]
 
 
 def _cleanup_own_pidfile(pidfile='watch_process.pid'):
@@ -127,11 +153,12 @@ def _restart_process():
         except Exception:
             logger.warning('关闭扫码进程池失败', exc_info=True)
 
+    _, has_start_subcmd = _normalize_restart_args(sys.argv[1:])
     cmd = _build_restart_cmd()
     if sys.platform != 'win32':
-        # 仅在重启命令包含 'start'（Daemon.start 会重新创建 PID 文件）时清理旧 PID；
+        # 仅在重启命令包含 'start' 子命令（含由 'restart' 规范化而来，Daemon.start 会重建 PID 文件）时清理旧 PID；
         # 否则 os.execv 保持原 PID，需保留现有 PID 文件。
-        if 'start' in cmd:
+        if has_start_subcmd:
             _cleanup_own_pidfile()
         os.execv(cmd[0], cmd)
     else:
