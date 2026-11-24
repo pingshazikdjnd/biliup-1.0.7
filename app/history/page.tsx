@@ -1,11 +1,11 @@
 'use client'
-import { Layout, Modal, Typography } from '@douyinfe/semi-ui'
+import { Layout, Modal, Toast, Typography } from '@douyinfe/semi-ui'
 import { IconUserCardVideo, IconVideoListStroked } from '@douyinfe/semi-icons'
 import { Table } from '@douyinfe/semi-ui'
 import { SortOrder } from '@douyinfe/semi-ui/lib/es/table'
 import useSWR from 'swr'
 import { fetcher, FileList } from '@/app/lib/api-streamer'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import dynamic from 'next/dynamic'
 import { humDate } from '@/app/lib/utils'
 import { AuthGuard } from '../lib/auth-guard'
@@ -19,7 +19,8 @@ export default function Home() {
   const { Header, Footer, Sider, Content } = Layout
   const { data: data, error, isLoading } = useSWR<FileList[]>('/v1/videos', fetcher)
   const { Text } = Typography
-  const [fileName, setFileName] = useState<string>()
+  const [videoUrl, setVideoUrl] = useState<string>()
+  const requestIdRef = useRef(0)
   const columns = [
     {
       title: '标题',
@@ -55,22 +56,35 @@ export default function Home() {
     },
   ]
   const [visible, setVisible] = useState(false)
-  const showDialog = (name: string) => {
+  const showDialog = async (name: string) => {
+    const reqId = ++requestIdRef.current
+    const base = `${process.env.NEXT_PUBLIC_API_SERVER ?? ''}/static/${encodeURIComponent(name)}`
+    const auth = typeof window !== 'undefined' ? localStorage.getItem('auth') : null
+    if (!auth) {
+      setVideoUrl(base)
+      setVisible(true)
+      return
+    }
+    setVideoUrl(undefined)
     setVisible(true)
-    setFileName(name)
-    // setTimeout(()=>{
-    //     let player = new Player({
-    //           id: 'mse',
-    //           url: (process.env.NEXT_PUBLIC_API_SERVER ?? '') + '/static/' + name,
-    //           height: '100%',
-    //           // plugins: [FlvPlugin],
-    //           plugins: [FlvJsPlugin],
-    //           width: '100%',
-    //         });
-    // }, 500)
+    try {
+      const res = await fetcher(`/v1/static-token?file=${encodeURIComponent(name)}`, undefined)
+      if (requestIdRef.current !== reqId) {
+        return
+      }
+      setVideoUrl(res?.token ? `${base}?token=${encodeURIComponent(res.token)}` : base)
+    } catch (e: any) {
+      if (requestIdRef.current !== reqId) {
+        return
+      }
+      Toast.error(`获取播放授权失败: ${e?.message || '未知错误'}`)
+      setVisible(false)
+    }
   }
   const handleCancel = () => {
+    requestIdRef.current++
     setVisible(false)
+    setVideoUrl(undefined)
     console.log('Cancel button clicked')
   }
   return (
@@ -120,9 +134,9 @@ export default function Home() {
             bodyStyle={{ height: 500 }}
             footer={null}
           >
-            <Players
-              url={(process.env.NEXT_PUBLIC_API_SERVER ?? '') + '/static/' + fileName}
-            ></Players>
+            {visible && videoUrl ? (
+              <Players url={videoUrl}></Players>
+            ) : null}
             <div id="mse"></div>
           </Modal>
         </Content>

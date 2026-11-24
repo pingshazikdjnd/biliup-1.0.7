@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from . import plugins
@@ -46,9 +47,28 @@ async def singleton_check(platform, name, url):
     event_manager.send_event(Event(UPLOAD, ({'name': name, 'url': url},)))
     p = platform(name, url)
     if await p.acheck_stream(True) and p.should_record():
-        # 需要等待上传文件列表检索完成后才可以开始下次下载
-        with NamedLock(f'upload_file_list_{name}'):
-            event_manager.send_event(Event(PRE_DOWNLOAD, args=(name, url,)))
+        # 需要等待上传文件列表检索完成后才可以开始下次下载，避免阻塞主事件循环
+        cancelled = threading.Event()
+
+        def _dispatch_pre_download():
+            with NamedLock(f'upload_file_list_{name}'):
+                if cancelled.is_set():
+                    return
+                plugin_info = context.get('PluginInfo')
+                if plugin_info is not None:
+                    inverted_index = getattr(plugin_info, 'inverted_index', None)
+                    if inverted_index is not None and inverted_index.get(url) != name:
+                        return
+                    url_status = getattr(plugin_info, 'url_status', None)
+                    if url_status is not None and url_status.get(url) == 1:
+                        return
+                event_manager.send_event(Event(PRE_DOWNLOAD, args=(name, url,)))
+
+        try:
+            await asyncio.to_thread(_dispatch_pre_download)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
 
 async def shot(event):

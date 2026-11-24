@@ -1,5 +1,6 @@
 import logging
 import subprocess
+import threading
 
 logger = logging.getLogger('biliup')
 
@@ -9,13 +10,16 @@ class NamedLock:
     简单实现的命名锁
     """
     from _thread import LockType
+    _meta_lock = threading.Lock()
     _lock_dict = {}
 
     def __new__(cls, name) -> LockType:
-        import threading
-        if name not in cls._lock_dict:
-            cls._lock_dict[name] = threading.Lock()
-        return cls._lock_dict[name]
+        with cls._meta_lock:
+            lock = cls._lock_dict.get(name)
+            if lock is None:
+                lock = threading.Lock()
+                cls._lock_dict[name] = lock
+            return lock
 
 
 def silence_event_loop_closed(func):

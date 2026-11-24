@@ -82,6 +82,12 @@ class TestPR5SessionIsolation(unittest.IsolatedAsyncioTestCase):
         config.data.clear()
         config.data.update(self._config_snapshot)
 
+    def _register_cookie_paths(self, *paths):
+        with self._TestSession() as db:
+            for p in paths:
+                db.add(Configuration(key='bilibili-cookies', value=p))
+            db.commit()
+
     def test_module_does_not_shadow_bilibili_class_with_singleton(self):
         self.assertIsInstance(web_mod.BiliBili, type)
 
@@ -147,7 +153,12 @@ class TestPR5SessionIsolation(unittest.IsolatedAsyncioTestCase):
         await client.start_server()
         self.addAsyncCleanup(client.close)
 
-        with patch.object(web_mod, 'BiliBili', FakeBiliBili):
+        missing_path = os.path.join(self._tmpdir.name, 'nope.json')
+        unregistered_path = os.path.join(self._tmpdir.name, 'unregistered.json')
+        self._register_cookie_paths(path_a, path_b, missing_path)
+
+        with patch.object(web_mod, 'SessionLocal', self._TestSession), \
+             patch.object(web_mod, 'BiliBili', FakeBiliBili):
             resp_a, resp_b = await asyncio.gather(
                 client.get('/bili/space/myinfo', params={'user': path_a}),
                 client.get('/bili/space/myinfo', params={'user': path_b}),
@@ -172,11 +183,12 @@ class TestPR5SessionIsolation(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(config.data['user'], self._user_sentinel)
 
-            # 缺参返回 400，缺失文件返回 500
+            # 缺参返回 400，未登记路径返回 403，已登记但磁盘缺失返回 500
             self.assertEqual((await client.get('/bili/space/myinfo')).status, 400)
+            self.assertEqual((await client.get('/bili/space/myinfo', params={'user': unregistered_path})).status, 403)
             missing = await client.get(
                 '/bili/space/myinfo',
-                params={'user': os.path.join(self._tmpdir.name, 'nope.json')},
+                params={'user': missing_path},
             )
             self.assertEqual(missing.status, 500)
 
@@ -231,7 +243,10 @@ class TestPR5SessionIsolation(unittest.IsolatedAsyncioTestCase):
         await client.start_server()
         self.addAsyncCleanup(client.close)
 
-        with patch.object(web_mod, 'BiliBili', FakeBiliBili):
+        self._register_cookie_paths(path_a, path_b)
+
+        with patch.object(web_mod, 'SessionLocal', self._TestSession), \
+             patch.object(web_mod, 'BiliBili', FakeBiliBili):
             resp_a, resp_b = await asyncio.gather(
                 client.get('/bili/seasons', params={'user': path_a}),
                 client.get('/bili/seasons', params={'user': path_b}),
@@ -366,8 +381,10 @@ class TestPR5SessionIsolation(unittest.IsolatedAsyncioTestCase):
         def _fake_sg_login():
             seen_login_tids.append(threading.get_ident())
 
+        self._register_cookie_paths(path_a)
         config.data['toml'] = True
-        with patch.object(web_mod, 'BiliBili', TimeoutBiliBili), \
+        with patch.object(web_mod, 'SessionLocal', self._TestSession), \
+             patch.object(web_mod, 'BiliBili', TimeoutBiliBili), \
              patch.object(web_mod.stream_gears, 'login_by_cookies', side_effect=_fake_sg_login):
             resp_myinfo = await client.get('/bili/space/myinfo', params={'user': path_a})
             self.assertEqual(resp_myinfo.status, 504)

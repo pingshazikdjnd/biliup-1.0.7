@@ -30,6 +30,7 @@ class Config(UserDict):
 
     def load_from_db(self, db):
         from biliup.database.models import Configuration, LiveStreamers
+        new_data = dict(self.data)
         context = {
             'file_upload_count': self.data.get('file_upload_count', {}),
             'url_upload_count': self.data.get('url_upload_count', {}),
@@ -39,22 +40,26 @@ class Config(UserDict):
         }
 
         for con in db.execute(select(Configuration.value).where(Configuration.key == 'config')):
-            self.data = json.loads(con.value)
-        self.data.update(context)
-        self['streamers'] = {}
+            loaded = json.loads(con.value)
+            if isinstance(loaded, dict):
+                new_data = loaded
+        new_data.update(context)
+        streamers = {}
         for ls in db.scalars(select(LiveStreamers)):
-            self['streamers'][ls.remark] = {
-                k: v for k, v in ls.as_dict().items() if v and (k not in ['upload_streamers_id', 'id', 'remark'])}
-            # self['streamers'][ls.remark].pop('upload_streamers')
-            if ls.upload_streamers_id:
-                self['streamers'][ls.remark].update({
-                    k: v for k, v in ls.uploadstreamers.as_dict().items() if v and k not in ['id', 'template_name']})
-                if self['streamers'][ls.remark].get('uploader') is None:
-                    self['streamers'][ls.remark]['uploader'] = 'biliup-rs'
-            # if self['streamers'][ls.remark].get('tags'):
-            #     self['streamers'][ls.remark]['tags'] = self['streamers'][ls.remark]['tags']
-        # for us in UploadStreamers.select():
-        #     config.data[con.key] = con.value
+            streamer_cfg = {
+                k: v for k, v in ls.as_dict().items()
+                if v is not None and k not in ['upload_streamers_id', 'id', 'remark']
+            }
+            if ls.upload_streamers_id and ls.uploadstreamers is not None:
+                streamer_cfg.update({
+                    k: v for k, v in ls.uploadstreamers.as_dict().items()
+                    if v is not None and k not in ['id', 'template_name']
+                })
+                if not streamer_cfg.get('uploader'):
+                    streamer_cfg['uploader'] = 'biliup-rs'
+            streamers[ls.remark] = streamer_cfg
+        new_data['streamers'] = streamers
+        self.data = new_data
 
     def save_to_db(self, db):
         from biliup.database.models import Configuration, LiveStreamers, UploadStreamers
@@ -132,15 +137,57 @@ class Config(UserDict):
             with open('config.toml', 'wb') as stream:
                 tomli_w.dump(old_data, stream)
         else:
+            import tempfile
             import yaml
-            with open('config.yaml', 'w+', encoding='utf-8') as stream:
-                old_data = yaml.load(stream, Loader=yaml.FullLoader)
-                old_data["user"]["cookies"] = self.data["user"]["cookies"]
-                old_data["user"]["access_token"] = self.data["user"]["access_token"]
-                old_data["lines"] = self.data["lines"]
-                old_data["threads"] = self.data["threads"]
-                old_data["streamers"] = self.data["streamers"]
-                yaml.dump(old_data, stream, default_flow_style=False, allow_unicode=True)
+            target_path = os.path.realpath('config.yaml') if os.path.islink('config.yaml') else 'config.yaml'
+            target_dir = os.path.dirname(target_path) or '.'
+            old_data = {}
+            if os.path.exists(target_path):
+                with open(target_path, 'r', encoding='utf-8') as stream:
+                    loaded = yaml.safe_load(stream)
+                    if isinstance(loaded, dict):
+                        old_data = loaded
+
+            user_data = self.data.get("user")
+            if isinstance(user_data, dict):
+                if not isinstance(old_data.get("user"), dict):
+                    old_data["user"] = {}
+                if "cookies" in user_data:
+                    old_data["user"]["cookies"] = user_data["cookies"]
+                if "access_token" in user_data:
+                    old_data["user"]["access_token"] = user_data["access_token"]
+
+            for key in ("lines", "threads", "streamers"):
+                if key in self.data:
+                    old_data[key] = self.data[key]
+
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode='w',
+                    encoding='utf-8',
+                    dir=target_dir,
+                    prefix='.config.yaml.',
+                    suffix='.tmp',
+                    delete=False,
+                ) as tmp:
+                    tmp_path = tmp.name
+                    yaml.safe_dump(old_data, tmp, default_flow_style=False, allow_unicode=True)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                if os.path.exists(target_path):
+                    try:
+                        shutil.copymode(target_path, tmp_path)
+                    except OSError:
+                        pass
+                os.replace(tmp_path, target_path)
+            except Exception:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                raise
 
     def dump(self, file):
         """ 转储到旧版配置文件 """

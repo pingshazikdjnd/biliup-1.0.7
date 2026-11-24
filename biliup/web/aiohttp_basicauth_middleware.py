@@ -2,20 +2,33 @@
 https://github.com/bugov/aiohttp-basicauth-middleware
 """
 
+import hmac
 import inspect
 import logging
 from typing import (
     Callable,
     Iterable,
+    Optional,
     Type,
-    Coroutine,
-    Tuple
 )
 from aiohttp import web
 from .http_basic_auth import parse_header, BasicAuthException
 
 
 log = logging.getLogger(__name__)
+
+
+def _safe_compare(expected, actual) -> bool:
+    """使用恒定时间比对凭据，兼容非 ASCII 字符串并防御类型异常"""
+    if expected is None or actual is None:
+        return False
+    if isinstance(expected, str):
+        expected = expected.encode('utf-8')
+    if isinstance(actual, str):
+        actual = actual.encode('utf-8')
+    if not isinstance(expected, (bytes, bytearray)) or not isinstance(actual, (bytes, bytearray)):
+        return False
+    return hmac.compare_digest(expected, actual)
 
 
 class BaseStrategy:
@@ -27,7 +40,7 @@ class BaseStrategy:
 
         log.debug('Init strategy %r', (self.request, self.storage, self.handler))
 
-    def get_credentials(self) -> Tuple[str, str]:
+    def get_credentials(self) -> tuple[str, str]:
         try:
             return parse_header(self.header)
         except BasicAuthException:
@@ -37,11 +50,7 @@ class BaseStrategy:
     async def password_test(self) -> bool:
         login, password = self.get_credentials()
         server_password = self.storage.get(login)
-
-        if server_password != password:
-            return False
-
-        return True
+        return _safe_compare(server_password, password)
 
     async def check(self) -> web.Response:
         if await self.password_test():
@@ -58,48 +67,54 @@ def check_access(
     header_value: str,
     strategy: Callable = lambda x: x
 ) -> bool:
-    # log.debug('Check access: %r', header_value)
-
     try:
         login, password = parse_header(header_value)
     except BasicAuthException as e:
-        print(f"BasicAuthException: {e}")
+        log.debug('Invalid basic auth header: %s', e)
         return False
 
     hashed_password = auth_dict.get(login)
-    hashed_request_password = strategy(password)
-    if hashed_password != hashed_request_password:
+    if hashed_password is None:
         return False
-
-    # log.debug('%r log in successed', "biliup")
-    return True
+    hashed_request_password = strategy(password)
+    return _safe_compare(hashed_password, hashed_request_password)
 
 
 def basic_auth_middleware(
     urls: Iterable,
     auth_dict: dict,
-    strategy: Type[BaseStrategy] = lambda x: x
-) -> Coroutine:
-    async def factory(app, handler) -> Coroutine:
-        async def middleware(request) -> web.Response:
-            for url in urls:
-                if not request.path.startswith(url):
-                    continue
+    strategy: Type[BaseStrategy] = lambda x: x,
+    token_validator: Optional[Callable[[web.Request], bool]] = None
+):
+    protected_urls = tuple(urls)
 
-                if inspect.isclass(strategy) and issubclass(strategy, BaseStrategy):
-                    log.debug("Use Strategy: %r", strategy.__name__)
-                    strategy_obj = strategy(
-                        request,
-                        auth_dict,
-                        handler,
-                        request.headers.get('Authorization', '')
-                    )
-                    return await strategy_obj.check()
-
-                if not check_access(auth_dict, request.headers.get('Authorization', ''), strategy):
-                    raise web.HTTPUnauthorized()
-
-                return await handler(request)
+    @web.middleware
+    async def middleware(request: web.Request, handler: Callable) -> web.Response:
+        if request.method == 'OPTIONS':
             return await handler(request)
-        return middleware
-    return factory
+
+        for url in protected_urls:
+            if not request.path.startswith(url):
+                continue
+
+            auth_header = request.headers.get('Authorization', '')
+            if not auth_header and token_validator is not None and token_validator(request):
+                return await handler(request)
+
+            if inspect.isclass(strategy) and issubclass(strategy, BaseStrategy):
+                log.debug("Use Strategy: %r", strategy.__name__)
+                strategy_obj = strategy(
+                    request,
+                    auth_dict,
+                    handler,
+                    auth_header
+                )
+                return await strategy_obj.check()
+
+            if not check_access(auth_dict, auth_header, strategy):
+                raise web.HTTPUnauthorized()
+
+            return await handler(request)
+        return await handler(request)
+
+    return middleware

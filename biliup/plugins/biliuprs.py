@@ -64,34 +64,55 @@ class BiliWeb(UploadBase):
             }]
 
         ex_parent_conn, ex_child_conn = mp.Pipe()
-        upload_args = {
-            "ex_conn": ex_child_conn,
-            "lines": self.lines,
-            "submit": self.submit_api,
-            "video_path": [file.video for file in file_list],
-            "cookie_file": self.user_cookie,
-            "title": self.data["format_title"][:80],
-            "tid": self.tid,
-            "tag": ','.join(self.tags),
-            "copyright": self.copyright,
-            "source": self.copyright_source if self.copyright_source else self.data["url"],
-            "desc": self.desc,
-            "dynamic": self.dynamic,
-            "cover": self.cover_path if self.cover_path is not None else "",
-            "dolby": self.dolby,
-            "lossless_music": self.hires,
-            "no_reprint": self.no_reprint,
-            "charging_pay": self.charging_pay,
-            "limit": self.threads,
-            "desc_v2": desc_v2,
-            "extra_fields": self.extra_fields,
-            "dtime": int(time.time() + self.dtime) if self.dtime else None,
-        }
-        upload_process = mp.get_context('spawn').Process(target=stream_gears_upload, daemon=True, kwargs=upload_args)
-        upload_process.start()
-        upload_process.join()
-        if ex_parent_conn.poll():
-            raise RuntimeError(ex_parent_conn.recv())
+        try:
+            upload_args = {
+                "ex_conn": ex_child_conn,
+                "lines": self.lines,
+                "submit": self.submit_api,
+                "video_path": [file.video for file in file_list],
+                "cookie_file": self.user_cookie,
+                "title": self.data["format_title"][:80],
+                "tid": self.tid,
+                "tag": ','.join(self.tags),
+                "copyright": self.copyright,
+                "source": self.copyright_source if self.copyright_source else self.data["url"],
+                "desc": self.desc,
+                "dynamic": self.dynamic,
+                "cover": self.cover_path if self.cover_path is not None else "",
+                "dolby": self.dolby,
+                "lossless_music": self.hires,
+                "no_reprint": self.no_reprint,
+                "charging_pay": self.charging_pay,
+                "limit": self.threads,
+                "desc_v2": desc_v2,
+                "extra_fields": self.extra_fields,
+                "dtime": int(time.time() + self.dtime) if self.dtime else None,
+            }
+            upload_process = mp.get_context('spawn').Process(target=stream_gears_upload, daemon=True, kwargs=upload_args)
+            upload_process.start()
+            upload_process.join()
+            if upload_process.exitcode != 0:
+                err = None
+                try:
+                    if ex_parent_conn.poll():
+                        err = ex_parent_conn.recv()
+                except Exception:
+                    pass
+                if err:
+                    raise RuntimeError(f"上传子进程异常退出 (exitcode: {upload_process.exitcode}): {err}")
+                else:
+                    raise RuntimeError(f"上传子进程异常退出 (exitcode: {upload_process.exitcode})")
+            if ex_parent_conn.poll():
+                raise RuntimeError(ex_parent_conn.recv())
+        finally:
+            try:
+                ex_parent_conn.close()
+            except Exception:
+                pass
+            try:
+                ex_child_conn.close()
+            except Exception:
+                pass
 
         logger.info(f"上传成功: {self.principal}")
 

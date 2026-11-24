@@ -46,6 +46,25 @@ class UploadBase:
         return max
 
     @staticmethod
+    def _is_streamer_recording(index) -> bool:
+        from biliup.handler import event_manager
+        plugin_info = event_manager.context.get('PluginInfo')
+        if plugin_info is None:
+            return False
+        url_status = getattr(plugin_info, 'url_status', {}) or {}
+        streamer_url = config.get('streamers', {}).get(index, {}).get('url')
+        if isinstance(streamer_url, (list, tuple, set)):
+            if any(url_status.get(u) == 1 for u in streamer_url):
+                return True
+        elif streamer_url and url_status.get(streamer_url) == 1:
+            return True
+        inverted_index = getattr(plugin_info, 'inverted_index', {}) or {}
+        for u, s_name in inverted_index.items():
+            if s_name == index and url_status.get(u) == 1:
+                return True
+        return False
+
+    @staticmethod
     def file_list(index) -> List[FileInfo]:
         from biliup.handler import event_manager
         media_extensions = ['.mp4', '.flv', '.3gp', '.webm', '.mkv', '.ts']
@@ -53,16 +72,20 @@ class UploadBase:
         # 获取文件列表
         file_list = []
         # 数据库中保存的文件名, 不含后缀
-        save = []
+        save = set()
         with SessionLocal() as db:
             dbinfo = db.query(models.StreamerInfo).filter(models.StreamerInfo.name == index).order_by(
                 desc(models.StreamerInfo.id)).first()
             if dbinfo:
-                for dbfile in dbinfo.filelist:
-                    save.append(dbfile.file)
+                save = {
+                    pathlib.Path(f.file[:-5] if f.file.endswith('.part') else f.file).stem
+                    for f in dbinfo.filelist
+                    if f.file
+                }
         for file_name in os.listdir('.'):
-            # 可能有两层后缀.with_suffix('')去掉一层.stem取文件名
-            if (index in file_name or pathlib.Path(file_name).with_suffix('').stem in save ) and os.path.isfile(file_name):
+            base_name = file_name[:-5] if file_name.endswith('.part') else file_name
+            file_stem = pathlib.Path(base_name).stem
+            if (index in file_name or file_stem in save) and os.path.isfile(file_name):
                 file_list.append(file_name)
         if len(file_list) == 0:
             return []
@@ -73,10 +96,14 @@ class UploadBase:
         upload_filename: list = event_manager.context['upload_filename']
 
         results = []
-        for index, file in enumerate(file_list):
+        skipped_part_names = set()
+        for i, file in enumerate(file_list):
             old_name = file
             if file.endswith('.part'):
-                file_list[index] = os.path.splitext(file)[0]
+                if UploadBase._is_streamer_recording(index):
+                    skipped_part_names.add(os.path.splitext(file[:-5])[0])
+                    logger.debug(f'{index} 正在录制中，跳过 .part 文件: {file}')
+                    continue
                 file = os.path.splitext(file)[0]
 
             name, ext = os.path.splitext(file)
@@ -88,8 +115,13 @@ class UploadBase:
                 continue
 
             if old_name != file:
+                if UploadBase._is_streamer_recording(index):
+                    skipped_part_names.add(name)
+                    logger.debug(f'{index} 正在录制中，跳过 .part 文件: {old_name}')
+                    continue
                 logger.info(f'{old_name} 已更名为 {file}')
                 shutil.move(old_name, file)
+                file_list[i] = file
 
             file_size = os.path.getsize(file) / 1024 / 1024
             threshold = config.get('filtering_threshold', 0)
@@ -109,8 +141,8 @@ class UploadBase:
         # 过滤弹幕
         for file in file_list:
             name, ext = os.path.splitext(file)
-            # 过滤正在上传的
-            if name in upload_filename:
+            # 过滤正在上传或录制中跳过的文件
+            if name in upload_filename or name in skipped_part_names:
                 continue
             if ext == '.xml':
                 have_video = False
@@ -141,14 +173,19 @@ class UploadBase:
     def upload(self, file_list: List[FileInfo]) -> List[FileInfo]:
         raise NotImplementedError()
 
-    def start(self):
+    def start(self, allowed_files=None):
         from biliup.handler import event_manager
         # 保证一个name同时只有一个上传线程扫描文件列表
         lock = NamedLock(f'upload_file_list_{self.principal}')
+        lock_acquired = False
         upload_filename_list = []
         try:
             lock.acquire()
+            lock_acquired = True
             file_list = UploadBase.file_list(self.principal)
+            if allowed_files is not None:
+                allowed_set = set(allowed_files)
+                file_list = [f for f in file_list if f.video in allowed_set]
 
             if len(file_list) > 0:
                 upload_filename_list = [os.path.splitext(file.video)[0] for file in file_list]
@@ -157,11 +194,13 @@ class UploadBase:
                 with NamedLock('upload_filename'):
                     event_manager.context['upload_filename'].extend(upload_filename_list)
                 lock.release()
+                lock_acquired = False
                 file_list = self.upload(file_list)
                 return file_list
         finally:
-            with NamedLock('upload_filename'):
-                event_manager.context['upload_filename'] = list(
-                    set(event_manager.context['upload_filename']) - set(upload_filename_list))
-            if lock.locked():
+            if upload_filename_list:
+                with NamedLock('upload_filename'):
+                    event_manager.context['upload_filename'] = list(
+                        set(event_manager.context['upload_filename']) - set(upload_filename_list))
+            if lock_acquired:
                 lock.release()

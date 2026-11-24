@@ -258,6 +258,50 @@ const Global: React.FC = () => {
           }}
           showClear={true}
         />
+        <Form.InputNumber
+          field="disk_upload_threshold_gb"
+          label="磁盘触发上传软水位阈值（disk_upload_threshold_gb）"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              每段录制完成后检测磁盘剩余空间，若低于该阈值则主动提前结束本轮录制并触发上传清理以腾出空间。0 为不开启。
+              <br />
+              单位：GB（支持小数）
+            </div>
+          }
+          placeholder="0"
+          suffix="GB"
+          min={0}
+          step={0.1}
+          precision={2}
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        />
+        <Form.InputNumber
+          field="disk_stop_threshold_gb"
+          label="磁盘停止录制硬水位阈值（disk_stop_threshold_gb）"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              新开录制前检测磁盘剩余空间，若低于该阈值则暂停新开录制以保护系统文件、数据库和 Cookie。0 为不开启。
+              <br />
+              单位：GB（支持小数）
+            </div>
+          }
+          placeholder="0"
+          suffix="GB"
+          min={0}
+          step={0.1}
+          precision={2}
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        />
       </div>
 
       <Space />
@@ -386,6 +430,82 @@ const Global: React.FC = () => {
             alignSelf: 'stretch',
             padding: 0,
           }}
+        />
+        <Form.Switch
+          field="notify_email_enabled"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              在不可自愈上传失败、达到重试上限或触发磁盘硬水位时异步发送邮件告警。
+            </div>
+          }
+          label="启用邮件告警通知（notify_email_enabled）"
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+        />
+        <Form.Input
+          field="notify_smtp_host"
+          label="SMTP 服务器地址（notify_smtp_host）"
+          placeholder="smtp.qq.com"
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        />
+        <Form.InputNumber
+          field="notify_smtp_port"
+          label="SMTP 端口（notify_smtp_port）"
+          placeholder="465"
+          min={1}
+          max={65535}
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              QQ 邮箱 SSL 请使用 465 端口；STARTTLS 请使用 587 端口。默认 465。
+            </div>
+          }
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        />
+        <Form.Input
+          field="notify_smtp_user"
+          label="SMTP 用户名/发件人邮箱（notify_smtp_user）"
+          placeholder="example@qq.com"
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        />
+        <Form.Input
+          field="notify_smtp_pass"
+          mode="password"
+          label="SMTP 密码/授权码（notify_smtp_pass）"
+          placeholder="请输入 SMTP 授权码"
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        />
+        <Form.Input
+          field="notify_email_to"
+          label="收件人邮箱（notify_email_to）"
+          placeholder="recipient@example.com"
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
         />
       </div>
     </>

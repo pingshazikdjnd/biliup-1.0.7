@@ -1,17 +1,21 @@
 import asyncio
 import contextlib
+import hashlib
+import hmac
+import secrets
 import socket
 import json
 import os
 import pathlib
 import concurrent.futures
 import threading
+import time
 
 import copy
 import aiohttp_cors
 import requests
 import stream_gears
-from aiohttp import web
+from aiohttp import web, ClientTimeout
 from aiohttp.client import ClientSession
 from sqlalchemy import select, update
 from sqlalchemy.exc import NoResultFound, MultipleResultsFound
@@ -73,6 +77,62 @@ def _load_cookies_from_file(path: str) -> dict:
 
 # 全局变量存储密码
 GLOBAL_PASSWORD = None
+MAX_PROXY_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
+STATIC_TOKEN_TTL_SECONDS = 7200  # 2 小时
+
+
+def generate_static_token(secret: bytes, filename: str, ttl: int = STATIC_TOKEN_TTL_SECONDS) -> str:
+    """生成绑定单文件与过期时间的短时 HMAC-SHA256 签名令牌"""
+    exp = int(time.time()) + int(ttl)
+    payload = f"{filename}:{exp}".encode('utf-8')
+    sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def verify_static_token(secret: bytes, filename: str, token: str) -> bool:
+    """校验单文件短时签名令牌"""
+    if not secret or not filename or not token or '.' not in token:
+        return False
+    exp_str, sig = token.split('.', 1)
+    try:
+        exp = int(exp_str)
+    except ValueError:
+        return False
+    if exp < int(time.time()):
+        return False
+    payload = f"{filename}:{exp}".encode('utf-8')
+    expected_sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    try:
+        return hmac.compare_digest(expected_sig.encode('utf-8'), sig.encode('utf-8'))
+    except Exception:
+        return False
+
+
+def _validate_static_token(request: web.Request) -> bool:
+    if request.method not in ('GET', 'HEAD') or not request.path.startswith('/static/'):
+        return False
+    filename = request.path[len('/static/'):]
+    token = request.query.get('token', '')
+    return verify_static_token(request.app.get('static_token_secret'), filename, token)
+
+
+def _is_registered_cookie_file(file_path: str) -> bool:
+    """校验传入的 Cookie 文件路径是否已登记在 bilibili-cookies 或现有投稿模板中"""
+    if not file_path:
+        return False
+    with SessionLocal() as db:
+        registered = db.scalars(
+            select(Configuration.value).where(Configuration.key == 'bilibili-cookies')
+        ).all()
+        if file_path in registered:
+            return True
+        template_cookies = db.scalars(
+            select(UploadStreamers.user_cookie).where(
+                UploadStreamers.user_cookie.is_not(None),
+                UploadStreamers.user_cookie != ''
+            )
+        ).all()
+    return file_path in template_cookies
 
 
 def set_global_password(password: str):
@@ -352,6 +412,8 @@ async def lives(request):
     #     return web.HTTPBadRequest(text=f"{json_data['remark']} 与现存备注存在部分重复，禁止修改")
     with SessionLocal() as db:
         old = db.get(LiveStreamers, json_data['id'])
+        if old is None:
+            return web.HTTPNotFound(text="Streamer not found")
         old_url = old.url
         # 如果备注修改，才需要检查是否与现存备注存在部分重复
         if json_data['remark'] != old.remark:
@@ -364,15 +426,13 @@ async def lives(request):
         new_data = {key: json_data.get(key, None) for key in old.as_dict() if key != 'upload_streamers_id'}
         try:
             if uid:
-                # us = UploadStreamers.get_by_id(json_data['upload_id'])
-                us = db.get(UploadStreamers, json_data['upload_id'])
-                # LiveStreamers.update(**json_data, upload_streamers=us).where(LiveStreamers.id == old.id).execute()
-                # db.update_live_streamer(**{**json_data, "upload_streamers_id": us.id})
+                us = db.get(UploadStreamers, uid)
+                if us is None:
+                    return web.HTTPBadRequest(text=f"Upload streamer {uid} not found")
                 db.execute(update(LiveStreamers), [{**new_data, "upload_streamers_id": us.id}])
                 db.commit()
             else:
-                # LiveStreamers.update(**json_data).where(LiveStreamers.id == old.id).execute()
-                db.execute(update(LiveStreamers), [new_data])
+                db.execute(update(LiveStreamers), [{**new_data, "upload_streamers_id": None}])
                 db.commit()
         except Exception as e:
             return web.HTTPBadRequest(text=str(e))
@@ -386,13 +446,17 @@ async def lives(request):
 @routes.delete('/v1/streamers/{id}')
 async def streamers(request):
     from biliup.app import context
-    # org = LiveStreamers.get_by_id(request.match_info['id'])
     with SessionLocal() as db:
         org = db.get(LiveStreamers, request.match_info['id'])
-    # LiveStreamers.delete_by_id(request.match_info['id'])
+        if org is None:
+            return web.HTTPNotFound(text="Streamer not found")
+        org_url = org.url
         db.delete(org)
         db.commit()
-        context['PluginInfo'].delete(org.url)
+        try:
+            config.load_from_db(db)
+        finally:
+            context['PluginInfo'].delete(org_url)
     return web.HTTPOk()
 
 
@@ -415,9 +479,11 @@ async def streamers_id(request):
 async def streamers(request):
     with SessionLocal() as db:
         us = db.get(UploadStreamers, request.match_info['id'])
+        if us is None:
+            return web.HTTPNotFound(text="Upload streamer not found")
         db.delete(us)
         db.commit()
-    # UploadStreamers.delete_by_id(request.match_info['id'])
+        config.load_from_db(db)
     return web.HTTPOk()
 
 
@@ -476,8 +542,7 @@ async def users(request):
     to_save = Configuration(key=json_data['platform'], value=json_data['value'])
     with SessionLocal() as db:
         db.add(to_save)
-        # to_save.save()
-        # db.flush(to_save)
+        db.flush()
         resp = {
             'id': to_save.id,
             'name': to_save.value,
@@ -626,6 +691,8 @@ async def get_seasons(request):
     file = request.query.get('user')
     if not file:
         return web.json_response({"status": 400, 'error': "缺少 user 参数"}, status=400)
+    if not _is_registered_cookie_file(file):
+        return web.json_response({"status": 403, 'error': "未登记的 Cookie 文件路径"}, status=403)
     try:
         result = await asyncio.to_thread(_fetch_seasons, file)
         return web.json_response(result)
@@ -650,6 +717,8 @@ async def myinfo(request):
     file = request.query.get('user')
     if not file:
         return web.json_response({"status": 400, 'error': "缺少 user 参数"}, status=400)
+    if not _is_registered_cookie_file(file):
+        return web.json_response({"status": 403, 'error': "未登记的 Cookie 文件路径"}, status=403)
     try:
         res = await asyncio.to_thread(_fetch_myinfo, file)
         return web.json_response(res)
@@ -665,17 +734,52 @@ async def myinfo(request):
 
 @routes.get('/bili/proxy')
 async def proxy(request):
-    url = unquote(request.query['url'])
+    raw_url = request.query.get('url')
+    if not raw_url:
+        return web.HTTPBadRequest(reason="Missing url parameter")
+    url = unquote(raw_url)
     parsed_url = urlparse(url)
 
-    if not parsed_url.hostname or not parsed_url.hostname.endswith('.hdslb.com'):
-        return web.HTTPForbidden(reason="Access to the requested domain is forbidden")
+    if (
+        parsed_url.scheme not in ('http', 'https')
+        or not parsed_url.hostname
+        or not parsed_url.hostname.lower().endswith('.hdslb.com')
+        or parsed_url.username
+        or parsed_url.password
+    ):
+        return web.HTTPForbidden(reason="Access to the requested domain or scheme is forbidden")
 
-    async with ClientSession() as session:
+    timeout = ClientTimeout(total=15)
+    async with ClientSession(timeout=timeout) as session:
         try:
-            async with session.get(url) as response:
-                content = await response.read()
-                return web.Response(body=content, status=response.status)
+            async with session.get(url, allow_redirects=False) as response:
+                content_length = response.headers.get('Content-Length')
+                if content_length is not None:
+                    try:
+                        if int(content_length) > MAX_PROXY_BODY_SIZE:
+                            return web.HTTPRequestEntityTooLarge(
+                                max_size=MAX_PROXY_BODY_SIZE,
+                                actual_size=int(content_length),
+                            )
+                    except ValueError:
+                        pass
+
+                chunks = bytearray()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    chunks.extend(chunk)
+                    if len(chunks) > MAX_PROXY_BODY_SIZE:
+                        return web.HTTPRequestEntityTooLarge(
+                            max_size=MAX_PROXY_BODY_SIZE,
+                            actual_size=len(chunks),
+                        )
+
+                resp_headers = {}
+                content_type = response.headers.get('Content-Type')
+                if content_type:
+                    resp_headers['Content-Type'] = content_type
+                return web.Response(body=bytes(chunks), status=response.status, headers=resp_headers or None)
+        except asyncio.TimeoutError:
+            return web.HTTPGatewayTimeout(reason="Upstream request timed out")
         except Exception as e:
             return web.HTTPBadRequest(reason=str(e))
 
@@ -702,22 +806,26 @@ def read_last_n_lines(file_path, n=50):
         return [line.decode('utf-8', errors='replace') for line in lines[-n:]]
 
 
+@routes.get('/v1/static-token')
+async def get_static_token(request):
+    """签发仅限单文件短时有效的静态资源访问令牌（用于视频播放）"""
+    filename = request.query.get('file', '')
+    if not filename or '/' in filename or '\\' in filename or filename in ('.', '..') or '\x00' in filename:
+        return web.json_response({"status": 400, 'error': "非法文件名"}, status=400)
+    if not request.app.get('password'):
+        return web.json_response({"token": None})
+    token = generate_static_token(request.app['static_token_secret'], filename)
+    return web.json_response({"token": token})
+
+
 @routes.get('/ws/logs')
 async def websocket_logs(request):
-    # 检查URL参数中的认证信息
-    auth_param = request.query.get('authorization')
-    if auth_param:
-        # 验证URL参数中的认证信息
-        if not check_url_auth(auth_param):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            await ws.send_str("认证失败")
-            await ws.close()
-            return ws
-    else:
-        # 如果没有URL参数认证信息，则继续使用现有的中间件认证
-        pass
-    
+    app_password = request.app['password'] if 'password' in request.app else GLOBAL_PASSWORD
+    if app_password:
+        auth_value = request.query.get('authorization') or request.headers.get('Authorization', '')
+        if not auth_value or not check_access({'biliup': app_password}, auth_value):
+            return web.HTTPUnauthorized(reason="Unauthorized")
+
     ws = web.WebSocketResponse()
     try:
         await ws.prepare(request)
@@ -822,35 +930,41 @@ def find_all_folders(directory):
     return result
 
 
-async def service(args):
+def create_app(password=None, static_dir=None):
     app = web.Application()
-    routes.static('/static', '.', show_index=False)
     app.add_routes(routes)
-    if args.static_dir:
-        app.add_routes([web.static('/', args.static_dir, show_index=False)])
+    app.add_routes([web.static('/static', '.', show_index=False)])
+    if static_dir:
+        app.add_routes([web.static('/', static_dir, show_index=False)])
     else:
-        # res = [web.static('/', files('biliup.web').joinpath('public'))]
-        res = []
-        for fdir in pathlib.Path(files('biliup.web').joinpath('public')).glob('**/*.html'):
-            fname = fdir.relative_to(files('biliup.web').joinpath('public'))
+        public_dir = pathlib.Path(files('biliup.web').joinpath('public'))
+        if public_dir.exists():
+            res = []
+            for fdir in public_dir.glob('**/*.html'):
+                fname = fdir.relative_to(public_dir)
 
-            def _copy(fname):
-                async def static_view(request):
-                    return web.FileResponse(files('biliup.web').joinpath('public').joinpath(fname))
+                def _copy(fname):
+                    async def static_view(request):
+                        return web.FileResponse(public_dir.joinpath(fname))
 
-                return static_view
+                    return static_view
 
-            res.append(web.get('/' + str(fname.with_suffix('')).replace('\\', '/'), _copy(fname)))
-            # res.append(web.static('/'+fdir.replace('\\', '/'), files('biliup.web').joinpath('public/'+fdir)))
-        res.append(web.static('/', files('biliup.web').joinpath('public')))
-        app.add_routes(res)
-    if args.password:
-        # 设置全局密码
-        set_global_password(args.password)
-        # 只保护API路径，不保护前端页面路径
-        app.middlewares.append(basic_auth_middleware(('/api/', '/url-status', '/v1/'), {'biliup': args.password}, ))
+                res.append(web.get('/' + str(fname.with_suffix('')).replace('\\', '/'), _copy(fname)))
+            res.append(web.static('/', public_dir))
+            app.add_routes(res)
 
-    # web.run_app(app, host=host, port=port)
+    app['password'] = password or None
+    app['static_token_secret'] = secrets.token_bytes(32)
+    if password:
+        # 保护API及静态文件下载路径，不保护前端页面路由；/static/ 允许凭单文件短时签名 ?token= 访问
+        app.middlewares.append(
+            basic_auth_middleware(
+                ('/api/', '/url-status', '/v1/', '/bili/', '/static/'),
+                {'biliup': password},
+                token_validator=_validate_static_token,
+            )
+        )
+
     cors = aiohttp_cors.setup(app, defaults={
         "*": aiohttp_cors.ResourceOptions(
             allow_credentials=True,
@@ -863,11 +977,19 @@ async def service(args):
     for route in list(app.router.routes()):
         cors.add(route)
 
+    setup_middlewares(app)
+    return app
+
+
+async def service(args):
+    password = getattr(args, 'password', None)
+    set_global_password(password or None)
+    app = create_app(password=password, static_dir=getattr(args, 'static_dir', None))
+
     if args.no_access_log:
         runner = web.AppRunner(app, access_log=None)
     else:
         runner = web.AppRunner(app)
-    setup_middlewares(app)
     await runner.setup()
     site = web.TCPSite(runner, host=args.host, port=args.port)
     await site.start()
@@ -876,7 +998,10 @@ async def service(args):
 
 
 async def handle_404(request):
-    return web.FileResponse(files('biliup.web').joinpath('public').joinpath('404.html'))
+    not_found_path = pathlib.Path(files('biliup.web').joinpath('public').joinpath('404.html'))
+    if not_found_path.is_file():
+        return web.FileResponse(not_found_path, status=404)
+    return web.Response(status=404, text='Not Found')
 
 
 async def handle_500(request):
