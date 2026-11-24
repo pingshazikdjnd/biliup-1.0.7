@@ -66,6 +66,14 @@ jobs:
       with:
         tagName: ${{ github.ref }} # the action automatically replaces \_\_VERSION\_\_ with the app version.
         projectPath: tauri-app
+    - name: Label & Rename Desktop Installers
+      if: ${{ github.event_name == 'release' }}
+      continue-on-error: true
+      shell: pwsh
+      run: python .github/scripts/label_release_assets.py
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
 #    - uses: actions/upload-artifact@v4
 #      with:
 #        path: dist/*

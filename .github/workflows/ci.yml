@@ -214,5 +214,19 @@ jobs:
           files: wheels-*/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout release helper
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          path: _repo
+          sparse-checkout: .github/scripts
+      - name: Label Release Assets
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        continue-on-error: true
+        run: python3 _repo/.github/scripts/label_release_assets.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref }}
 
 
