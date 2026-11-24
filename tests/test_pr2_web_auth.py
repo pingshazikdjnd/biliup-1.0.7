@@ -120,9 +120,16 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
         query_api_resp = await client.get(f'/api/basic?authorization={quote(auth_header)}')
         self.assertEqual(query_api_resp.status, 401)
 
-        # /v1/static-token 校验路径合法性并签发单文件短时签名令牌
+        # /v1/static-token 校验路径合法性并签发单文件短时签名令牌（拒绝目录跳转，放行含连续点的合法文件名）
         bad_token_req = await client.get('/v1/static-token?file=../secret.log', headers={'Authorization': auth_header})
         self.assertEqual(bad_token_req.status, 400)
+        dotdot_req = await client.get('/v1/static-token?file=..', headers={'Authorization': auth_header})
+        self.assertEqual(dotdot_req.status, 400)
+
+        dots_name_resp = await client.get(f'/v1/static-token?file={quote("直播...mp4")}', headers={'Authorization': auth_header})
+        self.assertEqual(dots_name_resp.status, 200)
+        dots_token = (await dots_name_resp.json())['token']
+        self.assertTrue(web_mod.verify_static_token(client.app['static_token_secret'], '直播...mp4', dots_token))
 
         token_resp = await client.get('/v1/static-token?file=ds_update.log', headers={'Authorization': auth_header})
         self.assertEqual(token_resp.status, 200)

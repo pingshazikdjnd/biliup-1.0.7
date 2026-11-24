@@ -735,7 +735,7 @@ def read_last_n_lines(file_path, n=50):
 async def get_static_token(request):
     """签发仅限单文件短时有效的静态资源访问令牌（用于视频播放）"""
     filename = request.query.get('file', '')
-    if not filename or '/' in filename or '\\' in filename or '..' in filename or '\x00' in filename:
+    if not filename or '/' in filename or '\\' in filename or filename in ('.', '..') or '\x00' in filename:
         return web.json_response({"status": 400, 'error': "非法文件名"}, status=400)
     if not request.app.get('password'):
         return web.json_response({"token": None})
