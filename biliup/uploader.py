@@ -7,6 +7,7 @@ import json
 from biliup.config import config
 from .common.tools import NamedLock
 from .engine.decorators import Plugin
+from .engine.upload import UploadBase
 
 logger = logging.getLogger('biliup')
 
@@ -75,7 +76,7 @@ def biliup_uploader(filelist, data):
         from .app import context as app_context
         index = data['name']
         data, fmt_ctx = fmt_title_and_desc_m(data)
-        context = {**config, **{k: v for k, v in fmt_ctx.items() if v is not None}}
+        context = {**config, **{k: v for k, v in fmt_ctx.items() if v is not None and v != ''}}
         platform = context.get("uploader") if context.get("uploader") else "biliup-rs"
         cls = Plugin.upload_plugins.get(platform)
         if cls is None:
@@ -100,7 +101,8 @@ def biliup_uploader(filelist, data):
                     logger.warning(f"文件 {raw_path} 正在上传中，跳过重复上传")
                     continue
                 seen.add(file_base)
-                active_files.append(f)
+                file_item = f if hasattr(f, 'video') else UploadBase.FileInfo(video=str(f), danmaku=None)
+                active_files.append(file_item)
                 registered_names.append(file_base)
             upload_filename_list.extend(registered_names)
 
@@ -122,12 +124,13 @@ def biliup_uploader(filelist, data):
         logger.info("stop biliup")
     finally:
         if registered_names and app_context is not None:
-            registered_set = set(registered_names)
             with NamedLock('upload_filename'):
-                app_context['upload_filename'] = [
-                    x for x in app_context.get('upload_filename', [])
-                    if x not in registered_set
-                ]
+                current = app_context.setdefault('upload_filename', [])
+                for base_name in registered_names:
+                    try:
+                        current.remove(base_name)
+                    except ValueError:
+                        pass
 
 
 def fmt_title_and_desc_m(data):

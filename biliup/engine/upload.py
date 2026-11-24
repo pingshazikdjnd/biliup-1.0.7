@@ -188,19 +188,34 @@ class UploadBase:
                 file_list = [f for f in file_list if f.video in allowed_set]
 
             if len(file_list) > 0:
-                upload_filename_list = [os.path.splitext(file.video)[0] for file in file_list]
-
-                logger.info('准备上传' + self.data["format_title"])
+                claimed_files = []
                 with NamedLock('upload_filename'):
-                    event_manager.context['upload_filename'].extend(upload_filename_list)
+                    current = event_manager.context.setdefault('upload_filename', [])
+                    in_flight = set(current)
+                    for f in file_list:
+                        base_name = os.path.splitext(f.video)[0]
+                        if base_name in in_flight:
+                            logger.debug(f'文件 {f.video} 已在上传队列中，跳过重复上传')
+                            continue
+                        in_flight.add(base_name)
+                        claimed_files.append(f)
+                        upload_filename_list.append(base_name)
+                    current.extend(upload_filename_list)
+
+                if not claimed_files:
+                    return None
+                logger.info('准备上传' + self.data["format_title"])
                 lock.release()
                 lock_acquired = False
-                file_list = self.upload(file_list)
-                return file_list
+                return self.upload(claimed_files)
         finally:
             if upload_filename_list:
                 with NamedLock('upload_filename'):
-                    event_manager.context['upload_filename'] = list(
-                        set(event_manager.context['upload_filename']) - set(upload_filename_list))
+                    current = event_manager.context.setdefault('upload_filename', [])
+                    for name in upload_filename_list:
+                        try:
+                            current.remove(name)
+                        except ValueError:
+                            pass
             if lock_acquired:
                 lock.release()

@@ -317,16 +317,25 @@ class TestPR6UploadContracts(unittest.IsolatedAsyncioTestCase):
                 bili.probe()
 
         # 2. _upload 10 次分片重试失败后抛 RuntimeError
+        chunk_attempts = 0
+
         async def always_fail_chunk(*args, **kwargs):
+            nonlocal chunk_attempts
+            chunk_attempts += 1
             raise aiohttp.ClientError('chunk failed')
 
         with self.assertRaises(RuntimeError):
             await bili._upload({}, io.BytesIO(b'123456'), 4, always_fail_chunk, tasks=1)
+        self.assertEqual(chunk_attempts, 10)
 
         # 3. upos 合并重试耗尽后抛 RuntimeError
+        merge_attempts = 0
+
         def fake_upos_post(url, params=None, json=None, headers=None, timeout=None):
+            nonlocal merge_attempts
             if 'uploads' in url:
                 return types.SimpleNamespace(json=lambda: {'upload_id': 'uid_1'})
+            merge_attempts += 1
             return types.SimpleNamespace(json=lambda: {'OK': 0, 'error': 'merge denied'})
 
         ret = {
@@ -338,11 +347,13 @@ class TestPR6UploadContracts(unittest.IsolatedAsyncioTestCase):
         }
         buf = io.BytesIO(b'1234')
         buf.name = 'test.mp4'
-        with patch.object(bili, '_upload', side_effect=MagicMock(return_value=asyncio.sleep(0))), \
+        with patch.object(bili, '_upload', side_effect=lambda *a, **kw: asyncio.sleep(0)), \
              patch.object(session, 'post', side_effect=fake_upos_post), \
-             patch.object(webup_mod.time, 'sleep'):
+             patch.object(webup_mod.time, 'sleep') as sleep_mock:
             with self.assertRaises(RuntimeError):
                 await bili.upos(buf, 4, ret, tasks=1)
+        self.assertEqual(merge_attempts, 6)
+        self.assertEqual(sleep_mock.call_count, 5)
         bili.close()
 
     def test_credits_to_desc_v2_handles_fewer_placeholders(self):
@@ -403,13 +414,15 @@ class TestPR6UploadContracts(unittest.IsolatedAsyncioTestCase):
         params = {
             'name': 'tpl1',
             'uploader': 'fake_manual',
-            'lines': None,
+            'lines': '',
             'threads': None,
-            'submit_api': None,
+            'submit_api': '',
         }
+        expected_free = UploadBase.FileInfo(video='dir/free.mp4', danmaku=None)
         with patch.dict(uploader_mod.Plugin.upload_plugins, {'fake_manual': FakeManualPlugin}):
             res = uploader_mod.biliup_uploader(['dir/busy.mp4', 'dir/free.mp4', 'dir/free.mkv'], dict(params))
-            self.assertEqual(res, ['dir/free.mp4'])
+            self.assertEqual(res, [expected_free])
+            self.assertIsInstance(captured['files'][0], UploadBase.FileInfo)
             self.assertEqual(captured['lines'], 'qn')
             self.assertEqual(captured['threads'], 6)
             self.assertEqual(captured['submit_api'], 'client')
@@ -422,6 +435,30 @@ class TestPR6UploadContracts(unittest.IsolatedAsyncioTestCase):
             res_err = uploader_mod.biliup_uploader(['dir/boom.mp4'], dict(params))
             self.assertIsNone(res_err)
             self.assertEqual(app_mod.context['upload_filename'], ['dir/busy'])
+
+    def test_upload_base_start_skips_file_concurrently_claimed_before_lock(self):
+        app_mod.context['upload_filename'] = []
+        file_claimed = UploadBase.FileInfo(video='dir/race.mp4', danmaku=None)
+        file_ok = UploadBase.FileInfo(video='dir/ok.mp4', danmaku=None)
+        seen_uploads = []
+
+        class RaceUploader(UploadBase):
+            def upload(self, file_list):
+                seen_uploads.append(list(file_list))
+                return file_list
+
+        def _fake_file_list(index):
+            # 模拟 file_list 扫描完成后、start() 进锁占位前，手动上传并发占用了 race.mp4
+            app_mod.context['upload_filename'].append('dir/race')
+            return [file_claimed, file_ok]
+
+        up = RaceUploader('race_streamer', {'format_title': 'race_title'})
+        with patch.object(UploadBase, 'file_list', side_effect=_fake_file_list):
+            res = up.start()
+
+        self.assertEqual(res, [file_ok])
+        self.assertEqual(seen_uploads, [[file_ok]])
+        self.assertEqual(app_mod.context['upload_filename'], ['dir/race'])
 
 
 if __name__ == '__main__':
