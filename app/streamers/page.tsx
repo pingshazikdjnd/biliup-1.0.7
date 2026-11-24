@@ -21,7 +21,7 @@ import React from 'react'
 import useStreamers from '../lib/use-streamers'
 import TemplateModal from '../ui/TemplateModal'
 import OverrideModal from '../ui/OverrideModal'
-import { LiveStreamerEntity, put, requestDelete, sendRequest } from '../lib/api-streamer'
+import { LiveStreamerEntity, proxy, put, requestDelete, sendRequest } from '../lib/api-streamer'
 import useSWRMutation from 'swr/mutation'
 import { AuthGuard } from '../lib/auth-guard'
 import ProtectedLayout from '../lib/protected-layout'
@@ -36,6 +36,30 @@ export default function Home() {
 
   const onConfirm = async (id: number) => {
     await deleteStreamers(id)
+  }
+  const handleDownloadLog = async () => {
+    try {
+      const res = await proxy('/static/ds_update.log')
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'ds_update.log'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e: any) {
+      Notification.error({
+        title: '下载日志失败',
+        content: (
+          <Typography.Paragraph style={{ maxWidth: 450 }}>
+            {e?.message || '未知错误'}
+          </Typography.Paragraph>
+        ),
+        style: { width: 'min-content' },
+      })
+    }
   }
   const handleEntityPostprocessor = (values: any) => {
     if (values?.postprocessor) {
@@ -170,7 +194,7 @@ export default function Home() {
                 style={{
                   color: 'var(--semi-color-text-2)',
                 }}
-                onClick={() => (window.location.href = '/static/ds_update.log')}
+                onClick={handleDownloadLog}
               />
               <TemplateModal onOk={handleOk}>
                 <Button icon={<IconPlusCircle />} theme="solid" style={{ marginRight: 10 }}>

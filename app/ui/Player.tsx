@@ -50,7 +50,8 @@ const Players: React.FC<PlayerConfig> = ({ url, height = '100%', width = '100%' 
         playerRef.current = null
       }
 
-      if (url.endsWith('.flv')) {
+      const cleanPath = url.split('?')[0].split('#')[0].toLowerCase()
+      if (cleanPath.endsWith('.flv')) {
         playerRef.current = new Artplayer({
           container: containerRef.current,
           url,
