@@ -62,7 +62,9 @@ class Kilakila(DownloadBase):
                 self.raw_stream_url = r['b']['hlsPlayUrl']
         except json.JSONDecodeError:
             logger.error(f"{self.plugin_msg}: {r.text}")
+            return False
         except:
             logger.error(f"{self.plugin_msg}: 获取房间信息失败", exc_info=True)
+            return False
 
         return True

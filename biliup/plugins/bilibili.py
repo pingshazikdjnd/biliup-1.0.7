@@ -2,6 +2,7 @@ import time
 import json
 import re
 import asyncio
+from urllib.parse import urlparse
 
 from biliup.common.util import client
 from biliup.config import config
@@ -27,16 +28,17 @@ class Bililive(DownloadBase):
         self.__real_room_id = None
         self.__login_mid = 0
         self.__anchor_mid = 0
-        self.bili_cookie = config.get('user', {}).get('bili_cookie')
-        self.bili_cookie_file = config.get('user', {}).get('bili_cookie_file')
-        self.bili_qn = int(config.get('bili_qn', 25000))
-        self.bili_protocol = config.get('bili_protocol', 'stream')
-        self.bili_cdn = config.get('bili_cdn', [])
-        self.bili_hls_timeout = config.get('bili_hls_transcode_timeout', 60)
-        self.bili_api_list = [
-            normalize_url(config.get('bili_liveapi', OFFICIAL_API)).rstrip('/'),
-            normalize_url(config.get('bili_fallback_api', OFFICIAL_API)).rstrip('/'),
-        ]
+        user_conf = config.get('user') or {}
+        self.bili_cookie = user_conf.get('bili_cookie')
+        self.bili_cookie_file = user_conf.get('bili_cookie_file')
+        self.bili_qn = int(config.get('bili_qn') or 25000)
+        self.bili_protocol = config.get('bili_protocol') or 'stream'
+        self.bili_cdn = config.get('bili_cdn') or []
+        hls_timeout = config.get('bili_hls_transcode_timeout', 60)
+        self.bili_hls_transcode_timeout = 60 if hls_timeout is None else hls_timeout
+        self.bili_liveapi = config.get('bili_liveapi') or OFFICIAL_API
+        self.bili_fallback_api = config.get('bili_fallback_api') or OFFICIAL_API
+        self._custom_bili_api_list = None
         self.bili_anonymous_origin = config.get('bili_anonymous_origin', False)
         self.bili_cdn_fallback = config.get('bili_cdn_fallback', False)
         self.bili_wait_transcode = config.get('bili_wait_transcode', False)
@@ -45,7 +47,43 @@ class Bililive(DownloadBase):
         except (ValueError, TypeError):
             self.bili_wait_transcode_timeout = 120
 
+    @property
+    def bili_hls_timeout(self):
+        if 'bili_hls_timeout' in self.__dict__:
+            val = self.__dict__['bili_hls_timeout']
+            return 60 if val is None else val
+        return 60 if self.bili_hls_transcode_timeout is None else self.bili_hls_transcode_timeout
+
+    @bili_hls_timeout.setter
+    def bili_hls_timeout(self, value):
+        self.bili_hls_transcode_timeout = value
+        self.__dict__.pop('bili_hls_timeout', None)
+
+    @property
+    def bili_api_list(self):
+        if 'bili_api_list' in self.__dict__ and self.__dict__['bili_api_list'] is not None:
+            return list(self.__dict__['bili_api_list'])
+        if self._custom_bili_api_list is not None:
+            return list(self._custom_bili_api_list)
+        return [
+            normalize_url(self.bili_liveapi or OFFICIAL_API).rstrip('/'),
+            normalize_url(self.bili_fallback_api or OFFICIAL_API).rstrip('/'),
+        ]
+
+    @bili_api_list.setter
+    def bili_api_list(self, value):
+        self._custom_bili_api_list = None if value is None else list(value)
+        self.__dict__.pop('bili_api_list', None)
+
     async def acheck_stream(self, is_check=False):
+        try:
+            self.bili_qn = int(self.bili_qn) if self.bili_qn is not None else 25000
+        except (ValueError, TypeError):
+            self.bili_qn = 25000
+        try:
+            self.bili_wait_transcode_timeout = max(0, int(self.bili_wait_transcode_timeout))
+        except (ValueError, TypeError):
+            self.bili_wait_transcode_timeout = 120
 
         if "b23.tv" in self.url:
             try:
@@ -200,12 +238,19 @@ class Bililive(DownloadBase):
         # --- 等待转码流逻辑结束 ---
         if not stream_urls:
             if self.bili_protocol == 'hls_fmp4':
-                if int(time.time()) - live_start_time <= self.bili_hls_timeout:
+                try:
+                    hls_timeout = int(self.bili_hls_timeout)
+                except (ValueError, TypeError):
+                    hls_timeout = 60
+                if int(time.time()) - live_start_time <= hls_timeout:
                     logger.warning(f"{self.plugin_msg}: 暂未提供 hls_fmp4 流，等待下一次检测")
                     return False
                 else:
                     # 回退首个可用格式
                     stream_urls = await self.aget_stream(self.bili_qn, 'stream', special_type)
+                    if not stream_urls:
+                        logger.error(f"{self.plugin_msg}: hls_fmp4 回退获取 stream 流失败")
+                        return False
             else:
                 logger.error(f"{self.plugin_msg}: 获取{self.bili_protocol}流失败")
                 return False
@@ -439,11 +484,14 @@ class Bililive(DownloadBase):
         suffix_regexp = r'suffix=([^&]+)'
         if isinstance(args[0], str):
             url = args[0]
-            host = "https://" + match1(url, r'https?://([^/]+)')
+            parsed = urlparse(url)
+            scheme = parsed.scheme or 'https'
+            host = f"{scheme}://{parsed.netloc}" if parsed.netloc else ''
+            base_url = f"{parsed.path}?" if parsed.query else parsed.path
             stream_url = {
                 'host': host,
-                'base_url': url.split("?")[0].split(host)[1] + "?",
-                'extra': url.split("?")[1]
+                'base_url': base_url,
+                'extra': parsed.query,
             }
             return {
                 'url': stream_url,
@@ -487,13 +535,14 @@ class Bililive(DownloadBase):
         current_qn = None
         result = {}
 
-        if not lines[0].startswith('#EXTM3U'):
+        if not lines or not lines[0].startswith('#EXTM3U'):
             raise ValueError('Invalid m3u8 file')
 
         for line in lines:
             if line.startswith('#EXT-X-STREAM-INF:'):
                 codec = match1(line, r'CODECS="([^"]+)"')
-                current_qn = int(match1(line, r'BILI-QN=(\d+)'))
+                qn_str = match1(line, r'BILI-QN=(\d+)')
+                current_qn = int(qn_str) if qn_str else None
 
                 if codec and current_qn:
                     if 'avc' in codec.lower():

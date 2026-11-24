@@ -6,10 +6,11 @@ type Props = {
   entity: any
   list: any
   initValues?: Record<string, any>
+  isOverride?: boolean
 }
 
 const Twitch: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
+  const { entity, list, initValues, isOverride } = props
   const formApi = useFormApi()
 
   useEffect(() => {
@@ -30,7 +31,13 @@ const Twitch: React.FC<Props> = props => {
         />
         <Form.Switch
           initValue={
-            entity?.hasOwnProperty('twitch_disable_ads') ? entity['twitch_disable_ads'] : true
+            isOverride
+              ? initValues && Object.prototype.hasOwnProperty.call(initValues, 'twitch_disable_ads')
+                ? initValues['twitch_disable_ads']
+                : undefined
+              : entity && Object.prototype.hasOwnProperty.call(entity, 'twitch_disable_ads')
+                ? entity['twitch_disable_ads']
+                : true
           }
           field="twitch_disable_ads"
           extraText="去除Twitch广告功能，默认开启

@@ -62,21 +62,27 @@ export default function Home() {
     }
   }
   const handleEntityPostprocessor = (values: any) => {
+    if (!values) return values
     if (values?.postprocessor) {
-      values.postprocessor = values.postprocessor.map(
-        (element: { [key: string]: string } | string) => {
-          if (element === 'rm') {
-            return { cmd: 'rm' }
-          } else if (typeof element === 'object' && !element.cmd) {
-            const [key, value] = Object.entries(element)[0]
-            return { cmd: key, value: value }
+      return {
+        ...values,
+        postprocessor: values.postprocessor.map(
+          (element: { [key: string]: string } | string) => {
+            if (element === 'rm') {
+              return { cmd: 'rm' }
+            } else if (typeof element === 'object' && element !== null && !element.cmd) {
+              const entries = Object.entries(element)
+              if (entries.length > 0) {
+                const [key, value] = entries[0]
+                return { cmd: key, value: value }
+              }
+            }
+            return typeof element === 'object' && element !== null ? { ...element } : element
           }
-          return element
-        }
-      )
-      // console.log(values.postprocessor);
+        ),
+      }
     }
-    return values
+    return { ...values }
   }
   const data: LiveStreamerEntity[] | undefined = streamers?.map(live => {
     let status
@@ -101,13 +107,14 @@ export default function Home() {
   })
 
   const handleOk = async (values: any) => {
-    if (values?.postprocessor) {
-      values.postprocessor = values.postprocessor.map(
+    const payload = { ...values }
+    if (payload?.postprocessor) {
+      payload.postprocessor = payload.postprocessor.map(
         ({ cmd, value }: { cmd: string; value: string }) => (cmd === 'rm' ? 'rm' : { [cmd]: value })
       )
     }
     try {
-      const res = await trigger(values)
+      const res = await trigger(payload)
     } catch (e: any) {
       Notification.error({
         title: '创建失败',
@@ -119,15 +126,15 @@ export default function Home() {
   }
 
   const handleUpdate = async (values: any) => {
-    console.log(values);
-    delete values.status
-    if (values?.postprocessor) {
-      values.postprocessor = values.postprocessor.map(
+    const payload = { ...values }
+    delete payload.status
+    if (payload?.postprocessor) {
+      payload.postprocessor = payload.postprocessor.map(
         ({ cmd, value }: { cmd: string; value: string }) => (cmd === 'rm' ? 'rm' : { [cmd]: value })
       )
     }
     try {
-      const res = await updateStreamers(values)
+      const res = await updateStreamers(payload)
     } catch (e: any) {
       Notification.error({
         title: '更新失败',

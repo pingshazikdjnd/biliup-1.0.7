@@ -30,6 +30,8 @@ def create_event_manager():
     app.context['file_upload_count'] = {}
     # 边录边传的下载器使用的map
     app.context['sync_downloader_map'] = {}
+    # 待派发或正在预处理中的下载 URL，防止 PRE_DOWNLOAD -> DOWNLOAD 窗口重入
+    app.context['pending_download_urls'] = set()
     return app
 
 
@@ -40,8 +42,9 @@ context = event_manager.context
 async def singleton_check(platform, name, url):
     from biliup.handler import PRE_DOWNLOAD, UPLOAD
     context['url_upload_count'].setdefault(url, 0)
-    if context['PluginInfo'].url_status[url] == 1:
-        logger.debug(f'{url} 正在下载中，跳过检测')
+    pending = context.setdefault('pending_download_urls', set())
+    if context['PluginInfo'].url_status.get(url) == 1 or url in pending:
+        logger.debug(f'{url} 正在下载或待下载中，跳过检测')
         return
 
     event_manager.send_event(Event(UPLOAD, ({'name': name, 'url': url},)))
@@ -52,17 +55,27 @@ async def singleton_check(platform, name, url):
 
         def _dispatch_pre_download():
             with NamedLock(f'upload_file_list_{name}'):
-                if cancelled.is_set():
-                    return
-                plugin_info = context.get('PluginInfo')
-                if plugin_info is not None:
-                    inverted_index = getattr(plugin_info, 'inverted_index', None)
-                    if inverted_index is not None and inverted_index.get(url) != name:
+                with NamedLock('download_dispatch'):
+                    if cancelled.is_set():
                         return
-                    url_status = getattr(plugin_info, 'url_status', None)
-                    if url_status is not None and url_status.get(url) == 1:
+                    plugin_info = context.get('PluginInfo')
+                    if plugin_info is not None:
+                        inverted_index = getattr(plugin_info, 'inverted_index', None)
+                        if inverted_index is not None and inverted_index.get(url) != name:
+                            return
+                        url_status = getattr(plugin_info, 'url_status', None)
+                        if url_status is not None and url_status.get(url) == 1:
+                            return
+                    pending_urls = context.setdefault('pending_download_urls', set())
+                    if url in pending_urls:
                         return
-                event_manager.send_event(Event(PRE_DOWNLOAD, args=(name, url,)))
+                    pending_urls.add(url)
+                try:
+                    event_manager.send_event(Event(PRE_DOWNLOAD, args=(name, url,)))
+                except Exception:
+                    with NamedLock('download_dispatch'):
+                        context.setdefault('pending_download_urls', set()).discard(url)
+                    raise
 
         try:
             await asyncio.to_thread(_dispatch_pre_download)
@@ -81,14 +94,18 @@ async def shot(event):
             index = 0
             continue
         cur = event.url_list[index]
+        skip = False
         try:
             await singleton_check(event, context['PluginInfo'].inverted_index[cur], cur)
-            index += 1
-            skip = context['PluginInfo'].url_status[cur] == 1 and index < len(event.url_list)
-            if skip:  # 全部主播检测后不应跳过
-                continue
+            pending = context.setdefault('pending_download_urls', set())
+            is_busy = context['PluginInfo'].url_status.get(cur) == 1 or cur in pending
+            skip = is_busy and (index + 1) < len(event.url_list)
         except Exception:
             logger.exception('shot')
+        finally:
+            index += 1
+        if skip:  # 全部主播检测后不应跳过
+            continue
         await asyncio.sleep(config.get('event_loop_interval', 30))
 
 
@@ -126,6 +143,7 @@ class PluginInfo:
         if not url in self.inverted_index:
             return
         del self.inverted_index[url]
+        context.setdefault('pending_download_urls', set()).discard(url)
         exec_del = False
         for key, value in self.checker.items():
             if url in value.url_list:

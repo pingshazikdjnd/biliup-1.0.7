@@ -6,10 +6,11 @@ type Props = {
   entity: any
   list: any
   initValues?: Record<string, any>
+  isOverride?: boolean
 }
 
 const YouTube: React.FC<Props> = props => {
-  const { entity, list, initValues } = props
+  const { entity, list, initValues, isOverride } = props
   const formApi = useFormApi()
 
   useEffect(() => {
@@ -42,9 +43,14 @@ const YouTube: React.FC<Props> = props => {
         />
         <Form.Switch
           initValue={
-            entity?.hasOwnProperty('youtube_enable_download_live')
-              ? entity['youtube_enable_download_live']
-              : true
+            isOverride
+              ? initValues &&
+                Object.prototype.hasOwnProperty.call(initValues, 'youtube_enable_download_live')
+                ? initValues['youtube_enable_download_live']
+                : undefined
+              : entity && Object.prototype.hasOwnProperty.call(entity, 'youtube_enable_download_live')
+                ? entity['youtube_enable_download_live']
+                : true
           }
           field="youtube_enable_download_live"
           extraText="### 是否下载直播 默认开启
@@ -62,9 +68,15 @@ const YouTube: React.FC<Props> = props => {
         />
         <Form.Switch
           initValue={
-            entity?.hasOwnProperty('youtube_enable_download_playback')
-              ? entity['youtube_enable_download_playback']
-              : true
+            isOverride
+              ? initValues &&
+                Object.prototype.hasOwnProperty.call(initValues, 'youtube_enable_download_playback')
+                ? initValues['youtube_enable_download_playback']
+                : undefined
+              : entity &&
+                  Object.prototype.hasOwnProperty.call(entity, 'youtube_enable_download_playback')
+                ? entity['youtube_enable_download_playback']
+                : true
           }
           field="youtube_enable_download_playback"
           extraText="是否下载直播回放 默认开启

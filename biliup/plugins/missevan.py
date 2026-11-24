@@ -13,17 +13,25 @@ class Missevan(DownloadBase):
     async def acheck_stream(self, is_check=False):
         rid = 0
         # 用户主页获取直播间地址
-        if self.url.split('www'):
+        if 'www' in self.url:
             user_page = await biliup.common.util.client.get(self.url, timeout=30, headers=self.fake_headers)
             # 取硬编码在网页内的直播间号
             if user_page.status_code == 200:
-                start = user_page.text.find('data-id="') + 9
-                end = user_page.text.find('"', start)
-                rid = user_page.text[start:end]
+                marker = 'data-id="'
+                idx = user_page.text.find(marker)
+                if idx != -1:
+                    start = idx + len(marker)
+                    end = user_page.text.find('"', start)
+                    if end != -1:
+                        rid = user_page.text[start:end]
             else:
                 logger.debug(user_page.status_code)
-        if self.url.split("live"):
+        elif 'live' in self.url:
             rid = match1(self.url, r'/(\d+)')
+
+        if not rid:
+            logger.debug(f"Missevan: 未解析到有效直播间号 ({self.url})")
+            return False
 
         room_info = (await biliup.common.util.client.get(f"https://fm.missevan.com/api/v2/live/{rid}", timeout=30, headers=self.fake_headers)).json()
 

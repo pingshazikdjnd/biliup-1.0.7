@@ -555,11 +555,13 @@ class DownloadBase(ABC):
         return None
 
     def gen_download_filename(self, is_fmt=False):
+        safe_fname = str(self.fname or '').replace('%', '%%')
+        safe_title = str(self.room_title or '').replace('%', '%%')
         if self.filename_prefix:  # 判断是否存在自定义录播命名设置
-            filename = (self.filename_prefix.format(streamer=self.fname, title=self.room_title).encode(
+            filename = (self.filename_prefix.format(streamer=safe_fname, title=safe_title).encode(
                 'unicode-escape').decode()).encode().decode("unicode-escape")
         else:
-            filename = f'{self.fname}%Y-%m-%dT%H_%M_%S'
+            filename = f'{safe_fname}%Y-%m-%dT%H_%M_%S'
         filename = get_valid_filename(filename)
         if is_fmt:
             file_time = time.time()

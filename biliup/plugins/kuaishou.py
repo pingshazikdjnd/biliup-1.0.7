@@ -1,4 +1,4 @@
-import time
+import asyncio
 import random
 
 import biliup.common.util
@@ -9,12 +9,16 @@ from ..engine.download import DownloadBase
 from ..plugins import logger
 
 
-@Plugin.download(regexp=r'(?:https?://)?(?:(?:live|www|v)\.)?(kuaishou)\.com')
-@Plugin.download(regexp=r'(?:https?://)?(?:(?:(?:livev)\.(?:m))\.)?chenzhongtech\.com')
+@Plugin.download(
+    regexp=r'(?:https?://)?(?:(?:(?:live|www|v)\.)?kuaishou\.com|(?:(?:livev\.m)\.)?chenzhongtech\.com)'
+)
 class Kuaishou(DownloadBase):
     def __init__(self, fname, url, suffix='flv'):
         super().__init__(fname, url, suffix)
-        self.fake_headers['Cookie'] = config.get('kuaishou_cookie', '')
+        self.fake_headers['Cookie'] = (
+            (config.get('user') or {}).get('kuaishou_cookie')
+            or config.get('kuaishou_cookie', '')
+        )
 
     async def acheck_stream(self, is_check=False):
         try:
@@ -38,7 +42,7 @@ class Kuaishou(DownloadBase):
         # 不暂停似乎容易风控
         times = 3 + random.random()
         logger.debug(f"{plugin_msg}: 暂停 {times} 秒")
-        time.sleep(times)
+        await asyncio.sleep(times)
 
         err_keys = ["错误代码22", "主播尚未开播"]
         html = (await biliup.common.util.client.get(
