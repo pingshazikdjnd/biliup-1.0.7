@@ -46,9 +46,12 @@ async def singleton_check(platform, name, url):
     event_manager.send_event(Event(UPLOAD, ({'name': name, 'url': url},)))
     p = platform(name, url)
     if await p.acheck_stream(True) and p.should_record():
-        # 需要等待上传文件列表检索完成后才可以开始下次下载
-        with NamedLock(f'upload_file_list_{name}'):
-            event_manager.send_event(Event(PRE_DOWNLOAD, args=(name, url,)))
+        # 需要等待上传文件列表检索完成后才可以开始下次下载，避免阻塞主事件循环
+        def _dispatch_pre_download():
+            with NamedLock(f'upload_file_list_{name}'):
+                event_manager.send_event(Event(PRE_DOWNLOAD, args=(name, url,)))
+
+        await asyncio.to_thread(_dispatch_pre_download)
 
 
 async def shot(event):

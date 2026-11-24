@@ -30,6 +30,7 @@ class Config(UserDict):
 
     def load_from_db(self, db):
         from biliup.database.models import Configuration, LiveStreamers
+        new_data = dict(self.data)
         context = {
             'file_upload_count': self.data.get('file_upload_count', {}),
             'url_upload_count': self.data.get('url_upload_count', {}),
@@ -39,22 +40,26 @@ class Config(UserDict):
         }
 
         for con in db.execute(select(Configuration.value).where(Configuration.key == 'config')):
-            self.data = json.loads(con.value)
-        self.data.update(context)
-        self['streamers'] = {}
+            loaded = json.loads(con.value)
+            if isinstance(loaded, dict):
+                new_data = loaded
+        new_data.update(context)
+        streamers = {}
         for ls in db.scalars(select(LiveStreamers)):
-            self['streamers'][ls.remark] = {
-                k: v for k, v in ls.as_dict().items() if v and (k not in ['upload_streamers_id', 'id', 'remark'])}
-            # self['streamers'][ls.remark].pop('upload_streamers')
-            if ls.upload_streamers_id:
-                self['streamers'][ls.remark].update({
-                    k: v for k, v in ls.uploadstreamers.as_dict().items() if v and k not in ['id', 'template_name']})
-                if self['streamers'][ls.remark].get('uploader') is None:
-                    self['streamers'][ls.remark]['uploader'] = 'biliup-rs'
-            # if self['streamers'][ls.remark].get('tags'):
-            #     self['streamers'][ls.remark]['tags'] = self['streamers'][ls.remark]['tags']
-        # for us in UploadStreamers.select():
-        #     config.data[con.key] = con.value
+            streamer_cfg = {
+                k: v for k, v in ls.as_dict().items()
+                if v is not None and k not in ['upload_streamers_id', 'id', 'remark']
+            }
+            if ls.upload_streamers_id and ls.uploadstreamers is not None:
+                streamer_cfg.update({
+                    k: v for k, v in ls.uploadstreamers.as_dict().items()
+                    if v is not None and k not in ['id', 'template_name']
+                })
+                if not streamer_cfg.get('uploader'):
+                    streamer_cfg['uploader'] = 'biliup-rs'
+            streamers[ls.remark] = streamer_cfg
+        new_data['streamers'] = streamers
+        self.data = new_data
 
     def save_to_db(self, db):
         from biliup.database.models import Configuration, LiveStreamers, UploadStreamers
