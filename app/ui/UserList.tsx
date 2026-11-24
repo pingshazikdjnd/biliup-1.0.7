@@ -49,20 +49,29 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
 
   const addUser = async (value: any) => {
     setConfirmLoading(true)
+    let createdId: number | undefined
     try {
-      const ret = await fetcher(`/bili/space/myinfo?user=${value}`, undefined)
-      if (ret.code) {
-        throw new Error(ret.message)
-      }
-      await trigger({
+      const created = await trigger({
         id: 0,
         name: value,
         value: value,
         platform: 'bilibili-cookies',
       })
+      createdId = Array.isArray(created) ? created[0]?.id : undefined
+      const ret = await fetcher(`/bili/space/myinfo?user=${encodeURIComponent(value)}`, undefined)
+      if (ret.code) {
+        throw new Error(ret.message)
+      }
       setVisible(false)
       Toast.success('创建成功')
     } catch (e: any) {
+      if (createdId !== undefined) {
+        try {
+          await deleteUser(createdId)
+        } catch (rollbackErr) {
+          console.error('Rollback failed:', rollbackErr)
+        }
+      }
       let messageObj = e.message
       try {
         messageObj = JSON.parse(messageObj).error

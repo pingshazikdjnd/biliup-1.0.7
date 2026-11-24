@@ -10,7 +10,7 @@ import copy
 import aiohttp_cors
 import requests
 import stream_gears
-from aiohttp import web
+from aiohttp import web, ClientTimeout
 from aiohttp.client import ClientSession
 from sqlalchemy import select, update
 from sqlalchemy.exc import NoResultFound, MultipleResultsFound
@@ -36,6 +36,18 @@ routes = web.RouteTableDef()
 
 # 全局变量存储密码
 GLOBAL_PASSWORD = None
+MAX_PROXY_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+def _is_registered_cookie_file(file_path: str) -> bool:
+    """校验传入的 Cookie 文件路径是否已登记在数据库 bilibili-cookies 白名单中"""
+    if not file_path:
+        return False
+    with SessionLocal() as db:
+        registered = db.scalars(
+            select(Configuration.value).where(Configuration.key == 'bilibili-cookies')
+        ).all()
+    return file_path in registered
 
 
 def set_global_password(password: str):
@@ -425,8 +437,7 @@ async def users(request):
     to_save = Configuration(key=json_data['platform'], value=json_data['value'])
     with SessionLocal() as db:
         db.add(to_save)
-        # to_save.save()
-        # db.flush(to_save)
+        db.flush()
         resp = {
             'id': to_save.id,
             'name': to_save.value,
@@ -555,6 +566,8 @@ async def get_seasons(request):
     file = request.query.get('user')
     if not file:
         return web.json_response({"status": 400, 'error': "缺少 user 参数"}, status=400)
+    if not _is_registered_cookie_file(file):
+        return web.json_response({"status": 403, 'error': "未登记的 Cookie 文件路径"}, status=403)
     try:
         config.load_cookies(file)
     except FileNotFoundError:
@@ -583,7 +596,11 @@ async def get_seasons(request):
 
 @routes.get('/bili/space/myinfo')
 async def myinfo(request):
-    file = request.query['user']
+    file = request.query.get('user')
+    if not file:
+        return web.json_response({"status": 400, 'error': "缺少 user 参数"}, status=400)
+    if not _is_registered_cookie_file(file):
+        return web.json_response({"status": 403, 'error': "未登记的 Cookie 文件路径"}, status=403)
     try:
         config.load_cookies(file)
     except FileNotFoundError:
@@ -594,17 +611,52 @@ async def myinfo(request):
 
 @routes.get('/bili/proxy')
 async def proxy(request):
-    url = unquote(request.query['url'])
+    raw_url = request.query.get('url')
+    if not raw_url:
+        return web.HTTPBadRequest(reason="Missing url parameter")
+    url = unquote(raw_url)
     parsed_url = urlparse(url)
 
-    if not parsed_url.hostname or not parsed_url.hostname.endswith('.hdslb.com'):
-        return web.HTTPForbidden(reason="Access to the requested domain is forbidden")
+    if (
+        parsed_url.scheme not in ('http', 'https')
+        or not parsed_url.hostname
+        or not parsed_url.hostname.lower().endswith('.hdslb.com')
+        or parsed_url.username
+        or parsed_url.password
+    ):
+        return web.HTTPForbidden(reason="Access to the requested domain or scheme is forbidden")
 
-    async with ClientSession() as session:
+    timeout = ClientTimeout(total=15)
+    async with ClientSession(timeout=timeout) as session:
         try:
-            async with session.get(url) as response:
-                content = await response.read()
-                return web.Response(body=content, status=response.status)
+            async with session.get(url, allow_redirects=False) as response:
+                content_length = response.headers.get('Content-Length')
+                if content_length is not None:
+                    try:
+                        if int(content_length) > MAX_PROXY_BODY_SIZE:
+                            return web.HTTPRequestEntityTooLarge(
+                                max_size=MAX_PROXY_BODY_SIZE,
+                                actual_size=int(content_length),
+                            )
+                    except ValueError:
+                        pass
+
+                chunks = bytearray()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    chunks.extend(chunk)
+                    if len(chunks) > MAX_PROXY_BODY_SIZE:
+                        return web.HTTPRequestEntityTooLarge(
+                            max_size=MAX_PROXY_BODY_SIZE,
+                            actual_size=len(chunks),
+                        )
+
+                resp_headers = {}
+                content_type = response.headers.get('Content-Type')
+                if content_type:
+                    resp_headers['Content-Type'] = content_type
+                return web.Response(body=bytes(chunks), status=response.status, headers=resp_headers or None)
+        except asyncio.TimeoutError:
+            return web.HTTPGatewayTimeout(reason="Upstream request timed out")
         except Exception as e:
             return web.HTTPBadRequest(reason=str(e))
 
@@ -633,20 +685,11 @@ def read_last_n_lines(file_path, n=50):
 
 @routes.get('/ws/logs')
 async def websocket_logs(request):
-    # 检查URL参数中的认证信息
-    auth_param = request.query.get('authorization')
-    if auth_param:
-        # 验证URL参数中的认证信息
-        if not check_url_auth(auth_param):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            await ws.send_str("认证失败")
-            await ws.close()
-            return ws
-    else:
-        # 如果没有URL参数认证信息，则继续使用现有的中间件认证
-        pass
-    
+    if GLOBAL_PASSWORD:
+        auth_value = request.query.get('authorization') or request.headers.get('Authorization', '')
+        if not auth_value or not check_url_auth(auth_value):
+            return web.HTTPUnauthorized(reason="Unauthorized")
+
     ws = web.WebSocketResponse()
     try:
         await ws.prepare(request)
@@ -751,35 +794,40 @@ def find_all_folders(directory):
     return result
 
 
-async def service(args):
+def create_app(password=None, static_dir=None):
     app = web.Application()
-    routes.static('/static', '.', show_index=False)
     app.add_routes(routes)
-    if args.static_dir:
-        app.add_routes([web.static('/', args.static_dir, show_index=False)])
+    app.add_routes([web.static('/static', '.', show_index=False)])
+    if static_dir:
+        app.add_routes([web.static('/', static_dir, show_index=False)])
     else:
-        # res = [web.static('/', files('biliup.web').joinpath('public'))]
-        res = []
-        for fdir in pathlib.Path(files('biliup.web').joinpath('public')).glob('**/*.html'):
-            fname = fdir.relative_to(files('biliup.web').joinpath('public'))
+        public_dir = pathlib.Path(files('biliup.web').joinpath('public'))
+        if public_dir.exists():
+            res = []
+            for fdir in public_dir.glob('**/*.html'):
+                fname = fdir.relative_to(public_dir)
 
-            def _copy(fname):
-                async def static_view(request):
-                    return web.FileResponse(files('biliup.web').joinpath('public').joinpath(fname))
+                def _copy(fname):
+                    async def static_view(request):
+                        return web.FileResponse(public_dir.joinpath(fname))
 
-                return static_view
+                    return static_view
 
-            res.append(web.get('/' + str(fname.with_suffix('')).replace('\\', '/'), _copy(fname)))
-            # res.append(web.static('/'+fdir.replace('\\', '/'), files('biliup.web').joinpath('public/'+fdir)))
-        res.append(web.static('/', files('biliup.web').joinpath('public')))
-        app.add_routes(res)
-    if args.password:
-        # 设置全局密码
-        set_global_password(args.password)
-        # 只保护API路径，不保护前端页面路径
-        app.middlewares.append(basic_auth_middleware(('/api/', '/url-status', '/v1/'), {'biliup': args.password}, ))
+                res.append(web.get('/' + str(fname.with_suffix('')).replace('\\', '/'), _copy(fname)))
+            res.append(web.static('/', public_dir))
+            app.add_routes(res)
 
-    # web.run_app(app, host=host, port=port)
+    set_global_password(password or None)
+    if password:
+        # 保护API及静态文件下载路径，不保护前端页面路由
+        app.middlewares.append(
+            basic_auth_middleware(
+                ('/api/', '/url-status', '/v1/', '/bili/', '/static/'),
+                {'biliup': password},
+                query_auth_prefixes=('/static/',),
+            )
+        )
+
     cors = aiohttp_cors.setup(app, defaults={
         "*": aiohttp_cors.ResourceOptions(
             allow_credentials=True,
@@ -792,11 +840,17 @@ async def service(args):
     for route in list(app.router.routes()):
         cors.add(route)
 
+    setup_middlewares(app)
+    return app
+
+
+async def service(args):
+    app = create_app(password=getattr(args, 'password', None), static_dir=getattr(args, 'static_dir', None))
+
     if args.no_access_log:
         runner = web.AppRunner(app, access_log=None)
     else:
         runner = web.AppRunner(app)
-    setup_middlewares(app)
     await runner.setup()
     site = web.TCPSite(runner, host=args.host, port=args.port)
     await site.start()

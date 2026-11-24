@@ -73,6 +73,14 @@ export default function Home() {
     setVisible(false)
     console.log('Cancel button clicked')
   }
+  const buildVideoUrl = (name: string) => {
+    const base = `${process.env.NEXT_PUBLIC_API_SERVER ?? ''}/static/${encodeURIComponent(name)}`
+    const auth = typeof window !== 'undefined' ? localStorage.getItem('auth') : null
+    if (auth) {
+      return `${base}?authorization=${encodeURIComponent(`Basic ${auth}`)}`
+    }
+    return base
+  }
   return (
     <AuthGuard>
       <ProtectedLayout>
@@ -120,9 +128,9 @@ export default function Home() {
             bodyStyle={{ height: 500 }}
             footer={null}
           >
-            <Players
-              url={(process.env.NEXT_PUBLIC_API_SERVER ?? '') + '/static/' + fileName}
-            ></Players>
+            {visible && fileName ? (
+              <Players url={buildVideoUrl(fileName)}></Players>
+            ) : null}
             <div id="mse"></div>
           </Modal>
         </Content>

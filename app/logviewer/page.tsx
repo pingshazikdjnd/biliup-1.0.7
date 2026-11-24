@@ -10,6 +10,7 @@ import {
 } from '@douyinfe/semi-icons'
 import { AuthGuard } from '../lib/auth-guard'
 import ProtectedLayout from '../lib/protected-layout'
+import { proxy } from '../lib/api-streamer'
 
 // 日志内容组件
 interface LogContentProps {
@@ -197,6 +198,23 @@ function LogViewerContent({ logs, setLogs, isConnected, setIsConnected, isLoadin
     setLogs([])
   }
 
+  const handleDownloadLog = async () => {
+    try {
+      const res = await proxy(`/static/${activeTab}.log`)
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${activeTab}.log`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e: any) {
+      Toast.error(`下载日志失败: ${e?.message || '未知错误'}`)
+    }
+  }
+
   return (
     <>
       <Header style={{ backgroundColor: 'var(--semi-color-bg-1)' }}>
@@ -246,7 +264,7 @@ function LogViewerContent({ logs, setLogs, isConnected, setIsConnected, isLoadin
               <div style={{ display: 'flex', gap: 8, alignItems: 'center'}}>
                 <Button
                   icon={<IconSave />}
-                  onClick={() => (window.location.href = `/static/${activeTab}.log`)}
+                  onClick={handleDownloadLog}
                   type="primary"
                   theme="solid"
                   size="small"
