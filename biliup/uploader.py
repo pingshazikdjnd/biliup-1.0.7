@@ -25,7 +25,7 @@ def merge_dict(*dicts):
             result.update(d)
     return result
 
-def upload(data):
+def upload(data, target_files=None):
     """
     上传入口
     :param platform:
@@ -54,7 +54,10 @@ def upload(data):
             v = context.get(k)
             if v:
                 kwargs[k] = v
-        return cls(index, data, **kwargs).start()
+        uploader_instance = cls(index, data, **kwargs)
+        if target_files is not None:
+            return uploader_instance.start(allowed_files=target_files)
+        return uploader_instance.start()
     except Exception:
         logger.exception("Uncaught exception:")
         raise

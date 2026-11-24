@@ -1,9 +1,11 @@
 import logging
 import smtplib
+import ssl
 import threading
 import time
 from email.header import Header
 from email.mime.text import MIMEText
+from email.utils import formataddr
 from typing import Optional
 
 from biliup.config import config
@@ -59,18 +61,18 @@ def _send_email_sync(title: str, content: str, streamer_name: str, error_type: s
     server: Optional[smtplib.SMTP] = None
     try:
         msg = MIMEText(content, 'plain', 'utf-8')
-        msg['From'] = Header(f"biliup <{user}>", 'utf-8')
-        msg['To'] = Header(to_addr, 'utf-8')
+        msg['From'] = formataddr(('biliup', user))
+        msg['To'] = to_addr
         msg['Subject'] = Header(title, 'utf-8')
 
+        ssl_context = ssl.create_default_context()
         if port == 465:
-            server = smtplib.SMTP_SSL(host, port, timeout=15)
+            server = smtplib.SMTP_SSL(host, port, timeout=15, context=ssl_context)
         else:
             server = smtplib.SMTP(host, port, timeout=15)
             server.ehlo()
-            if port == 587 or (hasattr(server, 'has_extn') and server.has_extn('starttls')):
-                server.starttls()
-                server.ehlo()
+            server.starttls(context=ssl_context)
+            server.ehlo()
 
         server.login(user, password)
         server.sendmail(user, [to_addr], msg.as_string())

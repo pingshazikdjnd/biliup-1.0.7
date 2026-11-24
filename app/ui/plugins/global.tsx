@@ -270,6 +270,7 @@ const Global: React.FC = () => {
           }
           placeholder="0"
           suffix="GB"
+          min={0}
           step={0.1}
           precision={2}
           style={{ width: '100%' }}
@@ -291,6 +292,7 @@ const Global: React.FC = () => {
           }
           placeholder="0"
           suffix="GB"
+          min={0}
           step={0.1}
           precision={2}
           style={{ width: '100%' }}
@@ -457,6 +459,8 @@ const Global: React.FC = () => {
           field="notify_smtp_port"
           label="SMTP 端口（notify_smtp_port）"
           placeholder="465"
+          min={1}
+          max={65535}
           extraText={
             <div style={{ fontSize: '14px' }}>
               QQ 邮箱 SSL 请使用 465 端口；STARTTLS 请使用 587 端口。默认 465。

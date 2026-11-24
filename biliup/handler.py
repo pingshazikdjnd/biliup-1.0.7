@@ -128,10 +128,27 @@ def process_upload(stream_info):
         context['url_upload_count'][url] += 1
     # 上传开始
     try:
-        file_list = UploadBase.file_list(name)
+        raw_file_list = UploadBase.file_list(name)
+        if len(raw_file_list) <= 0:
+            logger.debug("无需上传")
+            return
+
+        max_upload_limit = config.get("max_upload_limit", 999)
+        with NamedLock("file_upload_count"):
+            file_upload_count = context.setdefault('file_upload_count', {})
+            file_list = [
+                item for item in raw_file_list
+                if file_upload_count.get(item.video, 0) < max_upload_limit
+            ]
         file_count = len(file_list)
         if file_count <= 0:
-            logger.debug("无需上传")
+            logger.warning(f"上传次数达到阈值: {name}")
+            send_notification(
+                title=f"biliup 上传达到重试上限告警: {name}",
+                content=f"主播: {name}\nURL: {url}\n待传文件均已达到重试阈值 ({max_upload_limit})，已停止自动重试。",
+                streamer_name=name,
+                error_type="max_upload_limit_reached"
+            )
             return
 
         # 上传延迟检测
@@ -159,14 +176,13 @@ def process_upload(stream_info):
 
         upload_count = UploadBase.get_max_upload_count(file_list)
         filelist = None
-        max_upload_limit = config.get("max_upload_limit", 999)
         if upload_count < max_upload_limit:
             logger.info(f"开始第{upload_count+1}次上传： {name}")
 
             # 上传webhook部分
             expt = None
             try:
-                res_files = upload(stream_info)
+                res_files = upload(stream_info, target_files=[item.video for item in file_list])
                 if res_files:
                     filelist = res_files
             except Exception as e:
@@ -175,7 +191,7 @@ def process_upload(stream_info):
                 if is_unrecoverable_error(e):
                     logger.error(f"{name} 检测到不可自愈上传错误 ({e})，标记该批文件不再重试")
                     with NamedLock("file_upload_count"):
-                        file_upload_count = context.get('file_upload_count', {})
+                        file_upload_count = context.setdefault('file_upload_count', {})
                         for item in file_list:
                             file_upload_count[item.video] = max_upload_limit
                     send_notification(
@@ -183,6 +199,14 @@ def process_upload(stream_info):
                         content=f"主播: {name}\nURL: {url}\n错误信息: {e}\n该批文件已被标记跳过重试，请检查账号状态或Cookie。",
                         streamer_name=name,
                         error_type="unrecoverable_upload_error"
+                    )
+                elif upload_count + 1 >= max_upload_limit:
+                    logger.warning(f"上传次数达到阈值: {name}")
+                    send_notification(
+                        title=f"biliup 上传达到重试上限告警: {name}",
+                        content=f"主播: {name}\nURL: {url}\n上传重试次数已达到阈值 ({upload_count + 1}/{max_upload_limit})，已停止自动重试。最后一次错误: {e}",
+                        streamer_name=name,
+                        error_type="max_upload_limit_reached"
                     )
             finally:
                 post_processor = config['streamers'].get(name, {}).get("postprocessor", None)

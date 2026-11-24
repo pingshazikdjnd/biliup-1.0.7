@@ -1,10 +1,15 @@
+import copy
 import os
 import shutil
+import smtplib
+import ssl
 import time
 import unittest
+from email import message_from_string
 from unittest.mock import MagicMock, patch, call
 from collections import namedtuple
 
+import tests  # noqa: F401
 from biliup.config import config
 from biliup.app import context
 from biliup.common.notify import (
@@ -23,6 +28,10 @@ import biliup.uploader as uploader
 class TestPR1UploadSafety(unittest.TestCase):
     def setUp(self):
         clear_cooldown()
+        self._config_snapshot = {
+            k: (v if k == 'PluginInfo' else copy.deepcopy(v))
+            for k, v in config.data.items()
+        }
         config['streamers'] = {}
         context['url_upload_count'] = {}
         context['upload_filename'] = []
@@ -30,6 +39,8 @@ class TestPR1UploadSafety(unittest.TestCase):
         context['sync_downloader_map'] = {}
 
     def tearDown(self):
+        config.data.clear()
+        config.data.update(self._config_snapshot)
         clear_cooldown()
 
     # 1. biliuprs.py upload_process exitcode 检查及 Pipe try/finally 资源关闭
@@ -61,6 +72,8 @@ class TestPR1UploadSafety(unittest.TestCase):
             bili_web.upload(fake_files)
 
         self.assertIn("exitcode: 1", str(ctx_err.exception))
+        mock_proc.start.assert_called_once()
+        mock_proc.join.assert_called_once()
         # 确保 Pipe 在 finally 中被关闭
         mock_parent_conn.close.assert_called_once()
         mock_child_conn.close.assert_called_once()
@@ -119,7 +132,8 @@ class TestPR1UploadSafety(unittest.TestCase):
         stream_info = {'name': 'test_streamer', 'url': 'http://test.com', 'title': 'test'}
         process_upload(Event(UPLOAD, (stream_info,)))
 
-        # 核心保证：绝对不能调用 uploaded 来删除录像文件
+        # 确认确实执行了 upload 且失败后绝对不能调用 uploaded 删除录像文件
+        mock_upload.assert_called_once()
         mock_uploaded.assert_not_called()
 
     # 5. handler.py process_upload: 达到重试上限绝不调用 uploaded() 删录像，并发送告警
@@ -214,14 +228,21 @@ class TestPR1UploadSafety(unittest.TestCase):
         config['notify_smtp_pass'] = 'auth_code'
         config['notify_email_to'] = 'receiver@qq.com'
 
-        # 465 端口走 SSL
+        # 465 端口走 SSL，且显式传入 ssl.SSLContext 校验证书
         config['notify_smtp_port'] = 465
         clear_cooldown()
         res1 = send_notification("标题1", "正文1", streamer_name="主播A", error_type="oom", sync=True)
         self.assertTrue(res1)
-        mock_smtp_ssl_cls.assert_called_with('smtp.qq.com', 465, timeout=15)
+        mock_smtp_ssl_cls.assert_called_once()
+        ssl_args, ssl_kwargs = mock_smtp_ssl_cls.call_args
+        self.assertEqual(ssl_args, ('smtp.qq.com', 465))
+        self.assertEqual(ssl_kwargs.get('timeout'), 15)
+        self.assertIsInstance(ssl_kwargs.get('context'), ssl.SSLContext)
         mock_ssl_inst.login.assert_called_with('test@qq.com', 'auth_code')
         mock_ssl_inst.sendmail.assert_called_once()
+        sent_msg = message_from_string(mock_ssl_inst.sendmail.call_args[0][2])
+        self.assertEqual(sent_msg['From'], 'biliup <test@qq.com>')
+        self.assertEqual(sent_msg['To'], 'receiver@qq.com')
 
         # 同主播 + 同类错误 30 分钟冷却
         res_cooldown = send_notification("标题1-重复", "正文1-重复", streamer_name="主播A", error_type="oom", sync=True)
@@ -232,16 +253,29 @@ class TestPR1UploadSafety(unittest.TestCase):
         res_diff_error = send_notification("标题2", "正文2", streamer_name="主播A", error_type="disk_full", sync=True)
         self.assertTrue(res_diff_error)
 
-        # 587 端口走 STARTTLS
+        # 587 端口走 STARTTLS，且显式传入 ssl.SSLContext
         config['notify_smtp_port'] = 587
         clear_cooldown()
         res_587 = send_notification("标题3", "正文3", streamer_name="主播B", error_type="test", sync=True)
         self.assertTrue(res_587)
         mock_smtp_cls.assert_called_with('smtp.qq.com', 587, timeout=15)
         mock_tls_inst.starttls.assert_called_once()
+        self.assertIsInstance(mock_tls_inst.starttls.call_args.kwargs.get('context'), ssl.SSLContext)
         mock_tls_inst.login.assert_called_with('test@qq.com', 'auth_code')
 
-    # 8. 磁盘保护：软水位与硬水位触发逻辑
+        # 非 465/587 端口（如 25）同样强制 STARTTLS；若服务器不支持 STARTTLS 则严禁明文 login()
+        config['notify_smtp_port'] = 25
+        clear_cooldown()
+        mock_plain_inst = MagicMock()
+        mock_plain_inst.starttls.side_effect = smtplib.SMTPNotSupportedError("STARTTLS extension not supported")
+        mock_smtp_cls.return_value = mock_plain_inst
+        res_25 = send_notification("标题4", "正文4", streamer_name="主播C", error_type="test", sync=True)
+        self.assertFalse(res_25)
+        mock_plain_inst.starttls.assert_called_once()
+        mock_plain_inst.login.assert_not_called()
+        mock_plain_inst.sendmail.assert_not_called()
+
+    # 8. 磁盘保护：软水位与硬水位触发逻辑及 OSError 容错
     @patch('shutil.disk_usage')
     def test_disk_soft_and_hard_watermarks(self, mock_disk_usage):
         Usage = namedtuple('Usage', ['total', 'used', 'free'])
@@ -259,6 +293,7 @@ class TestPR1UploadSafety(unittest.TestCase):
                 self.platform = "dummy"
                 self.use_live_cover = False
                 self.live_cover_url = None
+                self.callback_called = 0
 
             async def acheck_stream(self, is_check=False):
                 return True
@@ -267,7 +302,7 @@ class TestPR1UploadSafety(unittest.TestCase):
                 pass
 
             def download_success_callback(self):
-                pass
+                self.callback_called += 1
 
             def gen_download_filename(self):
                 return "test"
@@ -292,9 +327,28 @@ class TestPR1UploadSafety(unittest.TestCase):
         mock_disk_usage.return_value = Usage(total=100 * 1024**3, used=90 * 1024**3, free=10 * 1024**3)
         self.assertTrue(downloader.should_record())
 
-        # 测试 8.2: 软水位 start 循环提前 break 逻辑
-        # 配置软水位 10GB，当前剩余 6GB -> run() 一次后检测到软水位不足，主动 break
+        # disk_usage 抛出 OSError 时不应阻断 should_record
+        mock_disk_usage.side_effect = OSError("disk stats unavailable")
+        self.assertTrue(downloader.should_record())
+        mock_disk_usage.side_effect = None
+
+        # 测试 8.2: 软水位高于阈值时不提前 break，直至主播下播(run 返回 False)
         config['disk_upload_threshold_gb'] = 10.0
+        mock_disk_usage.return_value = Usage(total=100 * 1024**3, used=80 * 1024**3, free=20 * 1024**3)
+        above_runs = 0
+
+        def fake_run_above():
+            nonlocal above_runs
+            above_runs += 1
+            return above_runs < 3  # 前两段继续录制，第 3 次下播退出
+
+        downloader.run = fake_run_above
+        with patch('biliup.engine.download.SessionLocal'):
+            downloader.start()
+        self.assertEqual(above_runs, 3)
+
+        # 测试 8.3: 软水位低于阈值时 start 循环提前 break
+        # 配置软水位 10GB，当前剩余 6GB -> run() 一次后检测到软水位不足，主动 break
         mock_disk_usage.return_value = Usage(total=100 * 1024**3, used=94 * 1024**3, free=6 * 1024**3)
 
         run_count = 0
@@ -311,6 +365,94 @@ class TestPR1UploadSafety(unittest.TestCase):
         # 仅运行了一次就主动 break，未进入死循环
         self.assertEqual(run_count, 1)
         self.assertEqual(stream_info['name'], "test_streamer")
+
+        # 测试 8.4: 软水位检测抛出 OSError 时不中断 start() 及 download_success_callback()
+        mock_disk_usage.side_effect = OSError("disk stats unavailable")
+        err_runs = 0
+
+        def fake_run_oserror():
+            nonlocal err_runs
+            err_runs += 1
+            return err_runs < 2
+
+        downloader.run = fake_run_oserror
+        before_cb = downloader.callback_called
+        with patch('biliup.engine.download.SessionLocal'):
+            downloader.start()
+        self.assertEqual(err_runs, 2)
+        self.assertEqual(downloader.callback_called, before_cb + 1)
+
+    # 9. 已熔断/耗尽的旧文件不得阻断同批新录制的上传
+    @patch('biliup.handler.uploaded')
+    @patch('biliup.handler.upload')
+    @patch('biliup.handler.UploadBase.file_list')
+    @patch('biliup.handler.UploadBase.get_max_upload_count')
+    def test_exhausted_file_does_not_block_fresh_file_in_same_scan(
+        self, mock_get_count, mock_file_list, mock_upload, mock_uploaded
+    ):
+        burned = UploadBase.FileInfo(video='burned.mp4', danmaku=None)
+        fresh = UploadBase.FileInfo(video='fresh.mp4', danmaku=None)
+        mock_file_list.return_value = [burned, fresh]
+        config['max_upload_limit'] = 3
+        context['file_upload_count'] = {'burned.mp4': 3, 'fresh.mp4': 0}
+        context['url_upload_count']['http://test.com'] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {'http://test.com': 2}
+
+        mock_get_count.return_value = 0
+        mock_upload.return_value = [fresh]
+
+        stream_info = {'name': 'test_streamer', 'url': 'http://test.com', 'title': 'test'}
+        process_upload(Event(UPLOAD, (stream_info,)))
+
+        mock_get_count.assert_called_once_with([fresh])
+        mock_upload.assert_called_once()
+        self.assertEqual(mock_upload.call_args.kwargs.get('target_files'), ['fresh.mp4'])
+        mock_uploaded.assert_called_once_with('test_streamer', None, [fresh])
+
+        # 验证 UploadBase.start(allowed_files=...) 仅上传目标新文件
+        class DummyUploader(UploadBase):
+            def __init__(self, principal, data):
+                super().__init__(principal, data)
+                self.uploaded_batches = []
+
+            def upload(self, file_list):
+                self.uploaded_batches.append(file_list)
+                return file_list
+
+        dummy_up = DummyUploader('test_streamer', {'format_title': 'test_title'})
+        res = dummy_up.start(allowed_files=['fresh.mp4'])
+        self.assertEqual(res, [fresh])
+        self.assertEqual(dummy_up.uploaded_batches, [[fresh]])
+
+    # 10. 末次允许的瞬态重试失败应立即发送达到重试上限告警，无需等下一次事件
+    @patch('biliup.handler.send_notification')
+    @patch('biliup.handler.uploaded')
+    @patch('biliup.handler.upload')
+    @patch('biliup.handler.UploadBase.file_list')
+    @patch('biliup.handler.UploadBase.get_max_upload_count')
+    def test_final_transient_attempt_immediately_sends_limit_alert(
+        self, mock_get_count, mock_file_list, mock_upload, mock_uploaded, mock_send_notify
+    ):
+        mock_file = UploadBase.FileInfo(video='test_video.mp4', danmaku=None)
+        mock_file_list.return_value = [mock_file]
+        config['max_upload_limit'] = 3
+        # 第 3 次（最后 1 次允许的尝试）前计数为 2
+        mock_get_count.return_value = 2
+        mock_upload.side_effect = TimeoutError("Read timed out")
+
+        context['url_upload_count']['http://test.com'] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {'http://test.com': 2}
+
+        stream_info = {'name': 'test_streamer', 'url': 'http://test.com', 'title': 'test'}
+        process_upload(Event(UPLOAD, (stream_info,)))
+
+        mock_upload.assert_called_once()
+        mock_uploaded.assert_not_called()
+        mock_send_notify.assert_called_once()
+        self.assertEqual(mock_send_notify.call_args.kwargs['error_type'], 'max_upload_limit_reached')
+        self.assertIn('3/3', mock_send_notify.call_args.kwargs['content'])
 
 
 if __name__ == '__main__':

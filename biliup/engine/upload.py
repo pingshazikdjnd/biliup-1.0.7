@@ -141,7 +141,7 @@ class UploadBase:
     def upload(self, file_list: List[FileInfo]) -> List[FileInfo]:
         raise NotImplementedError()
 
-    def start(self):
+    def start(self, allowed_files=None):
         from biliup.handler import event_manager
         # 保证一个name同时只有一个上传线程扫描文件列表
         lock = NamedLock(f'upload_file_list_{self.principal}')
@@ -149,6 +149,9 @@ class UploadBase:
         try:
             lock.acquire()
             file_list = UploadBase.file_list(self.principal)
+            if allowed_files is not None:
+                allowed_set = set(allowed_files)
+                file_list = [f for f in file_list if f.video in allowed_set]
 
             if len(file_list) > 0:
                 upload_filename_list = [os.path.splitext(file.video)[0] for file in file_list]
