@@ -2,6 +2,8 @@ import asyncio
 import copy
 import json
 import os
+import shutil
+import stat
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -270,10 +272,14 @@ class TestPR3IsolationAndSave(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([n for n in os.listdir('.') if n.startswith('.config.yaml.')], [])
 
         # 4. 保留原文件权限 (shutil.copymode) 与软链接目标原子替换
-        with patch('biliup.config.shutil.copymode') as mock_copymode:
+        if os.name != 'nt':
+            os.chmod('config.yaml', 0o640)
+        expected_mode = stat.S_IMODE(os.stat('config.yaml').st_mode)
+        with patch('biliup.config.shutil.copymode', wraps=shutil.copymode) as mock_copymode:
             config.save()
             mock_copymode.assert_called_once()
             self.assertEqual(mock_copymode.call_args[0][0], 'config.yaml')
+        self.assertEqual(stat.S_IMODE(os.stat('config.yaml').st_mode), expected_mode)
 
         os.makedirs('linked_dir', exist_ok=True)
         real_target = os.path.abspath(os.path.join('linked_dir', 'real_config.yaml'))
