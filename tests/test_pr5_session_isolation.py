@@ -306,6 +306,83 @@ class TestPR5SessionIsolation(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(inst.closed for inst in instances))
         self.assertEqual(config.data['user'], self._user_sentinel)
 
+    async def test_bili_client_injects_default_timeout_and_routes_handle_timeout(self):
+        # 1. 验证 _bili_client 默认注入 (5, 15) 超时并保留显式传参的 timeout
+        seen_timeouts = []
+        fake_response = types.SimpleNamespace(json=lambda: {'code': 0})
+
+        def _fake_request(session_self, method, url, **kwargs):
+            seen_timeouts.append(kwargs.get('timeout'))
+            return fake_response
+
+        with patch.object(requests.Session, 'request', _fake_request):
+            with web_mod._bili_client() as bili:
+                session = bili._BiliBili__session
+                session.get('https://member.bilibili.com/test')
+                session.get('https://member.bilibili.com/test', timeout=10)
+        self.assertEqual(seen_timeouts, [(5, 15), 10])
+
+        # 2. 验证 /bili/space/myinfo、/bili/seasons、/api/check_tag 在 requests.Timeout 时返回 504，
+        # 以及 TOML 模式 /api/login_by_cookie 在工作线程中执行（不阻塞事件循环）
+        path_a = os.path.join(self._tmpdir.name, 'timeout.json')
+        _write_cookie_file(path_a, sessdata='timeout_sess')
+
+        class TimeoutBiliBili:
+            def __init__(self, data):
+                self.closed = False
+                setattr(
+                    self,
+                    '_BiliBili__session',
+                    types.SimpleNamespace(cookies=requests.cookies.RequestsCookieJar()),
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.close()
+
+            def close(self):
+                self.closed = True
+
+            def myinfo(self, cookies):
+                raise requests.Timeout('myinfo read timed out')
+
+            def list_seasons(self):
+                raise requests.Timeout('seasons read timed out')
+
+            def check_tag(self, tag):
+                raise requests.Timeout('check_tag read timed out')
+
+        app = web.Application()
+        app.add_routes(web_mod.routes)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+
+        event_loop_tid = threading.get_ident()
+        seen_login_tids = []
+
+        def _fake_sg_login():
+            seen_login_tids.append(threading.get_ident())
+
+        config.data['toml'] = True
+        with patch.object(web_mod, 'BiliBili', TimeoutBiliBili), \
+             patch.object(web_mod.stream_gears, 'login_by_cookies', side_effect=_fake_sg_login):
+            resp_myinfo = await client.get('/bili/space/myinfo', params={'user': path_a})
+            self.assertEqual(resp_myinfo.status, 504)
+
+            resp_seasons = await client.get('/bili/seasons', params={'user': path_a})
+            self.assertEqual(resp_seasons.status, 504)
+
+            resp_tag = await client.get('/api/check_tag', params={'tag': 'abc'})
+            self.assertEqual(resp_tag.status, 504)
+
+            resp_login = await client.get('/api/login_by_cookie')
+            self.assertEqual(resp_login.status, 200)
+            self.assertEqual(len(seen_login_tids), 1)
+            self.assertNotEqual(seen_login_tids[0], event_loop_tid)
+
 
 if __name__ == '__main__':
     unittest.main()

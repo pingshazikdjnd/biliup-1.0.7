@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import socket
 import json
 import os
@@ -31,6 +32,23 @@ except ImportError:
     from importlib_resources import files
 
 routes = web.RouteTableDef()
+
+_BILI_REQUEST_TIMEOUT = (5, 15)
+
+
+@contextlib.contextmanager
+def _bili_client(timeout=_BILI_REQUEST_TIMEOUT):
+    """为单次请求创建独立 BiliBili 实例，并为 Session 出站请求设置默认连接/读超时"""
+    with BiliBili(Data()) as bili:
+        session = getattr(bili, '_BiliBili__session', None)
+        orig_request = getattr(session, 'request', None)
+        if callable(orig_request):
+            def _timed_request(*args, **kwargs):
+                if kwargs.get('timeout') is None:
+                    kwargs['timeout'] = timeout
+                return orig_request(*args, **kwargs)
+            session.request = _timed_request
+        yield bili
 
 
 def _load_cookies_from_file(path: str) -> dict:
@@ -145,14 +163,14 @@ async def cookie_login(request):
     if config.data.get("toml"):
         print("trying to login by cookie")
         try:
-            stream_gears.login_by_cookies()
+            await asyncio.to_thread(stream_gears.login_by_cookies)
         except Exception as e:
             return web.HTTPBadRequest(text="login failed" + str(e))
     else:
         cookie = config.data.get('user', {}).get('cookies', {})
         try:
             def _do_login():
-                with BiliBili(Data()) as bili:
+                with _bili_client() as bili:
                     bili.login_by_cookies(cookie)
 
             await asyncio.to_thread(_do_login)
@@ -226,13 +244,17 @@ async def tag_check(request):
     tag = request.rel_url.query['tag']
 
     def _do_check_tag():
-        with BiliBili(Data()) as bili:
+        with _bili_client() as bili:
             return bili.check_tag(tag)
 
-    if await asyncio.to_thread(_do_check_tag):
+    try:
+        passed = await asyncio.to_thread(_do_check_tag)
+    except requests.Timeout:
+        logger.warning('check_tag timeout for tag=%s', tag)
+        return web.HTTPGatewayTimeout(text="tag check timeout")
+    if passed:
         return web.json_response({"status": 200})
-    else:
-        return web.HTTPBadRequest(text="标签违禁")
+    return web.HTTPBadRequest(text="标签违禁")
 
 
 @routes.get('/v1/videos')
@@ -556,7 +578,7 @@ async def app_status(request):
 
 def _fetch_pre_archive(path: str):
     cookies = _load_cookies_from_file(path)
-    with BiliBili(Data()) as bili:
+    with _bili_client() as bili:
         return bili.tid_archive(cookies)
 
 
@@ -582,7 +604,7 @@ async def pre_archive(request):
 
 def _fetch_seasons(file: str):
     cookies = _load_cookies_from_file(file)
-    with BiliBili(Data()) as bili:
+    with _bili_client() as bili:
         requests.utils.add_dict_to_cookiejar(bili._BiliBili__session.cookies, cookies)
         seasons_data = bili.list_seasons()
     result = []
@@ -609,6 +631,9 @@ async def get_seasons(request):
         return web.json_response(result)
     except FileNotFoundError:
         return web.json_response({"status": 500, 'error': f"{file} 文件不存在"}, status=500)
+    except requests.Timeout:
+        logger.warning('get_seasons timeout for user=%s', file)
+        return web.json_response({"status": 504, 'error': "请求上游超时"}, status=504)
     except Exception as e:
         logger.exception('get_seasons')
         return web.json_response({"status": 500, 'error': str(e)}, status=500)
@@ -616,7 +641,7 @@ async def get_seasons(request):
 
 def _fetch_myinfo(file: str):
     cookies = _load_cookies_from_file(file)
-    with BiliBili(Data()) as bili:
+    with _bili_client() as bili:
         return bili.myinfo(cookies)
 
 
@@ -630,6 +655,9 @@ async def myinfo(request):
         return web.json_response(res)
     except FileNotFoundError:
         return web.json_response({"status": 500, 'error': f"{file} 文件不存在"}, status=500)
+    except requests.Timeout:
+        logger.warning('myinfo timeout for user=%s', file)
+        return web.json_response({"status": 504, 'error': "请求上游超时"}, status=504)
     except Exception as e:
         logger.exception('myinfo')
         return web.json_response({"status": 500, 'error': str(e)}, status=500)

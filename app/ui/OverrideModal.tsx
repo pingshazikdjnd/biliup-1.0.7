@@ -27,9 +27,11 @@ type TemplateModalProps = {
 }
 
 type OverrideModalContentProps = {
+  visible: boolean
   entity?: LiveStreamerEntity
   onOk: (e: any) => Promise<void>
   onCancel: () => void
+  afterClose: () => void
 }
 
 const removeCircularReferences = (obj: any, seen = new WeakSet()): any => {
@@ -53,7 +55,13 @@ const removeCircularReferences = (obj: any, seen = new WeakSet()): any => {
   return result
 }
 
-const OverrideModalContent: React.FC<OverrideModalContentProps> = ({ entity, onOk, onCancel }) => {
+const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
+  visible,
+  entity,
+  onOk,
+  onCancel,
+  afterClose,
+}) => {
   const platformSetting = () => {
     for (const [pattern, Plugin] of Object.entries(SupportedPlatforms)) {
       if (entity?.url.match(new RegExp(pattern))) {
@@ -225,10 +233,11 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({ entity, onO
   return (
     <Modal
       title="配置覆写"
-      visible={true}
+      visible={visible}
       onOk={handleOk}
       style={{ width: 'min(600px, 90vw)' }}
       onCancel={onCancel}
+      afterClose={afterClose}
       bodyStyle={{
         overflow: 'auto',
         maxHeight: 'calc(100vh - 320px)',
@@ -276,12 +285,17 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({ entity, onO
 }
 
 const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk }) => {
+  const [mounted, setMounted] = useState(false)
   const [visible, setVisible] = useState(false)
   const showDialog = () => {
+    setMounted(true)
     setVisible(true)
   }
   const handleCancel = () => {
     setVisible(false)
+  }
+  const handleAfterClose = () => {
+    setMounted(false)
   }
 
   const childrenWithProps = React.Children.map(children, child => {
@@ -298,8 +312,14 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   return (
     <>
       {childrenWithProps}
-      {visible ? (
-        <OverrideModalContent entity={entity} onOk={onOk} onCancel={handleCancel} />
+      {mounted ? (
+        <OverrideModalContent
+          visible={visible}
+          entity={entity}
+          onOk={onOk}
+          onCancel={handleCancel}
+          afterClose={handleAfterClose}
+        />
       ) : null}
     </>
   )

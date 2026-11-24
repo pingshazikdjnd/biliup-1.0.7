@@ -1,4 +1,4 @@
-import useSWR from "swr";
+import useSWR, { useSWRConfig } from "swr";
 
 import {
   BiliType,
@@ -6,7 +6,7 @@ import {
   LiveStreamerEntity, proxy,
   User
 } from "./api-streamer";
-import {useEffect, useState} from "react";
+import {useEffect, useRef, useState} from "react";
 
 const NOFACE_URL = "https://i0.hdslb.com/bfs/face/member/noface.jpg";
 
@@ -72,10 +72,19 @@ export default function useStreamers() {
 
 export function useBiliUsers() {
   const {data: users, error: usersError, isLoading: usersLoading} = useSWR<User[]>("/v1/users", fetcher);
+  const { cache } = useSWRConfig();
+  const prevProfilesKeyRef = useRef<string | null>(null);
   const profilesKey =
     users && users.length > 0
-      ? ["bili-users-profiles", users.map((u) => `${u.id}:${u.value}`).join("|")]
+      ? `bili-users-profiles:${JSON.stringify(users.map((u) => [u.id, u.value]))}`
       : null;
+  useEffect(() => {
+    const prevKey = prevProfilesKeyRef.current;
+    if (prevKey && prevKey !== profilesKey) {
+      cache.delete(prevKey);
+    }
+    prevProfilesKeyRef.current = profilesKey;
+  }, [profilesKey, cache]);
   const {
     data: profiles,
     error: profilesError,
