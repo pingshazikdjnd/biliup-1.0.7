@@ -17,6 +17,7 @@ type PluginProps = {
   entity?: LiveStreamerEntity
   list?: { value: string | number; label: React.ReactNode }[]
   initValues?: any
+  isOverride?: boolean
 }
 
 type TemplateModalProps = {
@@ -110,34 +111,85 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
     ])
 
     if (values) {
-      // 处理 override_text
-      if (values.override_text) {
+      const isPlainObject = (val: any): val is Record<string, any> =>
+        Boolean(val) && typeof val === 'object' && !Array.isArray(val)
+      const valuesEqual = (a: any, b: any): boolean => {
+        if (a === b) return true
+        if (a == null || b == null || typeof a !== typeof b) return false
+        if (typeof a === 'object') {
+          try {
+            return JSON.stringify(a) === JSON.stringify(b)
+          } catch {
+            return false
+          }
+        }
+        return false
+      }
+
+      const initialOverride = isPlainObject(entity?.override) ? entity!.override : {}
+      const initialOverrideText = entity?.override ? JSON.stringify(entity.override, null, 2) : ''
+
+      const nextValues = { ...values }
+      const rawOverrideText = nextValues.override_text
+      delete nextValues.override_text
+      const normalizedOverrideText = typeof rawOverrideText === 'string' ? rawOverrideText : ''
+      const overrideTextChanged = normalizedOverrideText !== initialOverrideText
+
+      let baseOverride: Record<string, any> = {}
+      if (normalizedOverrideText.trim() !== '') {
         try {
-          values.override = JSON.parse(values.override_text)
-          delete values.override_text
+          const parsed = JSON.parse(normalizedOverrideText)
+          if (!isPlainObject(parsed)) {
+            throw new Error('Override must be a JSON object')
+          }
+          baseOverride = parsed
         } catch (e) {
           Notification.error({
             title: '错误',
-            content: '配置格式不正确，请检查 JSON 格式',
+            content: '配置格式不正确，请检查 JSON 对象格式',
           })
           return
         }
       }
 
-      const overrideConfig = { ...(values.override || {}) }
-      Object.keys(values).forEach(key => {
-        console.log(key, values[key])
+      const overrideConfig: Record<string, any> = { ...baseOverride }
+      Object.keys(nextValues).forEach(key => {
         if (!entityFields.has(key)) {
-          if (values[key] != undefined && values[key] != null) {
-            overrideConfig[key] = values[key]
+          const val = nextValues[key]
+          const origVal = initialOverride[key]
+          if (isPlainObject(val)) {
+            const existing = isPlainObject(overrideConfig[key]) ? overrideConfig[key] : {}
+            const origObj = isPlainObject(origVal) ? origVal : {}
+            const merged: Record<string, any> = { ...existing }
+            Object.entries(val).forEach(([subKey, subVal]) => {
+              if (overrideTextChanged && valuesEqual(subVal, origObj[subKey])) {
+                return
+              }
+              if (subVal !== undefined && subVal !== null && subVal !== '') {
+                merged[subKey] = subVal
+              } else {
+                delete merged[subKey]
+              }
+            })
+            if (Object.keys(merged).length > 0) {
+              overrideConfig[key] = merged
+            } else {
+              delete overrideConfig[key]
+            }
+          } else if (overrideTextChanged && valuesEqual(val, origVal)) {
+            // 用户直接清空或修改了 override_text，未改动的表单旧值不再回写覆盖
+          } else if (val !== undefined && val !== null && val !== '') {
+            overrideConfig[key] = val
+          } else {
+            delete overrideConfig[key]
           }
-          delete values[key]
+          delete nextValues[key]
         }
       })
-      values.override = overrideConfig
+      nextValues.override = overrideConfig
 
       // 处理循环引用
-      const cleanValues = removeCircularReferences(values)
+      const cleanValues = removeCircularReferences(nextValues)
       await onOk(cleanValues)
       onCancel()
       return
@@ -274,7 +326,7 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
             {(() => {
               const Plugin = platformSetting()
               return Plugin ? (
-                <Plugin entity={entity} list={list} initValues={entity?.override} />
+                <Plugin entity={entity} list={list} initValues={entity?.override} isOverride={true} />
               ) : null
             })()}
           </Collapse>

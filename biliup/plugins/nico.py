@@ -1,7 +1,7 @@
+import asyncio
 import random
 import re
 import subprocess
-import time
 
 import biliup.common.util
 from biliup.config import config
@@ -15,43 +15,70 @@ from ..plugins import logger
 class Nico(DownloadBase):
     def __init__(self, fname, url, suffix='flv'):
         super().__init__(fname, url, suffix)
+        self.proc = None
 
     async def acheck_stream(self, is_check=False):
         try:
             response = await biliup.common.util.client.get(self.url, timeout=5)
+            if response.status_code != 200:
+                logger.debug(f"Nico - {self.url}: status_code {response.status_code}")
+                return False
+            html = response.text
             # 正则表达式
             pattern = r'"name":"(.*?)","description":"(.*?)"'
             # 执行匹配
-            matches = re.findall(pattern, response.text)[0]
-            self.room_title = matches[0]
-        except:
-            logger.info("获取标题失败")
+            matches = re.findall(pattern, html)
+            if matches:
+                self.room_title = matches[0][0]
+        except Exception as e:
+            logger.info(f"Nico - {self.url} 获取页面失败: {e}")
+            return False
+
+        status_match = re.search(
+            r'(?:"|&quot;)(?:programStatus|status)(?:"|&quot;)\s*:\s*(?:"|&quot;)(ON_AIR|ENDED|RELEASED|BEFORE_RELEASE)(?:"|&quot;)',
+            html,
+        )
+        if status_match:
+            if status_match.group(1) != 'ON_AIR':
+                logger.debug(f"Nico - {self.url}: 直播状态为 {status_match.group(1)}，未开播")
+                return False
+        else:
+            is_live_jsonld = (
+                bool(re.search(r'(?:"|&quot;)isLiveBroadcast(?:"|&quot;)\s*:\s*true', html, re.IGNORECASE))
+                and not bool(re.search(r'(?:"|&quot;)endDate(?:"|&quot;)\s*:', html))
+            )
+            if not is_live_jsonld:
+                logger.debug(f"Nico - {self.url}: 页面未检测到开播状态")
+                return False
+
+        if is_check:
+            return True
+
+        user_conf = config.get('user') or {}
+        extra_args = []
+        for opt_key in ('niconico-email', 'niconico-password', 'niconico-user-session'):
+            val = user_conf.get(opt_key)
+            if val is not None and val != '':
+                extra_args.extend([f'--{opt_key}', str(val)])
+        purge_cred = user_conf.get('niconico-purge-credentials')
+        if purge_cred and str(purge_cred).lower() not in ('false', '0'):
+            extra_args.append('--niconico-purge-credentials')
+
         port = random.randint(1025, 65535)
         stream_shell = [
             "streamlink",
+            *extra_args,
             "--player-external-http",  # 为外部程序提供流媒体数据
             "--player-external-http-port", str(port),  # 对外部输出流的端口
             self.url, "best"  # 流链接
         ]
-        if config.get('user', {}).get('niconico-email') is not None:
-            niconico_email = "--niconico-email " + config.get('user', {}).get('niconico-email')
-            stream_shell.insert(1, niconico_email)
-        if config.get('user', {}).get('niconico-password') is not None:
-            niconico_password = "--niconico-password " + config.get('user', {}).get('niconico-password')
-            stream_shell.insert(1, niconico_password)
-        if config.get('user', {}).get('niconico-user-session') is not None:
-            niconico_user_session = "--niconico-user-session " + config.get('user', {}).get('niconico-user-session')
-            stream_shell.insert(1, niconico_user_session)
-        if config.get('user', {}).get('niconico-purge-credentials') is not None:
-            niconico_purge_credentials = "--niconico-purge-credentials " + config.get('user', {}).get('niconico-purge-credentials')
-            stream_shell.insert(1, niconico_purge_credentials)
         self.proc = subprocess.Popen(stream_shell)
         self.raw_stream_url = f"http://localhost:{port}"
         i = 0
         while i < 5:
-            if not (self.proc.poll() is None):
-                return
-            time.sleep(1)
+            if self.proc.poll() is not None:
+                return False
+            await asyncio.sleep(1)
             i += 1
         return True
 

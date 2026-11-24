@@ -170,7 +170,12 @@ class Douyin(DownloadBase):
                             optional_quality_items[optional_quality_index - 1])
 
                     # 取相邻的清晰度
-                    if quality_right_offset <= quality_left_offset:
+                    if quality_right_offset is None and quality_left_offset is None:
+                        logger.error(f"{self.plugin_msg}: 未找到可用清晰度")
+                        return False
+                    elif quality_left_offset is None or (
+                        quality_right_offset is not None and quality_right_offset <= quality_left_offset
+                    ):
                         quality = optional_quality_items[optional_quality_index + 1]
                     else:
                         quality = optional_quality_items[optional_quality_index - 1]

@@ -173,7 +173,7 @@ class TestPR3IsolationAndSave(unittest.IsolatedAsyncioTestCase):
                 resp.text = '<html>ok</html>'
             return resp
 
-        with patch('biliup.plugins.kuaishou.time.sleep'), \
+        with patch('biliup.plugins.kuaishou.asyncio.sleep', new=AsyncMock()), \
                 patch.object(util_mod.client, 'get', side_effect=fake_ks_get):
             ok_ks = await ks.acheck_stream()
 

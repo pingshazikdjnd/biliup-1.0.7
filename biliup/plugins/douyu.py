@@ -2,7 +2,8 @@ import hashlib
 import time
 import random
 from urllib.parse import parse_qs, urlencode, quote
-from functools import lru_cache
+
+_REAL_RID_CACHE = {}
 
 from biliup.common.util import client
 from biliup.config import config
@@ -35,6 +36,9 @@ class Douyu(DownloadBase):
                 self.__room_id = _get_real_rid(self.url)
         except:
             logger.exception(f"{self.plugin_msg}: 获取房间号错误")
+            return False
+        if not self.__room_id:
+            logger.error(f"{self.plugin_msg}: 未能解析到有效房间号")
             return False
 
         try:
@@ -276,13 +280,16 @@ class Douyu(DownloadBase):
         return hs_host, stream_id, hs_ip_url
 
 
-@lru_cache(maxsize=None)
 def _get_real_rid(url):
+    if url in _REAL_RID_CACHE:
+        return _REAL_RID_CACHE[url]
     import requests
     headers = {
         "user-agent": random_user_agent('mobile'),
     }
     rid = url.split('douyu.com/')[1].split('/')[0].split('?')[0] or match1(url, r'douyu.com/(\d+)')
-    resp = requests.get(f"https://m.douyu.com/{rid}", headers=headers)
+    resp = requests.get(f"https://m.douyu.com/{rid}", headers=headers, timeout=10)
     real_rid = match1(resp.text, r'roomInfo":{"rid":(\d+)')
+    if real_rid:
+        _REAL_RID_CACHE[url] = real_rid
     return real_rid

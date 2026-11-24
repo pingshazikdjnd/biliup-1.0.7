@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import List, Union
 
 from biliup.config import config
-from .app import event_manager, context
+from .app import event_manager, context, pending_download_urls
 from .common.notify import send_notification
 from .common.tools import NamedLock, processor
 from .common.util import check_timerange
@@ -33,19 +33,35 @@ logger = logging.getLogger('biliup')
 
 @event_manager.register(PRE_DOWNLOAD, block='Asynchronous1')
 def pre_processor(name, url):
-    url_status = context["PluginInfo"].url_status
-    if url_status[url] == 1:
-        logger.debug(f"{name} - {url} 正在下载中，跳过下载")
-        return
+    plugin_info = context["PluginInfo"]
+    url_status = plugin_info.url_status
+    with NamedLock('download_dispatch'):
+        inverted_index = getattr(plugin_info, 'inverted_index', None)
+        if inverted_index is not None and inverted_index.get(url) != name:
+            pending_download_urls.discard(url)
+            logger.debug(f"{name} - {url} 已移除或变更，跳过下载")
+            return
+        if url_status.get(url) == 1:
+            pending_download_urls.discard(url)
+            logger.debug(f"{name} - {url} 正在下载中，跳过下载")
+            return
+        url_status[url] = 1
+        pending_download_urls.discard(url)
 
     logger.debug(f"{name} - {url} 开播了准备下载")
-    preprocessor = config['streamers'].get(name, {}).get('preprocessor')
-    if preprocessor:
-        processor(preprocessor, json.dumps({
-            "name": name,
-            "url": url,
-            "start_time": int(time.time())
-        }, ensure_ascii=False))
+    try:
+        preprocessor = config['streamers'].get(name, {}).get('preprocessor')
+        if preprocessor:
+            processor(preprocessor, json.dumps({
+                "name": name,
+                "url": url,
+                "start_time": int(time.time())
+            }, ensure_ascii=False))
+    except Exception:
+        with NamedLock('download_dispatch'):
+            url_status[url] = 0 if check_timerange(name) else 2
+            pending_download_urls.discard(url)
+        raise
     yield Event(DOWNLOAD, (name, url))
 
 
@@ -54,14 +70,18 @@ def process(name, url):
     url_status = context['PluginInfo'].url_status
     # 下载开始
     try:
-        url_status[url] = 1
+        with NamedLock('download_dispatch'):
+            url_status[url] = 1
+            pending_download_urls.discard(url)
         stream_info = biliup_download(name, url, config['streamers'][name].copy())
         yield Event(DOWNLOADED, (stream_info,))
     except Exception as e:
         logger.exception(f"下载错误: {name} - {e}")
     finally:
         # 下载结束
-        url_status[url] = 0 if check_timerange(name) else 2
+        with NamedLock('download_dispatch'):
+            url_status[url] = 0 if check_timerange(name) else 2
+            pending_download_urls.discard(url)
 
 
 @event_manager.register(DOWNLOADED, block='Asynchronous1')

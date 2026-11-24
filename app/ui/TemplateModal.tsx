@@ -115,10 +115,14 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     }
   })
 
+  let initEntity = entity
   try {
-    if (entity && entity.time_range && typeof entity.time_range === "string") {
+    if (entity && entity.time_range && typeof entity.time_range === 'string') {
       const tr: string[] = JSON.parse(entity.time_range)
-      entity.time_range = tr.map(t => new Date(t))
+      initEntity = {
+        ...entity,
+        time_range: tr.map(t => new Date(t)),
+      }
     }
   } catch (e) {
     console.error(e)
@@ -140,7 +144,7 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           paddingRight: 10,
         }}
       >
-        <Form initValues={entity} getFormApi={formApi => (api.current = formApi)}>
+        <Form initValues={initEntity} getFormApi={formApi => (api.current = formApi)}>
           <Form.Input
             field="remark"
             label="录播备注"

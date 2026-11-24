@@ -42,7 +42,7 @@ class Huya(DownloadBase):
         self.__room_id = url.split('huya.com/')[1].split('?')[0]
         self.huya_danmaku = config.get('huya_danmaku', False)
         self.huya_max_ratio = config.get('huya_max_ratio', 0)
-        self.huya_cdn = config.get('huya_cdn', "").upper()  # 不填写时使用主播的CDN优先级
+        self.huya_cdn = (config.get('huya_cdn') or '').upper()  # 不填写时使用主播的CDN优先级
         self.huya_protocol = 'Hls' if config.get('huya_protocol') == 'Hls' else 'Flv'
         self.huya_imgplus = config.get('huya_imgplus', True)
         self.huya_cdn_fallback = config.get('huya_cdn_fallback', False)
@@ -88,6 +88,10 @@ class Huya(DownloadBase):
         skip_query_build = room_profile['gid'] in gid_blacklist
         stream_urls = await self.build_stream_urls(room_profile['streams_info'], skip_query_build)
         cdn_list = list(stream_urls.keys())
+        if not cdn_list:
+            logger.error(f"{self.plugin_msg}: 未获取到可用 CDN 线路")
+            return False
+        self.huya_cdn = (self.huya_cdn or '').upper()
         if not self.huya_cdn or self.huya_cdn not in cdn_list:
             self.huya_cdn = cdn_list[0]
 
@@ -123,6 +127,9 @@ class Huya(DownloadBase):
                 logger.debug(f"{self.plugin_msg}: {room_profile['message']}")
                 return False
             stream_urls = await self.build_stream_urls(room_profile['streams_info'], skip_query_build)
+            if self.huya_cdn not in stream_urls:
+                logger.error(f"{self.plugin_msg}: 刷新后未找到目标 CDN {self.huya_cdn}")
+                return False
 
         self.raw_stream_url = self.add_ratio(
             stream_urls[self.huya_cdn],
