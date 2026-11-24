@@ -61,13 +61,15 @@ class AutoReload(Timer):
             return False
         try:
             from biliup.app import context, pending_download_urls
-            plugin_info = context.get('PluginInfo')
-            if plugin_info is not None and any(status == 1 for status in plugin_info.url_status.values()):
-                return False
-            if pending_download_urls:
-                return False
-            if any(count > 0 for count in context.get('url_upload_count', {}).values()):
-                return False
+            from biliup.common.tools import NamedLock
+            with NamedLock('download_dispatch'):
+                plugin_info = context.get('PluginInfo')
+                if plugin_info is not None and any(status == 1 for status in plugin_info.url_status.values()):
+                    return False
+                if pending_download_urls:
+                    return False
+                if any(count > 0 for count in context.get('url_upload_count', {}).values()):
+                    return False
         except Exception:
             logger.exception('检查运行态任务空闲状态失败')
             return False
@@ -118,11 +120,22 @@ def _cleanup_own_pidfile(pidfile='watch_process.pid'):
 
 
 def _restart_process():
+    web_mod = sys.modules.get('biliup.web')
+    if web_mod is not None and hasattr(web_mod, '_shutdown_qr_pool'):
+        try:
+            web_mod._shutdown_qr_pool()
+        except Exception:
+            logger.warning('关闭扫码进程池失败', exc_info=True)
+
     cmd = _build_restart_cmd()
-    _cleanup_own_pidfile()
     if sys.platform != 'win32':
+        # 仅在重启命令包含 'start'（Daemon.start 会重新创建 PID 文件）时清理旧 PID；
+        # 否则 os.execv 保持原 PID，需保留现有 PID 文件。
+        if 'start' in cmd:
+            _cleanup_own_pidfile()
         os.execv(cmd[0], cmd)
     else:
+        _cleanup_own_pidfile()
         subprocess.Popen(cmd)
 
 

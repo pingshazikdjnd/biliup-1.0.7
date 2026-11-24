@@ -85,12 +85,11 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resp.status, 200)
                 self.assertEqual(await resp.json(), {'code': 0, 'data': {'url': 'https://qr'}})
 
-            # 非法 Python 表达式不会被 eval 执行，必须返回 400
-            eval_called = []
-            with patch.object(web_mod.stream_gears, 'get_qrcode', return_value='__import__("os").getpid()'):
-                resp = await client.get('/v1/get_qrcode')
-                self.assertEqual(resp.status, 400)
-                self.assertEqual(eval_called, [])
+            # 非法 Python 表达式绝不会触发 eval，必须返回 400
+            with patch('builtins.eval', side_effect=AssertionError('eval must not be called')):
+                with patch.object(web_mod.stream_gears, 'get_qrcode', return_value='__import__("os").getpid()'):
+                    resp = await client.get('/v1/get_qrcode')
+                    self.assertEqual(resp.status, 400)
 
             # 2. /url-status 读取 context['PluginInfo'].url_status
             app_mod.context['PluginInfo'] = SimpleNamespace(
@@ -103,7 +102,7 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
                 {'https://live.bilibili.com/1': 1, 'https://live.bilibili.com/2': 0},
             )
 
-            # 3. /api/login_by_cookie 缺失 cookie 或登录返回 False 时返回 400，True 返回 200
+            # 3. /api/login_by_cookie 缺失 cookie 或抛异常时返回 400；成功返回 None 时返回 200
             config.data.pop('toml', None)
             config.data['user'] = {}
             resp = await client.get('/api/login_by_cookie')
@@ -112,26 +111,33 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
             config.data['user'] = {'cookies': {'SESSDATA': 'abc'}}
             fake_bili = MagicMock()
             fake_bili.__enter__.return_value = fake_bili
-            fake_bili.login_by_cookies.return_value = False
+            fake_bili.login_by_cookies.side_effect = Exception('invalid cookie')
             with patch.object(web_mod, '_bili_client', return_value=fake_bili):
                 resp = await client.get('/api/login_by_cookie')
                 self.assertEqual(resp.status, 400)
 
-            fake_bili.login_by_cookies.return_value = True
+            fake_bili.login_by_cookies.side_effect = None
+            fake_bili.login_by_cookies.return_value = None  # BiliBili.login_by_cookies 成功真实返回 None
             with patch.object(web_mod, '_bili_client', return_value=fake_bili):
                 resp = await client.get('/api/login_by_cookie')
                 self.assertEqual(resp.status, 200)
 
-        # 验证懒初始化与 shutdown
+        # 验证懒初始化（spawn 上下文）与 shutdown 显式终止残留子进程
+        fake_proc = MagicMock()
+        fake_proc.is_alive.side_effect = [True, False]
         fake_pool = MagicMock()
+        fake_pool._processes = {1: fake_proc}
         with patch.object(web_mod.concurrent.futures, 'ProcessPoolExecutor', return_value=fake_pool) as pool_cls:
             p1 = web_mod._get_qr_pool()
             p2 = web_mod._get_qr_pool()
             self.assertIs(p1, fake_pool)
             self.assertIs(p2, fake_pool)
             pool_cls.assert_called_once()
+            self.assertEqual(pool_cls.call_args.kwargs['mp_context'].get_start_method(), 'spawn')
         web_mod._shutdown_qr_pool()
         fake_pool.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+        fake_proc.terminate.assert_called_once()
+        fake_proc.join.assert_called()
         self.assertIsNone(web_mod._qr_pool)
 
     async def test_bili_webup_uses_https_and_raises_timeout_error(self):
@@ -175,32 +181,54 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db_mod.delete_stream_info(fake_db, 'streamer_a'), 3)
         self.assertEqual(db_mod.delete_stream_info_by_date(fake_db, 'streamer_a', time.localtime()), 3)
 
-        orig_makedirs = os.makedirs
-        captured_cfg = {}
+        # 使用含空格的工作目录，验证 Alembic 实际解析出的 version_locations 不会被空格拆分
+        spaced_dir = os.path.join(self._tmpdir.name, 'bili up space')
+        os.makedirs(spaced_dir, exist_ok=True)
+        prev_cwd = os.getcwd()
+        os.chdir(spaced_dir)
+        try:
+            orig_makedirs = os.makedirs
+            captured_cfg = {}
 
-        def _fail_pkg_versions(path, *args, **kwargs):
-            if path.endswith(os.path.join('migration', 'versions')):
-                raise PermissionError('read-only site-packages')
-            return orig_makedirs(path, *args, **kwargs)
+            def _fail_pkg_versions(path, *args, **kwargs):
+                if path.endswith(os.path.join('migration', 'versions')):
+                    raise PermissionError('read-only site-packages')
+                return orig_makedirs(path, *args, **kwargs)
 
-        def _fake_stamp(cfg, *args, **kwargs):
-            captured_cfg['version_locations'] = cfg.get_main_option('version_locations')
+            def _fake_stamp(cfg, *args, **kwargs):
+                from alembic.script import ScriptDirectory
+                captured_cfg['cfg'] = cfg
+                captured_cfg['parsed_locations'] = list(ScriptDirectory.from_config(cfg)._version_locations)
 
-        with patch.object(db_mod.os, 'makedirs', side_effect=_fail_pkg_versions):
-            with patch.object(db_mod.command, 'stamp', side_effect=_fake_stamp):
-                with patch.object(db_mod.command, 'revision', return_value=None):
-                    db_mod.migrate_via_alembic()
+            def _fake_revision(cfg, **kwargs):
+                captured_cfg['version_path'] = kwargs.get('version_path')
+                return None
 
-        expected_fallback = os.path.abspath(os.path.join('.', 'data', 'migration_versions'))
-        self.assertEqual(captured_cfg.get('version_locations'), expected_fallback)
-        self.assertTrue(os.path.isdir(expected_fallback))
+            with patch.object(db_mod.os, 'makedirs', side_effect=_fail_pkg_versions):
+                with patch.object(db_mod.command, 'stamp', side_effect=_fake_stamp):
+                    with patch.object(db_mod.command, 'revision', side_effect=_fake_revision):
+                        db_mod.migrate_via_alembic()
+
+            expected_fallback = os.path.abspath(os.path.join('.', 'data', 'migration_versions'))
+            self.assertTrue(os.path.isdir(expected_fallback))
+            self.assertEqual(captured_cfg.get('version_path'), expected_fallback)
+            self.assertIn(expected_fallback, captured_cfg.get('parsed_locations', []))
+        finally:
+            os.chdir(prev_cwd)
 
     def test_main_deep_merge_log_conf_skips_none(self):
         base = {
             'version': 1,
             'handlers': {
-                'console': {'level': 'INFO', 'class': 'logging.StreamHandler'},
-                'file': {'level': 'DEBUG', 'filename': 'ds_update.log'},
+                'console': {'level': 'INFO', 'class': 'logging.StreamHandler', 'stream': 'ext://sys.stdout'},
+                'file': {
+                    'level': 'DEBUG',
+                    'class': 'biliup.common.log.SafeRotatingFileHandler',
+                    'when': 'W0',
+                    'interval': 1,
+                    'backupCount': 1,
+                    'filename': 'ds_update.log',
+                },
             },
             'loggers': {
                 'biliup': {'handlers': ['file'], 'level': 'INFO'},
@@ -210,6 +238,7 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
             'version': None,
             'handlers': {
                 'console': {'level': 'WARNING', 'class': None},
+                'file': {'class': 'logging.FileHandler', 'filename': 'app.log'},
             },
             'loggers': {
                 'biliup': {'level': 'DEBUG'},
@@ -217,9 +246,12 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
         }
         main_mod._deep_merge_dict(base, override)
         self.assertEqual(base['version'], 1)
+        # console 未更换 class，保留原 class/stream 并更新 level
         self.assertEqual(base['handlers']['console']['level'], 'WARNING')
         self.assertEqual(base['handlers']['console']['class'], 'logging.StreamHandler')
-        self.assertEqual(base['handlers']['file']['filename'], 'ds_update.log')
+        self.assertEqual(base['handlers']['console']['stream'], 'ext://sys.stdout')
+        # file 更换了 class，整体替换不残留 when/interval/backupCount
+        self.assertEqual(base['handlers']['file'], {'class': 'logging.FileHandler', 'filename': 'app.log'})
         self.assertEqual(base['loggers']['biliup']['handlers'], ['file'])
         self.assertEqual(base['loggers']['biliup']['level'], 'DEBUG')
 
@@ -290,6 +322,27 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
             f.write(f'{os.getpid()}\n')
         reload_mod._cleanup_own_pidfile(pidfile)
         self.assertFalse(os.path.exists(pidfile))  # 本进程 PID 安全清理
+
+        # POSIX execv 不含 'start' 时保留 PID 文件；含 'start' 时清理 PID 文件；且都会先关闭扫码池
+        with open(pidfile, 'w', encoding='utf-8') as f:
+            f.write(f'{os.getpid()}\n')
+        with patch.object(reload_mod.sys, 'platform', 'linux'), \
+                patch.object(reload_mod.sys, 'argv', ['biliup', '-P', '19159']), \
+                patch.object(reload_mod.os, 'execv', create=True) as execv_mock, \
+                patch.object(web_mod, '_shutdown_qr_pool') as shutdown_mock:
+            reload_mod._restart_process()
+            shutdown_mock.assert_called_once()
+            execv_mock.assert_called_once()
+            self.assertTrue(os.path.exists(pidfile))
+
+        with patch.object(reload_mod.sys, 'platform', 'linux'), \
+                patch.object(reload_mod.sys, 'argv', ['biliup', 'start']), \
+                patch.object(reload_mod.os, 'execv', create=True) as execv_mock, \
+                patch.object(web_mod, '_shutdown_qr_pool') as shutdown_mock:
+            reload_mod._restart_process()
+            shutdown_mock.assert_called_once()
+            execv_mock.assert_called_once()
+            self.assertFalse(os.path.exists(pidfile))
 
 
 if __name__ == '__main__':

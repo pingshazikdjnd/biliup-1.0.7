@@ -14,15 +14,37 @@ from biliup.common.reload import AutoReload
 from biliup.common.log import DebugLevelFilter
 
 
+def _strip_none_recursive(obj):
+    if isinstance(obj, dict):
+        return {k: _strip_none_recursive(v) for k, v in obj.items() if v is not None}
+    return obj
+
+
 def _deep_merge_dict(base: dict, override: dict) -> dict:
-    """递归合并嵌套字典并跳过 None，避免浅 update 覆盖整棵配置子树。"""
+    """递归合并嵌套字典并跳过 None；若处理器/工厂的 class 或 () 类型发生变更则整体替换避免残留旧类型参数。"""
     if not isinstance(override, dict):
         return base
     for key, value in override.items():
         if value is None:
             continue
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            _deep_merge_dict(base[key], value)
+        existing = base.get(key)
+        if isinstance(value, dict) and isinstance(existing, dict):
+            class_changed = (
+                'class' in value
+                and value['class'] is not None
+                and value['class'] != existing.get('class')
+            )
+            factory_changed = (
+                '()' in value
+                and value['()'] is not None
+                and value['()'] != existing.get('()')
+            )
+            if class_changed or factory_changed:
+                base[key] = _strip_none_recursive(value)
+            else:
+                _deep_merge_dict(existing, value)
+        elif isinstance(value, dict):
+            base[key] = _strip_none_recursive(value)
         else:
             base[key] = value
     return base

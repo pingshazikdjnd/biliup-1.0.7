@@ -6,6 +6,7 @@ import hmac
 import secrets
 import socket
 import json
+import multiprocessing
 import os
 import pathlib
 import concurrent.futures
@@ -236,11 +237,9 @@ async def cookie_login(request):
         try:
             def _do_login():
                 with _bili_client() as bili:
-                    return bili.login_by_cookies(cookie)
+                    bili.login_by_cookies(cookie)
 
-            ok = await asyncio.to_thread(_do_login)
-            if not ok:
-                return web.HTTPBadRequest(text="login failed")
+            await asyncio.to_thread(_do_login)
         except Exception:
             logger.exception("cookie_login failed")
             return web.HTTPBadRequest(text="login failed")
@@ -293,7 +292,8 @@ def _get_qr_pool():
     global _qr_pool
     with _qr_pool_lock:
         if _qr_pool is None:
-            _qr_pool = concurrent.futures.ProcessPoolExecutor(max_workers=2)
+            mp_ctx = multiprocessing.get_context('spawn')
+            _qr_pool = concurrent.futures.ProcessPoolExecutor(max_workers=2, mp_context=mp_ctx)
         return _qr_pool
 
 
@@ -303,7 +303,22 @@ def _shutdown_qr_pool():
         pool_ref = _qr_pool
         _qr_pool = None
     if pool_ref is not None:
+        processes = list((getattr(pool_ref, '_processes', None) or {}).values())
         pool_ref.shutdown(wait=False, cancel_futures=True)
+        for proc in processes:
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+            except Exception:
+                pass
+        for proc in processes:
+            try:
+                proc.join(timeout=3)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=1)
+            except Exception:
+                pass
 
 
 atexit.register(_shutdown_qr_pool)
