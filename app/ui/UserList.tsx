@@ -57,7 +57,7 @@ const UserList: React.FC<UserListProps> = ({ onCancel, visible }) => {
         value: value,
         platform: 'bilibili-cookies',
       })
-      createdId = Array.isArray(created) ? created[0]?.id : undefined
+      createdId = Array.isArray(created) ? created[0]?.id : created?.id
       const ret = await fetcher(`/bili/space/myinfo?user=${encodeURIComponent(value)}`, undefined)
       if (ret.code) {
         throw new Error(ret.message)

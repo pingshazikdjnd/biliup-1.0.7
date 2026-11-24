@@ -76,6 +76,7 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
 
         for path in [
             '/static/ds_update.log',
+            '/v1/static-token?file=ds_update.log',
             '/bili/space/myinfo?user=cookies.json',
             '/bili/seasons?user=cookies.json',
             '/bili/proxy?url=https://i0.hdslb.com/bfs/face/noface.jpg',
@@ -102,7 +103,7 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
             resp = await client.options(path, headers=cors_headers)
             self.assertEqual(resp.status, 200, f"Expected 200 for OPTIONS {path}, got {resp.status}")
 
-    async def test_basic_auth_utf8_and_static_query_auth(self):
+    async def test_basic_auth_utf8_and_static_signed_token(self):
         pw = '密码测试123'
         auth_header = _basic_auth(pw)
         client = await self._make_client(password=pw)
@@ -119,17 +120,58 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
         query_api_resp = await client.get(f'/api/basic?authorization={quote(auth_header)}')
         self.assertEqual(query_api_resp.status, 401)
 
-        # /static/ 支持请求头与查询参数鉴权，且错误查询参数被拦截
+        # /v1/static-token 校验路径合法性并签发单文件短时签名令牌
+        bad_token_req = await client.get('/v1/static-token?file=../secret.log', headers={'Authorization': auth_header})
+        self.assertEqual(bad_token_req.status, 400)
+
+        token_resp = await client.get('/v1/static-token?file=ds_update.log', headers={'Authorization': auth_header})
+        self.assertEqual(token_resp.status, 200)
+        static_token = (await token_resp.json())['token']
+        self.assertTrue(static_token)
+
+        # /static/ 支持请求头与单文件签名 token，且拒绝在 URL 中使用长期 Basic 凭据或跨文件/过期 token
         static_header_resp = await client.get('/static/ds_update.log', headers={'Authorization': auth_header})
         self.assertEqual(static_header_resp.status, 200)
         self.assertIn('hello log', await static_header_resp.text())
 
-        static_query_resp = await client.get(f'/static/ds_update.log?authorization={quote(auth_header)}')
-        self.assertEqual(static_query_resp.status, 200)
-        self.assertIn('hello log', await static_query_resp.text())
+        static_token_resp = await client.get(f'/static/ds_update.log?token={quote(static_token)}')
+        self.assertEqual(static_token_resp.status, 200)
+        self.assertIn('hello log', await static_token_resp.text())
 
-        static_bad_query_resp = await client.get('/static/ds_update.log?authorization=Basic%20invalid')
-        self.assertEqual(static_bad_query_resp.status, 401)
+        other_file_resp = await client.get(f'/static/other.log?token={quote(static_token)}')
+        self.assertEqual(other_file_resp.status, 401)
+
+        expired_token = web_mod.generate_static_token(client.app['static_token_secret'], 'ds_update.log', ttl=-10)
+        expired_resp = await client.get(f'/static/ds_update.log?token={quote(expired_token)}')
+        self.assertEqual(expired_resp.status, 401)
+
+        legacy_query_resp = await client.get(f'/static/ds_update.log?authorization={quote(auth_header)}')
+        self.assertEqual(legacy_query_resp.status, 401)
+
+        # 不存在的静态文件应保留 HTTP 404 状态码，而不是返回 200 HTML
+        missing_resp = await client.get('/static/missing.log', headers={'Authorization': auth_header})
+        self.assertEqual(missing_resp.status, 404)
+
+    async def test_multi_app_websocket_password_isolation(self):
+        protected_client = await self._make_client(password='pw1')
+        open_client = await self._make_client(password=None)
+
+        # 后创建的无密码 app 不得关闭已受保护 app 的 /ws/logs 鉴权
+        with self.assertRaises(WSServerHandshakeError) as ctx:
+            await protected_client.ws_connect('/ws/logs?file=ds_update.log')
+        self.assertEqual(ctx.exception.status, 401)
+
+        async with protected_client.ws_connect(
+            f'/ws/logs?file=ds_update.log&authorization={quote(_basic_auth("pw1"))}'
+        ) as ws:
+            self.assertEqual(await asyncio.wait_for(ws.receive_str(), timeout=3), 'hello log')
+
+        async with open_client.ws_connect('/ws/logs?file=ds_update.log') as ws:
+            self.assertEqual(await asyncio.wait_for(ws.receive_str(), timeout=3), 'hello log')
+
+        open_token_resp = await open_client.get('/v1/static-token?file=ds_update.log')
+        self.assertEqual(open_token_resp.status, 200)
+        self.assertIsNone((await open_token_resp.json())['token'])
 
     async def test_websocket_logs_auth_with_and_without_password(self):
         pw = 'ws_secret_密码'
@@ -166,10 +208,21 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
         headers = {'Authorization': auth_header}
         client = await self._make_client(password='secret123')
 
-        mock_db = MagicMock()
-        mock_db.scalars.return_value.all.return_value = ['data/registered.json']
+        class _FakeResult:
+            def __init__(self, values):
+                self._values = values
+
+            def all(self):
+                return self._values
+
+        class _FakeDB:
+            def scalars(self, stmt):
+                if 'uploadstreamers' in str(stmt).lower():
+                    return _FakeResult(['data/legacy_template.json'])
+                return _FakeResult(['data/registered.json'])
+
         mock_session_cm = MagicMock()
-        mock_session_cm.__enter__.return_value = mock_db
+        mock_session_cm.__enter__.return_value = _FakeDB()
         mock_session_cm.__exit__.return_value = False
 
         with patch.object(web_mod, 'SessionLocal', return_value=mock_session_cm):
@@ -185,7 +238,7 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
             r3 = await client.get('/bili/seasons?user=data/unregistered.json', headers=headers)
             self.assertEqual(r3.status, 403)
 
-            # 已登记路径 -> 放行并正常返回
+            # 已登记路径 & 旧模板 user_cookie 路径 -> 放行并正常返回
             mock_bili = MagicMock()
             mock_bili.myinfo.return_value = {'code': 0, 'data': {'name': 'tester'}}
             mock_bili_inst = MagicMock()
@@ -207,6 +260,10 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
                 ok_seasons = await client.get('/bili/seasons?user=data/registered.json', headers=headers)
                 self.assertEqual(ok_seasons.status, 200)
                 self.assertEqual(await ok_seasons.json(), [{'season_id': 10, 'title': '合集1', 'section_id': 20}])
+
+                legacy_seasons = await client.get('/bili/seasons?user=data/legacy_template.json', headers=headers)
+                self.assertEqual(legacy_seasons.status, 200)
+                self.assertEqual(await legacy_seasons.json(), [{'season_id': 10, 'title': '合集1', 'section_id': 20}])
 
     async def test_bili_proxy_security_and_size_limit(self):
         headers = {'Authorization': _basic_auth('secret123')}

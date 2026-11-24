@@ -8,6 +8,7 @@ import logging
 from typing import (
     Callable,
     Iterable,
+    Optional,
     Type,
 )
 from aiohttp import web
@@ -83,10 +84,9 @@ def basic_auth_middleware(
     urls: Iterable,
     auth_dict: dict,
     strategy: Type[BaseStrategy] = lambda x: x,
-    query_auth_prefixes: Iterable = ()
+    token_validator: Optional[Callable[[web.Request], bool]] = None
 ):
     protected_urls = tuple(urls)
-    query_prefixes = tuple(query_auth_prefixes)
 
     @web.middleware
     async def middleware(request: web.Request, handler: Callable) -> web.Response:
@@ -98,12 +98,8 @@ def basic_auth_middleware(
                 continue
 
             auth_header = request.headers.get('Authorization', '')
-            if (
-                not auth_header
-                and request.method in ('GET', 'HEAD')
-                and any(request.path.startswith(prefix) for prefix in query_prefixes)
-            ):
-                auth_header = request.query.get('authorization', '')
+            if not auth_header and token_validator is not None and token_validator(request):
+                return await handler(request)
 
             if inspect.isclass(strategy) and issubclass(strategy, BaseStrategy):
                 log.debug("Use Strategy: %r", strategy.__name__)

@@ -1,10 +1,14 @@
 import asyncio
+import hashlib
+import hmac
+import secrets
 import socket
 import json
 import os
 import pathlib
 import concurrent.futures
 import threading
+import time
 
 import copy
 import aiohttp_cors
@@ -37,17 +41,61 @@ routes = web.RouteTableDef()
 # 全局变量存储密码
 GLOBAL_PASSWORD = None
 MAX_PROXY_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
+STATIC_TOKEN_TTL_SECONDS = 7200  # 2 小时
+
+
+def generate_static_token(secret: bytes, filename: str, ttl: int = STATIC_TOKEN_TTL_SECONDS) -> str:
+    """生成绑定单文件与过期时间的短时 HMAC-SHA256 签名令牌"""
+    exp = int(time.time()) + int(ttl)
+    payload = f"{filename}:{exp}".encode('utf-8')
+    sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def verify_static_token(secret: bytes, filename: str, token: str) -> bool:
+    """校验单文件短时签名令牌"""
+    if not secret or not filename or not token or '.' not in token:
+        return False
+    exp_str, sig = token.split('.', 1)
+    try:
+        exp = int(exp_str)
+    except ValueError:
+        return False
+    if exp < int(time.time()):
+        return False
+    payload = f"{filename}:{exp}".encode('utf-8')
+    expected_sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    try:
+        return hmac.compare_digest(expected_sig.encode('utf-8'), sig.encode('utf-8'))
+    except Exception:
+        return False
+
+
+def _validate_static_token(request: web.Request) -> bool:
+    if request.method not in ('GET', 'HEAD') or not request.path.startswith('/static/'):
+        return False
+    filename = request.path[len('/static/'):]
+    token = request.query.get('token', '')
+    return verify_static_token(request.app.get('static_token_secret'), filename, token)
 
 
 def _is_registered_cookie_file(file_path: str) -> bool:
-    """校验传入的 Cookie 文件路径是否已登记在数据库 bilibili-cookies 白名单中"""
+    """校验传入的 Cookie 文件路径是否已登记在 bilibili-cookies 或现有投稿模板中"""
     if not file_path:
         return False
     with SessionLocal() as db:
         registered = db.scalars(
             select(Configuration.value).where(Configuration.key == 'bilibili-cookies')
         ).all()
-    return file_path in registered
+        if file_path in registered:
+            return True
+        template_cookies = db.scalars(
+            select(UploadStreamers.user_cookie).where(
+                UploadStreamers.user_cookie.is_not(None),
+                UploadStreamers.user_cookie != ''
+            )
+        ).all()
+    return file_path in template_cookies
 
 
 def set_global_password(password: str):
@@ -683,11 +731,24 @@ def read_last_n_lines(file_path, n=50):
         return [line.decode('utf-8', errors='replace') for line in lines[-n:]]
 
 
+@routes.get('/v1/static-token')
+async def get_static_token(request):
+    """签发仅限单文件短时有效的静态资源访问令牌（用于视频播放）"""
+    filename = request.query.get('file', '')
+    if not filename or '/' in filename or '\\' in filename or '..' in filename or '\x00' in filename:
+        return web.json_response({"status": 400, 'error': "非法文件名"}, status=400)
+    if not request.app.get('password'):
+        return web.json_response({"token": None})
+    token = generate_static_token(request.app['static_token_secret'], filename)
+    return web.json_response({"token": token})
+
+
 @routes.get('/ws/logs')
 async def websocket_logs(request):
-    if GLOBAL_PASSWORD:
+    app_password = request.app['password'] if 'password' in request.app else GLOBAL_PASSWORD
+    if app_password:
         auth_value = request.query.get('authorization') or request.headers.get('Authorization', '')
-        if not auth_value or not check_url_auth(auth_value):
+        if not auth_value or not check_access({'biliup': app_password}, auth_value):
             return web.HTTPUnauthorized(reason="Unauthorized")
 
     ws = web.WebSocketResponse()
@@ -817,14 +878,15 @@ def create_app(password=None, static_dir=None):
             res.append(web.static('/', public_dir))
             app.add_routes(res)
 
-    set_global_password(password or None)
+    app['password'] = password or None
+    app['static_token_secret'] = secrets.token_bytes(32)
     if password:
-        # 保护API及静态文件下载路径，不保护前端页面路由
+        # 保护API及静态文件下载路径，不保护前端页面路由；/static/ 允许凭单文件短时签名 ?token= 访问
         app.middlewares.append(
             basic_auth_middleware(
                 ('/api/', '/url-status', '/v1/', '/bili/', '/static/'),
                 {'biliup': password},
-                query_auth_prefixes=('/static/',),
+                token_validator=_validate_static_token,
             )
         )
 
@@ -845,7 +907,9 @@ def create_app(password=None, static_dir=None):
 
 
 async def service(args):
-    app = create_app(password=getattr(args, 'password', None), static_dir=getattr(args, 'static_dir', None))
+    password = getattr(args, 'password', None)
+    set_global_password(password or None)
+    app = create_app(password=password, static_dir=getattr(args, 'static_dir', None))
 
     if args.no_access_log:
         runner = web.AppRunner(app, access_log=None)
@@ -859,7 +923,10 @@ async def service(args):
 
 
 async def handle_404(request):
-    return web.FileResponse(files('biliup.web').joinpath('public').joinpath('404.html'))
+    not_found_path = pathlib.Path(files('biliup.web').joinpath('public').joinpath('404.html'))
+    if not_found_path.is_file():
+        return web.FileResponse(not_found_path, status=404)
+    return web.Response(status=404, text='Not Found')
 
 
 async def handle_500(request):
