@@ -15,7 +15,7 @@ import { useBiliUsers } from '../lib/use-streamers'
 
 type PluginProps = {
   entity?: LiveStreamerEntity
-  list?: { value: number; label: React.ReactNode }[]
+  list?: { value: string | number; label: React.ReactNode }[]
   initValues?: any
 }
 
@@ -24,6 +24,14 @@ type TemplateModalProps = {
   entity?: LiveStreamerEntity
   children?: React.ReactNode
   onOk: (e: any) => Promise<void>
+}
+
+type OverrideModalContentProps = {
+  visible: boolean
+  entity?: LiveStreamerEntity
+  onOk: (e: any) => Promise<void>
+  onCancel: () => void
+  afterClose: () => void
 }
 
 const removeCircularReferences = (obj: any, seen = new WeakSet()): any => {
@@ -47,21 +55,19 @@ const removeCircularReferences = (obj: any, seen = new WeakSet()): any => {
   return result
 }
 
-const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk }) => {
-  const [isOpen, setOpen] = useState(false)
-
-  const toggle = () => {
-    setOpen(!isOpen)
-  }
-
+const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
+  visible,
+  entity,
+  onOk,
+  onCancel,
+  afterClose,
+}) => {
   const platformSetting = () => {
     for (const [pattern, Plugin] of Object.entries(SupportedPlatforms)) {
       if (entity?.url.match(new RegExp(pattern))) {
-        // console.log('匹配到平台:', pattern)
         return Plugin as React.ComponentType<PluginProps>
       }
     }
-    // console.log('未匹配到平台')
     return null
   }
 
@@ -80,10 +86,6 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     }
   })
 
-  const [visible, setVisible] = useState(false)
-  const showDialog = () => {
-    setVisible(true)
-  }
   const handleOk = async () => {
     let values = await api.current?.validate()
     // 从 LiveStreamerEntity 接口定义中获取所有字段
@@ -137,25 +139,11 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       // 处理循环引用
       const cleanValues = removeCircularReferences(values)
       await onOk(cleanValues)
-      setVisible(false)
+      onCancel()
       return
     }
-    setVisible(false)
+    onCancel()
   }
-  const handleCancel = () => {
-    setVisible(false)
-  }
-
-  const childrenWithProps = React.Children.map(children, child => {
-    if (React.isValidElement<any>(child)) {
-      return React.cloneElement(child, {
-        onClick: () => {
-          showDialog()
-          child.props.onClick?.()
-        },
-      })
-    }
-  })
 
   const downloadSettings = (
     <Collapse.Panel header="下载设置" itemKey="download">
@@ -243,57 +231,96 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   )
 
   return (
+    <Modal
+      title="配置覆写"
+      visible={visible}
+      onOk={handleOk}
+      style={{ width: 'min(600px, 90vw)' }}
+      onCancel={onCancel}
+      afterClose={afterClose}
+      bodyStyle={{
+        overflow: 'auto',
+        maxHeight: 'calc(100vh - 320px)',
+        paddingLeft: 10,
+        paddingRight: 10,
+      }}
+    >
+      <Form initValues={entity} getFormApi={formApi => (api.current = formApi)}>
+        <Form.TextArea
+          field="override_text"
+          label="配置覆写"
+          placeholder="请输入 JSON 格式的配置"
+          style={{ marginBottom: 12 }}
+          initValue={entity?.override ? JSON.stringify(entity.override, null, 2) : ''}
+          rules={[
+            { required: false },
+            {
+              validator: (rule, value) => {
+                if (!value) return true
+                try {
+                  JSON.parse(value)
+                  return true
+                } catch (e) {
+                  return false
+                }
+              },
+              message: '请输入有效的 JSON 格式',
+            },
+          ]}
+        />
+        <Form.Section>
+          <Collapse defaultActiveKey={['plugin']}>
+            {downloadSettings}
+            {(() => {
+              const Plugin = platformSetting()
+              return Plugin ? (
+                <Plugin entity={entity} list={list} initValues={entity?.override} />
+              ) : null
+            })()}
+          </Collapse>
+        </Form.Section>
+      </Form>
+    </Modal>
+  )
+}
+
+const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk }) => {
+  const [mounted, setMounted] = useState(false)
+  const [visible, setVisible] = useState(false)
+  const showDialog = () => {
+    setMounted(true)
+    setVisible(true)
+  }
+  const handleCancel = () => {
+    setVisible(false)
+  }
+  const handleAfterClose = () => {
+    setMounted(false)
+  }
+
+  const childrenWithProps = React.Children.map(children, child => {
+    if (React.isValidElement<any>(child)) {
+      return React.cloneElement(child, {
+        onClick: () => {
+          showDialog()
+          child.props.onClick?.()
+        },
+      })
+    }
+  })
+
+  return (
     <>
       {childrenWithProps}
-      <Modal
-        title="配置覆写"
-        visible={visible}
-        onOk={handleOk}
-        style={{ width: 'min(600px, 90vw)' }}
-        onCancel={handleCancel}
-        bodyStyle={{
-          overflow: 'auto',
-          maxHeight: 'calc(100vh - 320px)',
-          paddingLeft: 10,
-          paddingRight: 10,
-        }}
-      >
-        <Form initValues={entity} getFormApi={formApi => (api.current = formApi)}>
-          <Form.TextArea
-            field="override_text"
-            label="配置覆写"
-            placeholder="请输入 JSON 格式的配置"
-            style={{ marginBottom: 12 }}
-            initValue={entity?.override ? JSON.stringify(entity.override, null, 2) : ''}
-            rules={[
-              { required: false },
-              {
-                validator: (rule, value) => {
-                  if (!value) return true
-                  try {
-                    JSON.parse(value)
-                    return true
-                  } catch (e) {
-                    return false
-                  }
-                },
-                message: '请输入有效的 JSON 格式',
-              },
-            ]}
-          />
-          <Form.Section>
-            <Collapse defaultActiveKey={['plugin']}>
-              {downloadSettings}
-              {(() => {
-                const Plugin = platformSetting()
-                return Plugin ? (
-                  <Plugin entity={entity} list={list} initValues={entity?.override} />
-                ) : null
-              })()}
-            </Collapse>
-          </Form.Section>
-        </Form>
-      </Modal>
+      {mounted ? (
+        <OverrideModalContent
+          visible={visible}
+          entity={entity}
+          onOk={onOk}
+          onCancel={handleCancel}
+          afterClose={handleAfterClose}
+        />
+      ) : null}
     </>
   )
 }

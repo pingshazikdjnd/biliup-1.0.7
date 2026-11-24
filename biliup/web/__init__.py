@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import secrets
@@ -34,9 +35,45 @@ except ImportError:
     # Try backported to PY<37 `importlib_resources`.
     from importlib_resources import files
 
-BiliBili = BiliBili(Data())
-
 routes = web.RouteTableDef()
+
+_BILI_REQUEST_TIMEOUT = (5, 15)
+
+
+@contextlib.contextmanager
+def _bili_client(timeout=_BILI_REQUEST_TIMEOUT):
+    """为单次请求创建独立 BiliBili 实例，并为 Session 出站请求设置默认连接/读超时"""
+    with BiliBili(Data()) as bili:
+        session = getattr(bili, '_BiliBili__session', None)
+        orig_request = getattr(session, 'request', None)
+        if callable(orig_request):
+            def _timed_request(*args, **kwargs):
+                if kwargs.get('timeout') is None:
+                    kwargs['timeout'] = timeout
+                return orig_request(*args, **kwargs)
+            session.request = _timed_request
+        yield bili
+
+
+def _load_cookies_from_file(path: str) -> dict:
+    """从 cookie 文件局部读取 cookies 字典，不污染全局 config.data['user']"""
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    with open(path, encoding='utf-8') as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid cookie file format: {path}")
+    cookie_list = data.get("cookie_info", {}).get("cookies")
+    if not isinstance(cookie_list, list):
+        raise ValueError(f"Invalid cookie file format: {path}")
+    cookies = {}
+    for item in cookie_list:
+        if isinstance(item, dict):
+            name = item.get("name")
+            value = item.get("value")
+            if name is not None and value is not None:
+                cookies[name] = value
+    return cookies
 
 # 全局变量存储密码
 GLOBAL_PASSWORD = None
@@ -186,13 +223,17 @@ async def cookie_login(request):
     if config.data.get("toml"):
         print("trying to login by cookie")
         try:
-            stream_gears.login_by_cookies()
+            await asyncio.to_thread(stream_gears.login_by_cookies)
         except Exception as e:
             return web.HTTPBadRequest(text="login failed" + str(e))
     else:
         cookie = config.data.get('user', {}).get('cookies', {})
         try:
-            BiliBili.login_by_cookies(cookie)
+            def _do_login():
+                with _bili_client() as bili:
+                    bili.login_by_cookies(cookie)
+
+            await asyncio.to_thread(_do_login)
         except Exception as e:
             print(e)
             return web.HTTPBadRequest(text="login failed")
@@ -260,10 +301,20 @@ async def qrcode_login(request):
 
 @routes.get('/api/check_tag')
 async def tag_check(request):
-    if BiliBili.check_tag(request.rel_url.query['tag']):
+    tag = request.rel_url.query['tag']
+
+    def _do_check_tag():
+        with _bili_client() as bili:
+            return bili.check_tag(tag)
+
+    try:
+        passed = await asyncio.to_thread(_do_check_tag)
+    except requests.Timeout:
+        logger.warning('check_tag timeout for tag=%s', tag)
+        return web.HTTPGatewayTimeout(text="tag check timeout")
+    if passed:
         return web.json_response({"status": 200})
-    else:
-        return web.HTTPBadRequest(text="标签违禁")
+    return web.HTTPBadRequest(text="标签违禁")
 
 
 @routes.get('/v1/videos')
@@ -590,28 +641,48 @@ async def app_status(request):
     return web.json_response(res)
 
 
+def _fetch_pre_archive(path: str):
+    cookies = _load_cookies_from_file(path)
+    with _bili_client() as bili:
+        return bili.tid_archive(cookies)
+
+
 @routes.get('/bili/archive/pre')
 async def pre_archive(request):
-    # path = 'cookies.json'
-    # conf = Configuration.get_or_none(Configuration.key == 'bilibili-cookies')
     with SessionLocal() as db:
-        confs = db.scalars(
-            select(Configuration).where(Configuration.key == 'bilibili-cookies'))
-    # if conf is not None:
-    #     path = conf.value
-        for conf in confs:
-            path = conf.value
-            try:
-                config.load_cookies(path)
-                cookies = config.data.get('user', {}).get('cookies', {})
-                res = BiliBili.tid_archive(cookies)
-                if res['code'] != 0:
-                    continue
+        paths = [
+            conf.value
+            for conf in db.scalars(
+                select(Configuration).where(Configuration.key == 'bilibili-cookies')
+            )
+        ]
+    for path in paths:
+        try:
+            res = await asyncio.to_thread(_fetch_pre_archive, path)
+            if isinstance(res, dict) and res.get('code') == 0:
                 return web.json_response(res)
-            except:
-                logger.exception('pre_archive')
-                continue
+        except Exception:
+            logger.exception('pre_archive')
+            continue
     return web.json_response({"status": 500, 'error': "无可用 cookie 文件"}, status=500)
+
+
+def _fetch_seasons(file: str):
+    cookies = _load_cookies_from_file(file)
+    with _bili_client() as bili:
+        requests.utils.add_dict_to_cookiejar(bili._BiliBili__session.cookies, cookies)
+        seasons_data = bili.list_seasons()
+    result = []
+    for item in seasons_data.get('seasons', []):
+        season = item.get('season', {})
+        sections = item.get('sections', {}).get('sections', [])
+        section_id = sections[0]['id'] if sections else None
+        result.append({
+            'season_id': season.get('id'),
+            'title': season.get('title', ''),
+            'section_id': section_id,
+        })
+    return result
 
 
 @routes.get('/bili/seasons')
@@ -623,29 +694,22 @@ async def get_seasons(request):
     if not _is_registered_cookie_file(file):
         return web.json_response({"status": 403, 'error': "未登记的 Cookie 文件路径"}, status=403)
     try:
-        config.load_cookies(file)
+        result = await asyncio.to_thread(_fetch_seasons, file)
+        return web.json_response(result)
     except FileNotFoundError:
         return web.json_response({"status": 500, 'error': f"{file} 文件不存在"}, status=500)
-    cookies = config.data.get('user', {}).get('cookies', {})
-    try:
-        bili = BiliBili.__class__(Data())
-        requests.utils.add_dict_to_cookiejar(bili._BiliBili__session.cookies, cookies)
-        seasons_data = bili.list_seasons()
-        result = []
-        for item in seasons_data.get('seasons', []):
-            season = item.get('season', {})
-            sections = item.get('sections', {}).get('sections', [])
-            section_id = sections[0]['id'] if sections else None
-            result.append({
-                'season_id': season.get('id'),
-                'title': season.get('title', ''),
-                'section_id': section_id,
-            })
-        bili.close()
-        return web.json_response(result)
+    except requests.Timeout:
+        logger.warning('get_seasons timeout for user=%s', file)
+        return web.json_response({"status": 504, 'error': "请求上游超时"}, status=504)
     except Exception as e:
         logger.exception('get_seasons')
         return web.json_response({"status": 500, 'error': str(e)}, status=500)
+
+
+def _fetch_myinfo(file: str):
+    cookies = _load_cookies_from_file(file)
+    with _bili_client() as bili:
+        return bili.myinfo(cookies)
 
 
 @routes.get('/bili/space/myinfo')
@@ -656,11 +720,16 @@ async def myinfo(request):
     if not _is_registered_cookie_file(file):
         return web.json_response({"status": 403, 'error': "未登记的 Cookie 文件路径"}, status=403)
     try:
-        config.load_cookies(file)
+        res = await asyncio.to_thread(_fetch_myinfo, file)
+        return web.json_response(res)
     except FileNotFoundError:
         return web.json_response({"status": 500, 'error': f"{file} 文件不存在"}, status=500)
-    cookies = config.data.get('user', {}).get('cookies', {})
-    return web.json_response(BiliBili.myinfo(cookies))
+    except requests.Timeout:
+        logger.warning('myinfo timeout for user=%s', file)
+        return web.json_response({"status": 504, 'error': "请求上游超时"}, status=504)
+    except Exception as e:
+        logger.exception('myinfo')
+        return web.json_response({"status": 500, 'error': str(e)}, status=500)
 
 
 @routes.get('/bili/proxy')

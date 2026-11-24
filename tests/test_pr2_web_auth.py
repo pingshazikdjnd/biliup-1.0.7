@@ -246,20 +246,17 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r3.status, 403)
 
             # 已登记路径 & 旧模板 user_cookie 路径 -> 放行并正常返回
-            mock_bili = MagicMock()
-            mock_bili.myinfo.return_value = {'code': 0, 'data': {'name': 'tester'}}
             mock_bili_inst = MagicMock()
+            mock_bili_inst.__enter__.return_value = mock_bili_inst
+            mock_bili_inst.__exit__.return_value = False
             mock_bili_inst._BiliBili__session = MagicMock()
+            mock_bili_inst.myinfo.return_value = {'code': 0, 'data': {'name': 'tester'}}
             mock_bili_inst.list_seasons.return_value = {
                 'seasons': [{'season': {'id': 10, 'title': '合集1'}, 'sections': {'sections': [{'id': 20}]}}]
             }
-            mock_bili.__class__ = MagicMock(return_value=mock_bili_inst)
 
-            def fake_load_cookies(path):
-                config.data['user'] = {'cookies': {'SESSDATA': 'abc'}}
-
-            with patch.object(config, 'load_cookies', side_effect=fake_load_cookies), \
-                    patch.object(web_mod, 'BiliBili', mock_bili):
+            with patch.object(web_mod, '_load_cookies_from_file', return_value={'SESSDATA': 'abc'}), \
+                    patch.object(web_mod, 'BiliBili', return_value=mock_bili_inst):
                 ok_info = await client.get('/bili/space/myinfo?user=data/registered.json', headers=headers)
                 self.assertEqual(ok_info.status, 200)
                 self.assertEqual((await ok_info.json())['data']['name'], 'tester')
