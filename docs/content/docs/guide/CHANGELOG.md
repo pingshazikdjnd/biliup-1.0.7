@@ -19,6 +19,13 @@ top = false
 - 🔧已修复的问题
 - ⚠️需要手动操作的更新信息
 
+## 1.0.7.009
+### What's Changed
+- 💡 新增外挂 mesio 下载器支持（FLV/HLS 实时时间戳修复）：支持全局/单主播覆写 `mesio` 与 `mesio_path`，采用 `.mesio_tmp` 隔离会话目录分段原子移出、软水位实时停机穿透 `delay`、冷启动残留自动恢复与 `ffmpeg` 回退
+- 🔧 加固软水位触发与立即上传、覆写弹窗状态保持、热重载安全校验及 Rust Server 细节处理
+
+**Full Changelog**: [1.0.7.008...1.0.7.009](https://github.com/pingshazikdjnd/biliup-1.0.7/compare/1.0.7.008...1.0.7.009)
+
 ## 1.0.7.008
 ### What's Changed
 - 💡 新增可配置双水位磁盘保护（`disk_upload_threshold_gb` 软水位主动触发上传清理、`disk_stop_threshold_gb` 硬水位告警暂停录制）
