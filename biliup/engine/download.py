@@ -61,7 +61,12 @@ def _resolve_mesio_binary(mesio_path: Optional[str]) -> Optional[str]:
         if candidate:
             has_sep = os.sep in candidate or (os.altsep is not None and os.altsep in candidate)
             if has_sep:
-                return candidate if os.path.isfile(candidate) else None
+                if not os.path.isfile(candidate):
+                    return None
+                if os.name != 'nt' and not os.access(candidate, os.X_OK):
+                    logger.error(f"mesio 文件不可执行，请检查权限（如执行 chmod +x）: {candidate}")
+                    return None
+                return candidate
             return shutil.which(candidate)
     return shutil.which('mesio')
 
@@ -132,6 +137,7 @@ def recover_stale_mesio_tmp(tmp_root: str = '.mesio_tmp', target_dir: str = '.')
             continue
         meta_path = os.path.join(session_dir, '.meta.json')
         base_name = entry
+        database_row_id = None
         if os.path.isfile(meta_path):
             try:
                 with open(meta_path, 'r', encoding='utf-8') as f:
@@ -140,6 +146,14 @@ def recover_stale_mesio_tmp(tmp_root: str = '.mesio_tmp', target_dir: str = '.')
                     meta_base = meta.get('base_name')
                     if isinstance(meta_base, str) and meta_base.strip():
                         base_name = os.path.basename(meta_base.strip()) or entry
+                    raw_row_id = meta.get('database_row_id')
+                    if not isinstance(raw_row_id, bool):
+                        try:
+                            parsed_row_id = int(raw_row_id)
+                            if parsed_row_id > 0:
+                                database_row_id = parsed_row_id
+                        except (TypeError, ValueError):
+                            pass
             except Exception as e:
                 logger.warning(f"读取残留 mesio 会话元数据失败 ({meta_path}): {e}")
 
@@ -159,6 +173,15 @@ def recover_stale_mesio_tmp(tmp_root: str = '.mesio_tmp', target_dir: str = '.')
             except OSError as e:
                 move_failed = True
                 logger.error(f"恢复残留 mesio 录像失败 ({src_path} -> {dst}): {e}")
+                continue
+            if database_row_id is not None:
+                try:
+                    from biliup.database.models import StreamerInfo
+                    with SessionLocal() as db:
+                        if db.get(StreamerInfo, database_row_id) is not None:
+                            update_file_list(db, database_row_id, os.path.basename(dst))
+                except Exception as e:
+                    logger.warning(f"登记恢复的 mesio 录像到数据库失败 ({dst}): {e}")
 
         for name in os.listdir(session_dir):
             if name == '.meta.json':
@@ -547,7 +570,15 @@ class DownloadBase(ABC):
         meta_path = os.path.join(session_tmp_dir, '.meta.json')
         try:
             with open(meta_path, 'w', encoding='utf-8') as f:
-                json.dump({'name': self.fname, 'base_name': session_base_name}, f, ensure_ascii=False)
+                json.dump(
+                    {
+                        'name': self.fname,
+                        'base_name': session_base_name,
+                        'database_row_id': self.database_row_id,
+                    },
+                    f,
+                    ensure_ascii=False,
+                )
         except OSError as e:
             logger.warning(f"{self.plugin_msg}: 写入 mesio 会话元数据失败: {e}")
 
@@ -565,6 +596,8 @@ class DownloadBase(ABC):
                 if key is None or value is None:
                     continue
                 clean_key = str(key).replace('\r', '').replace('\n', '').strip()
+                if clean_key.lower() == 'accept-encoding':
+                    continue
                 clean_val = str(value).replace('\r', '').replace('\n', '').strip()
                 if clean_key and clean_val:
                     cmd.extend(['-H', f'{clean_key}: {clean_val}'])
@@ -674,7 +707,11 @@ class DownloadBase(ABC):
             except ProcessLookupError:
                 pass
             except OSError as e:
-                logger.debug(f"{self.plugin_msg}: 发送 mesio 优雅停机信号失败: {e}")
+                logger.debug(f"{self.plugin_msg}: 发送 mesio 优雅停机信号失败，尝试 terminate 兜底: {e}")
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
 
         popen_kwargs = {
             'stdin': subprocess.DEVNULL,
@@ -689,59 +726,60 @@ class DownloadBase(ABC):
                 proc = subprocess.Popen(cmd, **popen_kwargs)
             except OSError as e:
                 logger.error(f"{self.plugin_msg}: 启动 mesio 进程失败: {e}")
-                return False
+                proc = None
 
-            if proc.stdout is not None:
-                log_thread = threading.Thread(
-                    target=_read_stdout,
-                    daemon=True,
-                    name=f"mesio_log_{self.database_row_id}_{os.getpid()}",
-                )
-                log_thread.start()
+            if proc is not None:
+                if proc.stdout is not None:
+                    log_thread = threading.Thread(
+                        target=_read_stdout,
+                        daemon=True,
+                        name=f"mesio_log_{self.database_row_id}_{os.getpid()}",
+                    )
+                    log_thread.start()
 
-            while True:
-                closed_event.wait(timeout=2.0)
-                closed_event.clear()
+                while True:
+                    closed_event.wait(timeout=2.0)
+                    closed_event.clear()
 
-                exited = proc.poll() is not None
-                moved = _flush_closed_segments(final=exited)
-                segments_moved += moved
+                    exited = proc.poll() is not None
+                    moved = _flush_closed_segments(final=exited)
+                    segments_moved += moved
 
-                if not exited and not stop_requested:
-                    if moved > 0:
-                        low_disk = _get_low_disk_soft_info(self.plugin_msg)
-                        if low_disk is not None:
-                            free_gb, disk_upload_threshold_gb = low_disk
-                            logger.warning(
-                                f"{self.plugin_msg}: 磁盘剩余空间 ({free_gb:.2f} GB) 低于软水位阈值 ({disk_upload_threshold_gb} GB)，"
-                                f"通知 mesio 优雅停止当前录制以立即触发上传与清理"
-                            )
-                            self._mesio_soft_triggered = True
+                    if not exited and not stop_requested:
+                        if moved > 0:
+                            low_disk = _get_low_disk_soft_info(self.plugin_msg)
+                            if low_disk is not None:
+                                free_gb, disk_upload_threshold_gb = low_disk
+                                logger.warning(
+                                    f"{self.plugin_msg}: 磁盘剩余空间 ({free_gb:.2f} GB) 低于软水位阈值 ({disk_upload_threshold_gb} GB)，"
+                                    f"通知 mesio 优雅停止当前录制以立即触发上传与清理"
+                                )
+                                self._mesio_soft_triggered = True
+                                stop_requested = True
+                                stop_deadline = time.monotonic() + 15.0
+                                _send_graceful_stop()
+
+                        if not stop_requested and self.time_range and not check_timerange(self.fname):
+                            logger.info(f"{self.plugin_msg}: 超出录制时间范围，通知 mesio 优雅停止")
+                            stopped_by_timerange = True
                             stop_requested = True
                             stop_deadline = time.monotonic() + 15.0
                             _send_graceful_stop()
 
-                    if not stop_requested and self.time_range and not check_timerange(self.fname):
-                        logger.info(f"{self.plugin_msg}: 超出录制时间范围，通知 mesio 优雅停止")
-                        stopped_by_timerange = True
-                        stop_requested = True
-                        stop_deadline = time.monotonic() + 15.0
-                        _send_graceful_stop()
+                    if stop_requested and not exited and time.monotonic() >= stop_deadline:
+                        logger.warning(f"{self.plugin_msg}: mesio 优雅停机超时 (15s)，强制结束进程")
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                        break
 
-                if stop_requested and not exited and time.monotonic() >= stop_deadline:
-                    logger.warning(f"{self.plugin_msg}: mesio 优雅停机超时 (15s)，强制结束进程")
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
-                    try:
-                        proc.wait(timeout=5)
-                    except Exception:
-                        pass
-                    break
-
-                if exited:
-                    break
+                    if exited:
+                        break
         finally:
             if proc is not None:
                 try:
@@ -785,6 +823,8 @@ class DownloadBase(ABC):
                 pass
 
         if proc is None:
+            if shutil.which("ffmpeg"):
+                return self.ffmpeg_download()
             return False
 
         with log_lock:

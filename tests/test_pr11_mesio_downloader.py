@@ -207,6 +207,14 @@ class TestPR11MesioDownloader(unittest.TestCase):
         self.assertEqual(download_mod._resolve_mesio_binary(f'  {bin_file}  '), bin_file)
         self.assertIsNone(download_mod._resolve_mesio_binary(os.path.join(bin_dir, 'missing.exe')))
 
+        # POSIX 不可执行文件应被拒绝返回 None；具备可执行权限则返回路径
+        with patch('biliup.engine.download.os.name', 'posix'), \
+                patch('biliup.engine.download.os.access', return_value=False):
+            self.assertIsNone(download_mod._resolve_mesio_binary(bin_file))
+        with patch('biliup.engine.download.os.name', 'posix'), \
+                patch('biliup.engine.download.os.access', return_value=True):
+            self.assertEqual(download_mod._resolve_mesio_binary(bin_file), bin_file)
+
         self.assertEqual(download_mod._allocate_unique_media_target('clip', '.flv', '.'), 'clip.flv')
         with open('clip.flv', 'wb') as f:
             f.write(b'1')
@@ -218,11 +226,14 @@ class TestPR11MesioDownloader(unittest.TestCase):
     def test_cli_arguments_headers_duration_size_and_no_opt_args(self):
         dl = DummyMesioDownloader(opt_args=['-ss', '00:00:10', '-c:v', 'libx264'])
         dl.downloader = 'mesio'
+        dl.database_row_id = 42
         dl.segment_time = '01:00:00'
         dl.file_size = 1048576
         dl.stream_headers = {
             'User-Agent': 'BiliAgent/1.0\r\nX-Injected: bad',
             'Referer': 'https://live.bilibili.com/12345',
+            'Accept-Encoding': 'gzip, deflate',
+            'accept-encoding': 'br',
             'BlankHeader': '   ',
             'NullHeader': None,
         }
@@ -232,6 +243,9 @@ class TestPR11MesioDownloader(unittest.TestCase):
         def fake_popen(cmd, **kwargs):
             captured['cmd'] = list(cmd)
             captured['kwargs'] = kwargs
+            sdir = _extract_session_dir(cmd)
+            with open(os.path.join(sdir, '.meta.json'), 'r', encoding='utf-8') as f:
+                captured['meta'] = json.load(f)
             proc = FakePopenProcess(cmd, returncode=1, on_poll=lambda p, n: 1)
             proc.stdout.push_eof()
             return proc
@@ -240,6 +254,8 @@ class TestPR11MesioDownloader(unittest.TestCase):
             ret = dl.mesio_download('/usr/local/bin/mesio')
 
         self.assertFalse(ret)
+        self.assertEqual(captured['meta']['database_row_id'], 42)
+        self.assertEqual(captured['meta']['name'], dl.fname)
         cmd = captured['cmd']
         self.assertEqual(cmd[0], '/usr/local/bin/mesio')
         self.assertIn('--fix', cmd)
@@ -259,6 +275,7 @@ class TestPR11MesioDownloader(unittest.TestCase):
             h_values,
             ['User-Agent: BiliAgent/1.0X-Injected: bad', 'Referer: https://live.bilibili.com/12345'],
         )
+        self.assertTrue(all('accept-encoding' not in hv.lower() for hv in h_values))
         self.assertEqual(cmd[cmd.index('-d') + 1], '3600s')
         self.assertEqual(cmd[cmd.index('-m') + 1], '1048576B')
         self.assertEqual(cmd[-1], dl.raw_stream_url)
@@ -315,6 +332,29 @@ class TestPR11MesioDownloader(unittest.TestCase):
                 patch.object(dl4, 'ffmpeg_download') as mock_ffmpeg4:
             self.assertFalse(dl4.mesio_download('/usr/bin/mesio'))
             mock_ffmpeg4.assert_not_called()
+
+        # 5. Popen 抛 OSError 时自动回退到 ffmpeg_download()，且在此前已完成 .mesio_tmp 清理
+        dl5 = DummyMesioDownloader()
+        dl5.downloader = 'mesio'
+
+        def _check_cleaned_and_ok():
+            self.assertFalse(os.path.exists('.mesio_tmp'))
+            return True
+
+        with patch('biliup.engine.download.subprocess.Popen', side_effect=OSError('spawn failed')), \
+                patch('biliup.engine.download.shutil.which', side_effect=lambda name: '/usr/bin/ffmpeg' if name == 'ffmpeg' else None), \
+                patch.object(dl5, 'ffmpeg_download', side_effect=_check_cleaned_and_ok) as mock_ffmpeg5:
+            self.assertTrue(dl5.mesio_download('/usr/bin/mesio'))
+            mock_ffmpeg5.assert_called_once_with()
+        self.assertFalse(os.path.exists('.mesio_tmp'))
+
+        # 6. Popen 抛 OSError 且无 ffmpeg 时返回 False 并清理 .mesio_tmp
+        dl6 = DummyMesioDownloader()
+        dl6.downloader = 'mesio'
+        with patch('biliup.engine.download.subprocess.Popen', side_effect=OSError('spawn failed')), \
+                patch('biliup.engine.download.shutil.which', return_value=None):
+            self.assertFalse(dl6.mesio_download('/usr/bin/mesio'))
+        self.assertFalse(os.path.exists('.mesio_tmp'))
 
     def test_isolated_dir_dual_flush_db_registration_and_static_prefix_collision(self):
         dl = DummyMesioDownloader(fname='主播100%测试')
@@ -579,41 +619,112 @@ class TestPR11MesioDownloader(unittest.TestCase):
         self.assertTrue(os.path.isfile('timeout_seg.flv'))
         self.assertTrue(os.path.isfile('timeout_seg_p001.flv'))
 
+    def test_send_signal_oserror_falls_back_to_terminate(self):
+        config['disk_upload_threshold_gb'] = 10.0
+        dl = DummyMesioDownloader()
+        dl.downloader = 'mesio'
+        dl.filename_prefix = 'sig_fallback'
+
+        with self._TestSession() as db:
+            dl.database_row_id = db_mod.add_stream_info(db, dl.fname, dl.url, time.localtime())
+
+        proc_holder = {}
+
+        def fake_popen(cmd, **kwargs):
+            sdir = _extract_session_dir(cmd)
+            with open(os.path.join(sdir, 'seg_000.flv'), 'wb') as f:
+                f.write(b'A' * 100)
+            with open(os.path.join(sdir, 'seg_001.flv'), 'wb') as f:
+                pass
+            proc = FakePopenProcess(cmd, returncode=0)
+
+            def _raise_signal(sig):
+                raise OSError('invalid console handle')
+
+            proc.send_signal = _raise_signal
+            proc.stdout.push(b'started\n')
+            proc_holder['proc'] = proc
+            return proc
+
+        with patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen), \
+                patch('biliup.engine.download.shutil.disk_usage', return_value=SimpleNamespace(free=1 * 1024**3)):
+            ret = dl.mesio_download('/usr/bin/mesio')
+
+        self._join_segment_threads(dl)
+        self.assertTrue(ret)
+        self.assertTrue(proc_holder['proc'].terminated)
+        self.assertFalse(proc_holder['proc'].killed)
+        self.assertTrue(os.path.isfile('sig_fallback.flv'))
+
     def test_recover_stale_mesio_tmp_and_main_cold_start_hook(self):
-        # 预置冲突目标文件，确保恢复不覆盖现有文件
+        with self._TestSession() as db:
+            row_id = db_mod.add_stream_info(db, 'up99', 'https://live.bilibili.com/99', time.localtime())
+
+        # 预置冲突目标文件，确保恢复不覆盖现有文件；且文件名故意不含 {streamer} ('up99')
         with open('recovered_stream.flv', 'wb') as f:
             f.write(b'existing')
 
         stale_dir = os.path.join('.mesio_tmp', '99_12345')
         os.makedirs(stale_dir, exist_ok=True)
         with open(os.path.join(stale_dir, '.meta.json'), 'w', encoding='utf-8') as f:
-            json.dump({'name': 'up99', 'base_name': 'recovered_stream'}, f)
+            json.dump({'name': 'up99', 'base_name': 'recovered_stream', 'database_row_id': row_id}, f)
         with open(os.path.join(stale_dir, 'seg_000.flv'), 'wb') as f:
             f.write(b'payload_flv')
         with open(os.path.join(stale_dir, 'seg_001.flv'), 'wb') as f:
             pass
-        with open(os.path.join(stale_dir, 'seg_002.mp4'), 'wb') as f:
+
+        stale_mp4_dir = os.path.join('.mesio_tmp', '99_12346')
+        os.makedirs(stale_mp4_dir, exist_ok=True)
+        with open(os.path.join(stale_mp4_dir, '.meta.json'), 'w', encoding='utf-8') as f:
+            json.dump({'name': 'up99', 'base_name': 'recovered_clip', 'database_row_id': row_id}, f)
+        with open(os.path.join(stale_mp4_dir, 'seg_000.mp4'), 'wb') as f:
             f.write(b'payload_mp4')
 
-        # 缺失 .meta.json 时应回退使用目录名作为前缀
+        # 缺失 .meta.json 时应回退使用目录名作为前缀；无效 database_row_id 不应崩溃
         no_meta_dir = os.path.join('.mesio_tmp', '88_999')
         os.makedirs(no_meta_dir, exist_ok=True)
         with open(os.path.join(no_meta_dir, 'seg_000.ts'), 'wb') as f:
             f.write(b'payload_ts')
 
-        recovered = download_mod.recover_stale_mesio_tmp()
-        self.assertEqual(
-            set(recovered),
-            {'recovered_stream_p001.flv', 'recovered_stream.mp4', '88_999.ts'},
-        )
+        missing_row_dir = os.path.join('.mesio_tmp', '77_888')
+        os.makedirs(missing_row_dir, exist_ok=True)
+        with open(os.path.join(missing_row_dir, '.meta.json'), 'w', encoding='utf-8') as f:
+            json.dump({'name': 'ghost', 'base_name': 'ghost_rec', 'database_row_id': 999999}, f)
+        with open(os.path.join(missing_row_dir, 'seg_000.mkv'), 'wb') as f:
+            f.write(b'payload_mkv')
+
+        with patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                patch('biliup.engine.upload.SessionLocal', self._TestSession):
+            recovered = download_mod.recover_stale_mesio_tmp()
+            self.assertEqual(
+                set(recovered),
+                {'recovered_stream_p001.flv', 'recovered_clip.mp4', '88_999.ts', 'ghost_rec.mkv'},
+            )
+            with self._TestSession() as db:
+                self.assertEqual(
+                    db_mod.get_file_list(db, row_id),
+                    ['recovered_stream_p001.flv', 'recovered_clip.mp4'],
+                )
+            # 验证 UploadBase.file_list('up99') 能精准匹配不含 {streamer} 的恢复文件而不误匹配无关冲突文件
+            app_mod.context['PluginInfo'] = SimpleNamespace(url_status={}, inverted_index={})
+            config['filtering_threshold'] = 0
+            scanned = UploadBase.file_list('up99')
+            self.assertEqual(
+                {item.video for item in scanned},
+                {'recovered_stream_p001.flv', 'recovered_clip.mp4'},
+            )
+
         with open('recovered_stream.flv', 'rb') as f:
             self.assertEqual(f.read(), b'existing')
         with open('recovered_stream_p001.flv', 'rb') as f:
             self.assertEqual(f.read(), b'payload_flv')
-        with open('recovered_stream.mp4', 'rb') as f:
+        with open('recovered_clip.mp4', 'rb') as f:
             self.assertEqual(f.read(), b'payload_mp4')
         with open('88_999.ts', 'rb') as f:
             self.assertEqual(f.read(), b'payload_ts')
+        with open('ghost_rec.mkv', 'rb') as f:
+            self.assertEqual(f.read(), b'payload_mkv')
         self.assertFalse(os.path.exists('.mesio_tmp'))
 
         # 验证 __main__.main 启动时调用 recover_stale_mesio_tmp 且异常不阻断启动
