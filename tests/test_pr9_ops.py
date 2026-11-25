@@ -56,7 +56,9 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
         }
         self._pending_snapshot = set(app_mod.pending_download_urls)
         self._plugin_info_snapshot = app_mod.context.get('PluginInfo')
+        self._upload_filename_snapshot = list(app_mod.context.get('upload_filename', []))
         app_mod.pending_download_urls.clear()
+        app_mod.context['upload_filename'] = []
         web_mod._shutdown_qr_pool()
 
     async def asyncTearDown(self):
@@ -66,6 +68,7 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
         web_mod.set_global_password(self._orig_password)
         app_mod.pending_download_urls.clear()
         app_mod.pending_download_urls.update(self._pending_snapshot)
+        app_mod.context['upload_filename'] = self._upload_filename_snapshot
         if self._plugin_info_snapshot is not None:
             app_mod.context['PluginInfo'] = self._plugin_info_snapshot
         else:
@@ -278,6 +281,12 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
         app_mod.context['url_upload_count']['u1'] = 1
         self.assertFalse(reload_mod.AutoReload._work_free())
         app_mod.context['url_upload_count']['u1'] = 0
+
+        # upload_filename 非空（例如手动上传进行中）-> False
+        app_mod.context['upload_filename'] = ['manual_video_base']
+        self.assertFalse(reload_mod.AutoReload._work_free())
+        app_mod.context['upload_filename'] = []
+        self.assertTrue(reload_mod.AutoReload._work_free())
 
         # 存在媒体文件 -> False
         tmp_flv = os.path.join(self._tmpdir.name, 'rec.flv')

@@ -70,6 +70,9 @@ class AutoReload(Timer):
                     return False
                 if any(count > 0 for count in context.get('url_upload_count', {}).values()):
                     return False
+            with NamedLock('upload_filename'):
+                if context.get('upload_filename'):
+                    return False
         except Exception:
             logger.exception('检查运行态任务空闲状态失败')
             return False

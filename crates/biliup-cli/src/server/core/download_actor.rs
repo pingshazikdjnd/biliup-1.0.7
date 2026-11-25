@@ -11,12 +11,36 @@ use indexmap::indexmap;
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::future::Future;
 use std::ops::DerefMut;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::log::info;
 use tracing::{debug, error};
+
+async fn finish_download_and_reset<Fut, E>(
+    task: &Cycle<StreamStatus>,
+    url: &str,
+    download_fut: Fut,
+) -> Result<(), E>
+where
+    Fut: Future<Output = Result<(), E>>,
+{
+    let download_res = download_fut.await;
+    task.change(url, StreamStatus::Idle);
+    download_res
+}
+
+fn reset_status_on_inspect_error(
+    task: &Cycle<StreamStatus>,
+    url: &str,
+    prior_status: StreamStatus,
+) {
+    if prior_status != StreamStatus::Working {
+        task.change(url, StreamStatus::Idle);
+    }
+}
 
 async fn start_monitor(
     task: Cycle<StreamStatus>,
@@ -89,8 +113,12 @@ async fn start_monitor(
 
                         let segmentable = Segmentable::new(split_time, split_size);
                         // let segmentable = Segmentable::new( None, Some(16*1024*1024));
-                        site.download(&filename, segmentable, hook).await?;
-                        task.change(&url, StreamStatus::Idle);
+                        finish_download_and_reset(
+                            &task,
+                            &url,
+                            site.download(&filename, segmentable, hook),
+                        )
+                        .await?;
                         Ok::<_, Box<dyn Error + Send + Sync>>(())
                     });
                 }
@@ -101,8 +129,8 @@ async fn start_monitor(
             (Ok(_site), StreamStatus::Working) => {
                 debug!("Working");
             }
-            (Err(e), _) => {
-                task.change(&url, StreamStatus::Idle);
+            (Err(e), s) => {
+                reset_status_on_inspect_error(&task, &url, s);
                 debug!(url, "{e}")
             }
         }
@@ -244,5 +272,45 @@ impl DownloadActorHandle {
         if let Some(handle) = handle_to_abort {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{finish_download_and_reset, reset_status_on_inspect_error};
+    use crate::server::core::StreamStatus;
+    use crate::server::core::util::Cycle;
+    use indexmap::indexmap;
+
+    #[tokio::test]
+    async fn test_finish_download_and_reset_restores_idle_on_ok_and_err() {
+        let url = "https://live.bilibili.com/123";
+        let cycle = Cycle::new(indexmap! { url.to_string() => StreamStatus::Working });
+
+        let ok_res = finish_download_and_reset(&cycle, url, async { Ok::<(), &str>(()) }).await;
+        assert!(ok_res.is_ok());
+        assert_eq!(cycle.get_all().get(url), Some(&StreamStatus::Idle));
+
+        cycle.change(url, StreamStatus::Working);
+        let err_res = finish_download_and_reset(&cycle, url, async { Err::<(), &str>("boom") }).await;
+        assert_eq!(err_res, Err("boom"));
+        assert_eq!(cycle.get_all().get(url), Some(&StreamStatus::Idle));
+    }
+
+    #[test]
+    fn test_reset_status_on_inspect_error_preserves_working_and_resets_others() {
+        let url = "https://live.bilibili.com/456";
+        let cycle = Cycle::new(indexmap! { url.to_string() => StreamStatus::Working });
+
+        reset_status_on_inspect_error(&cycle, url, StreamStatus::Working);
+        assert_eq!(cycle.get_all().get(url), Some(&StreamStatus::Working));
+
+        cycle.change(url, StreamStatus::Inspecting);
+        reset_status_on_inspect_error(&cycle, url, StreamStatus::Idle);
+        assert_eq!(cycle.get_all().get(url), Some(&StreamStatus::Idle));
+
+        cycle.change(url, StreamStatus::Inspecting);
+        reset_status_on_inspect_error(&cycle, url, StreamStatus::Inspecting);
+        assert_eq!(cycle.get_all().get(url), Some(&StreamStatus::Idle));
     }
 }

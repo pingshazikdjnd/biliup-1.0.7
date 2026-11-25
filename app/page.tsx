@@ -27,9 +27,28 @@ const REPO_RELEASES_URL = 'https://github.com/pingshazikdjnd/biliup-1.0.7/releas
 
 const RELEASES: ReleaseEntry[] = [
   {
+    version: '1.0.7.009',
+    date: '2026-11-25',
+    latest: true,
+    summary: '新增外挂 mesio 下载器支持与稳定性收口。',
+    items: [
+      {
+        kind: 'feat',
+        title: '新增外挂 mesio 下载器支持（FLV/HLS 实时时间戳修复）',
+        detail:
+          '全局下载设置与单主播配置覆写均支持选择 mesio，并新增 mesio_path 可执行文件路径配置；采用 .mesio_tmp 隔离会话目录分段原子移出、软水位实时停机穿透 delay 与冷启动崩溃残留恢复，解决 B 站 720p 录播单 P 时间戳跳变问题（支持缺失/启动异常自动回退 ffmpeg）。',
+      },
+      {
+        kind: 'fix',
+        title: '上传熔断、覆写弹窗、热重载与 Rust Server 加固',
+        detail:
+          '补充软水位触发标识传递与立即上传、OverrideModal 状态保持、热重载安全校验与 Rust Server 细节加固。',
+      },
+    ],
+  },
+  {
     version: '1.0.7.008',
     date: '2026-11-24',
-    latest: true,
     summary: '全栈稳定性与安全加固大版本（涵盖 PR #4 ~ PR #13 共 10 个专项修复）。',
     items: [
       {

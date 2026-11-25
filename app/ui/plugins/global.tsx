@@ -46,7 +46,7 @@ const Global: React.FC = () => {
               <br />
               5. ytarchive（仅适用于 Youtube Live）
               <br />
-              {/* 6. mesio（基于 Rust 的命令行视频下载/修复器）详见 <a href="https://github.com/hua0512/rust-srec/tree/main/mesio-cli" target="_blank" rel="noopener noreferrer" >项目主页</a> */}
+              6. mesio（FLV/HLS 实时时间戳修复，需自行安装 mesio）详见 <a href="https://github.com/hua0512/rust-srec/releases" target="_blank" rel="noopener noreferrer" >Releases 下载</a>
             </div>
           }
           style={{ width: '100%' }}
@@ -61,7 +61,7 @@ const Global: React.FC = () => {
           <Select.Option value="stream-gears">stream-gears（默认）</Select.Option>
           <Select.Option value="sync-downloader">sync-downloader（边录边传）</Select.Option>
           <Select.Option value="ytarchive">ytarchive（仅适用于 Youtube Live）</Select.Option>
-          {/* <Select.Option value="mesio">mesio</Select.Option> */}
+          <Select.Option value="mesio">mesio（FLV/HLS 实时时间戳修复，需自行安装 mesio）</Select.Option>
         </Form.Select>
         {formApi.getValue('downloader') === 'sync-downloader' ? (
           <>
@@ -106,6 +106,22 @@ const Global: React.FC = () => {
             />
           </>
         ) : null}
+        <Form.Input
+          field="mesio_path"
+          label="mesio 可执行文件路径（mesio_path）"
+          placeholder="留空默认从系统 PATH 查找 mesio"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              可选。留空则从系统 PATH 查找 mesio；即使全局使用其他下载器、仅单主播覆写 mesio 时也生效。
+            </div>
+          }
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        />
         <Form.InputNumber
           label="视频分段大小（file_size）"
           extraText={
