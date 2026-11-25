@@ -7,6 +7,7 @@ import requests
 import subprocess
 import threading
 import time
+from datetime import datetime
 from functools import reduce
 from pathlib import Path
 from typing import Dict, List, Set, Union
@@ -14,7 +15,7 @@ from typing import Dict, List, Set, Union
 from biliup.config import config
 from .app import event_manager, context, pending_download_urls
 from .common.notify import send_notification
-from .common.tools import NamedLock, get_file_create_timestamp, processor
+from .common.tools import NamedLock, get_file_birth_timestamp, get_file_create_timestamp, processor
 from .common.util import check_timerange
 from .database.db import get_stream_info_by_filename, SessionLocal
 from .downloader import biliup_download
@@ -204,6 +205,42 @@ def _pick_earlier_date(current_date, candidate_date):
     return current_date
 
 
+_FILENAME_DATETIME_RE = re.compile(
+    r'((?:19|20)\d{2})[-._](\d{2})[-._](\d{2})[T _-](\d{2})[._:-](\d{2})[._:-](\d{2})'
+)
+
+
+def _parse_filename_struct_time(file_path: str):
+    if not file_path:
+        return None
+    base_name = os.path.basename(file_path)
+    stem_input = base_name[:-5] if base_name.endswith('.part') else base_name
+    stem = Path(stem_input).stem
+    if not stem:
+        return None
+    matches = list(_FILENAME_DATETIME_RE.finditer(stem))
+    for match in reversed(matches):
+        year, month, day, hour, minute, second = (int(group) for group in match.groups())
+        try:
+            return datetime(year, month, day, hour, minute, second).timetuple()
+        except ValueError:
+            continue
+    return None
+
+
+def _get_file_birth_struct_time(file_path: str):
+    if not file_path or not os.path.exists(file_path):
+        return None
+    try:
+        birth_ts = get_file_birth_timestamp(file_path)
+        if birth_ts is None:
+            return None
+        return time.localtime(birth_ts)
+    except (OSError, ValueError) as e:
+        logger.debug(f"获取文件真实创建时间失败 ({file_path}): {e}")
+        return None
+
+
 def _get_file_create_struct_time(file_path: str):
     if not file_path or not os.path.exists(file_path):
         return None
@@ -215,39 +252,52 @@ def _get_file_create_struct_time(file_path: str):
 
 
 def _resolve_upload_stream_info(stream_info: dict, name: str, file_list: List[UploadBase.FileInfo]) -> dict:
-    """以首段视频对应的最早开播时间校准 date，并在标题缺失时补全数据库元数据。"""
+    """以全分段对应的最早开播/开录时间校准 date，并在标题缺失时补全数据库元数据。"""
     if not file_list:
         return stream_info
 
-    earliest_date = stream_info.get("date")
+    earliest_date = stream_info.get("date") if _date_sort_key(stream_info.get("date")) is not None else None
     missing_title = not stream_info.get("title")
-    fallback_meta: dict = {}
+    fallback_records = []
 
     try:
         with SessionLocal() as db:
             for idx, item in enumerate(file_list):
                 record = get_stream_info_by_filename(db, item.video, streamer_name=name)
-                if idx == 0:
-                    if record and record.get("date"):
-                        earliest_date = _pick_earlier_date(earliest_date, record["date"])
-                    else:
-                        earliest_date = _pick_earlier_date(
-                            earliest_date,
-                            _get_file_create_struct_time(item.video),
-                        )
+                if record and _date_sort_key(record.get("date")) is not None:
+                    segment_date = record["date"]
+                else:
+                    segment_date = _pick_earlier_date(
+                        _parse_filename_struct_time(item.video),
+                        _get_file_birth_struct_time(item.video),
+                    )
+                earliest_date = _pick_earlier_date(earliest_date, segment_date)
                 if missing_title and record:
-                    for key, val in record.items():
-                        fallback_meta.setdefault(key, val)
-                    if fallback_meta.get("title"):
-                        break
-                elif not missing_title:
-                    break
+                    fallback_records.append((_date_sort_key(segment_date), idx, record))
     except Exception as e:
-        logger.debug(f"反查上传元数据失败 ({name}): {e}")
-        earliest_date = _pick_earlier_date(
-            earliest_date,
-            _get_file_create_struct_time(file_list[0].video),
-        )
+        logger.warning(f"反查上传元数据失败 ({name}): {e}")
+        for item in file_list:
+            segment_date = _pick_earlier_date(
+                _parse_filename_struct_time(item.video),
+                _get_file_birth_struct_time(item.video),
+            )
+            earliest_date = _pick_earlier_date(earliest_date, segment_date)
+
+    if _date_sort_key(earliest_date) is None:
+        for item in file_list:
+            earliest_date = _pick_earlier_date(
+                earliest_date,
+                _get_file_create_struct_time(item.video),
+            )
+
+    fallback_meta: dict = {}
+    if missing_title and fallback_records:
+        fallback_records.sort(key=lambda entry: (entry[0] is None, entry[0] or (), entry[1]))
+        for _, _, record in fallback_records:
+            for key, val in record.items():
+                if key == "date" or not val:
+                    continue
+                fallback_meta.setdefault(key, val)
 
     if missing_title:
         merged = {**fallback_meta, **stream_info, "name": name}
@@ -255,12 +305,18 @@ def _resolve_upload_stream_info(stream_info: dict, name: str, file_list: List[Up
             merged["title"] = fallback_meta["title"]
         if not merged.get("live_cover_path") and fallback_meta.get("live_cover_path"):
             merged["live_cover_path"] = fallback_meta["live_cover_path"]
-        if earliest_date is not None:
+        if _date_sort_key(earliest_date) is not None:
             merged["date"] = earliest_date
+        elif "date" in merged and _date_sort_key(merged["date"]) is None:
+            merged.pop("date", None)
         formatted, _ = fmt_title_and_desc(merged)
         stream_info.update(formatted)
-    elif earliest_date is not None:
+        if _date_sort_key(stream_info.get("date")) is None:
+            stream_info.pop("date", None)
+    elif _date_sort_key(earliest_date) is not None:
         stream_info["date"] = earliest_date
+    elif "date" in stream_info and _date_sort_key(stream_info.get("date")) is None:
+        stream_info.pop("date", None)
 
     return stream_info
 

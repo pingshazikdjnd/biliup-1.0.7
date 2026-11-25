@@ -106,7 +106,7 @@ def get_stream_info_by_filename(db: Session, filename: str, streamer_name: Optio
             return {}
         stream_info_dict = file_row.streamerinfo.as_dict()
     except Exception as e:
-        logger.debug(f"{e}")
+        logger.warning(f"按文件名查询录播元数据失败 ({filename}): {e}")
         return {}
     stream_info_dict = {key: value for key, value in stream_info_dict.items() if value}  # 清除字典中的空元素
     if "date" in stream_info_dict and stream_info_dict["date"] is not None:
