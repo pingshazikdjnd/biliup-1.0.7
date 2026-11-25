@@ -22,6 +22,7 @@ top = false
 ## 1.0.7.009
 ### What's Changed
 - 💡 新增外挂 mesio 下载器支持（FLV/HLS 实时时间戳修复）：支持全局/单主播覆写 `mesio` 与 `mesio_path`，采用 `.mesio_tmp` 隔离会话目录分段原子移出、软水位实时停机穿透 `delay`、冷启动残留自动恢复与 `ffmpeg` 回退
+- 🔧 修复跨夜连续录播标题日期误写为次日的问题（补丁更新）：全分段竞争全局最早开录日期，区分真实 `birth-time` 与 `st_mtime` 回退并优先解析文件名时间戳，禁止 `fallback_meta` 透传后段 `date`；加固 `get_stream_info_by_filename`（按主播过滤、兼容重名与转码 `stem` 匹配、异常升级 `WARNING`）并在 `ffmpeg` 非零退出保留非空 `.part` 时补记 `FileList`
 - 🔧 加固软水位触发与立即上传、覆写弹窗状态保持、热重载安全校验及 Rust Server 细节处理
 
 **Full Changelog**: [1.0.7.008...1.0.7.009](https://github.com/pingshazikdjnd/biliup-1.0.7/compare/1.0.7.008...1.0.7.009)

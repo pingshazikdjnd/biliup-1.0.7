@@ -30,13 +30,19 @@ const RELEASES: ReleaseEntry[] = [
     version: '1.0.7.009',
     date: '2026-11-25',
     latest: true,
-    summary: '新增外挂 mesio 下载器支持与稳定性收口。',
+    summary: '新增外挂 mesio 下载器支持、跨夜标题日期校准与稳定性收口。',
     items: [
       {
         kind: 'feat',
         title: '新增外挂 mesio 下载器支持（FLV/HLS 实时时间戳修复）',
         detail:
           '全局下载设置与单主播配置覆写均支持选择 mesio，并新增 mesio_path 可执行文件路径配置；采用 .mesio_tmp 隔离会话目录分段原子移出、软水位实时停机穿透 delay 与冷启动崩溃残留恢复，解决 B 站 720p 录播单 P 时间戳跳变问题（支持缺失/启动异常自动回退 ffmpeg）。',
+      },
+      {
+        kind: 'fix',
+        title: '跨夜连续录播标题日期以最早分段为准并加固 DB 反查（补丁更新）',
+        detail:
+          '上传前遍历 file_list 全部分段竞争全局最早开录日期（按数据库记录、文件名时间戳、真实文件 birth-time 优先级恢复，仅在全缺失时以 st_mtime 末位兜底，防止 Linux 无 birth-time 或转码 remux 乱序导致标题日期误写为次日），并阻断 fallback_meta 透传后段 date 与空 date 异常；加固 get_stream_info_by_filename（按主播过滤、兼容重名与转码 stem 匹配、异常日志提升为 WARNING），并在 ffmpeg 非零退出保留非空 .part 时补记 FileList。',
       },
       {
         kind: 'fix',
