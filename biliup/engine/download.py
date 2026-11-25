@@ -129,7 +129,14 @@ def _publish_mesio_file(src_path: str, base_name: str, ext: str, target_dir: str
                         return dst
                     except FileExistsError:
                         continue
-                os.unlink(src_path)
+                try:
+                    os.unlink(src_path)
+                except OSError:
+                    try:
+                        os.unlink(dst)
+                    except OSError:
+                        pass
+                    raise
                 return dst
     return dst
 

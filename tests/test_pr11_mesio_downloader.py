@@ -807,6 +807,7 @@ class TestPR11MesioDownloader(unittest.TestCase):
             dl.database_row_id = db_mod.add_stream_info(db, dl.fname, dl.url, time.localtime())
 
         state = {'signals_at_zero_bytes': None}
+        proc_holder = {}
 
         def fake_popen(cmd, **kwargs):
             sdir = _extract_session_dir(cmd)
@@ -819,6 +820,9 @@ class TestPR11MesioDownloader(unittest.TestCase):
                     state['signals_at_zero_bytes'] = list(proc.signals)
                     with open(seg_path, 'wb') as f:
                         f.write(b'LIVE' * 128)
+                elif count >= 5:
+                    proc.stdout.push_eof()
+                    return 1
                 return None
 
             def on_signal(proc, sig):
@@ -826,6 +830,7 @@ class TestPR11MesioDownloader(unittest.TestCase):
                 proc.stdout.push_eof()
 
             proc = FakePopenProcess(cmd, returncode=0, on_poll=on_poll, on_signal=on_signal)
+            proc_holder['proc'] = proc
             return proc
 
         with patch('biliup.engine.download.SessionLocal', self._TestSession), \
@@ -836,6 +841,7 @@ class TestPR11MesioDownloader(unittest.TestCase):
         self._join_segment_threads(dl)
         self.assertTrue(ret)
         self.assertEqual(state['signals_at_zero_bytes'], [])
+        self.assertEqual(proc_holder['proc'].returncode, 0)
         self.assertTrue(dl._mesio_soft_triggered)
         self.assertTrue(os.path.isfile('long_seg.flv'))
 
@@ -1005,6 +1011,36 @@ class TestPR11MesioDownloader(unittest.TestCase):
         for idx, dst in results:
             with open(dst, 'rb') as f:
                 self.assertEqual(f.read(), f'payload_{idx}'.encode('utf-8'))
+
+        # 5. POSIX 下 os.link 成功但 os.unlink(src) 抛 OSError 时，回滚删除 dst 且保留完整 src 并向上抛出异常
+        src_unlink_fail = os.path.join(self._tmpdir.name, 'src_unlink_fail.flv')
+        with open(src_unlink_fail, 'wb') as f:
+            f.write(b'keep_source')
+
+        unlink_attempts = []
+
+        def real_like_link(src, dst):
+            with open(dst, 'wb') as f:
+                with open(src, 'rb') as sf:
+                    f.write(sf.read())
+
+        def failing_unlink(path):
+            unlink_attempts.append(path)
+            if path == src_unlink_fail:
+                raise OSError(errno.EACCES, 'cannot unlink source')
+            os.remove(path)
+
+        with patch('biliup.engine.download.os.name', 'posix'), \
+                patch('biliup.engine.download.os.link', side_effect=real_like_link), \
+                patch('biliup.engine.download.os.unlink', side_effect=failing_unlink):
+            with self.assertRaises(OSError):
+                download_mod._publish_mesio_file(src_unlink_fail, 'rollback_clip', '.flv', '.')
+
+        self.assertEqual(unlink_attempts, [src_unlink_fail, 'rollback_clip.flv'])
+        self.assertFalse(os.path.exists('rollback_clip.flv'))
+        self.assertTrue(os.path.isfile(src_unlink_fail))
+        with open(src_unlink_fail, 'rb') as f:
+            self.assertEqual(f.read(), b'keep_source')
 
     def test_recover_skips_live_mesio_pid_and_retries_pending_db_registration(self):
         # 1. mesio_download 成功启动后写入 pid 到 .meta.json
