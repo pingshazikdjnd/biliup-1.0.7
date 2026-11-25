@@ -7,8 +7,7 @@ import {
   Avatar,
 } from '@douyinfe/semi-ui'
 import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
-import React, { useRef } from 'react'
-import { useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { LiveStreamerEntity } from '../lib/api-streamer'
 import { SupportedPlatforms } from '@/app/ui/plugins'
 import { useBiliUsers } from '../lib/use-streamers'
@@ -56,6 +55,44 @@ const removeCircularReferences = (obj: any, seen = new WeakSet()): any => {
   return result
 }
 
+// 对标 Python LiveStreamers 表字段与 API DTO 字段；有意排除 filename_prefix，使其保留在 downloadSettings 中写入 override
+const ENTITY_FIELDS = new Set([
+  'id',
+  'url',
+  'remark',
+  'filename',
+  'split_time',
+  'split_size',
+  'upload_id',
+  'upload_streamers_id',
+  'status',
+  'format',
+  'time_range',
+  'excluded_keywords',
+  'preprocessor',
+  'segment_processor',
+  'downloaded_processor',
+  'postprocessor',
+  'opt_args',
+  'override',
+])
+
+const isPlainObject = (val: any): val is Record<string, any> =>
+  Boolean(val) && typeof val === 'object' && !Array.isArray(val)
+
+const valuesEqual = (a: any, b: any): boolean => {
+  if (a === b) return true
+  if (a == null || b == null || typeof a !== typeof b) return false
+  if (typeof a === 'object') {
+    try {
+      return JSON.stringify(a) === JSON.stringify(b)
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
 const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
   visible,
   entity,
@@ -73,6 +110,73 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
   }
 
   const api = useRef<FormApi>()
+  const touchedFieldsRef = useRef<Set<string>>(new Set())
+  const touchedUserFieldsRef = useRef<Set<string>>(new Set())
+  const isInitializingRef = useRef(true)
+
+  const initialOverrideText = useMemo(
+    () => (entity?.override ? JSON.stringify(entity.override, null, 2) : ''),
+    [entity?.override]
+  )
+  const initialOverride = useMemo<Record<string, any>>(() => {
+    if (!initialOverrideText) return {}
+    try {
+      const parsed = JSON.parse(initialOverrideText)
+      return isPlainObject(parsed) ? parsed : {}
+    } catch {
+      return {}
+    }
+  }, [initialOverrideText])
+  const mergedInitValues = useMemo(() => {
+    const base: Record<string, any> = entity ? { ...entity } : {}
+    Object.entries(initialOverride).forEach(([key, value]) => {
+      if (!ENTITY_FIELDS.has(key)) {
+        base[key] = value
+      }
+    })
+    return base
+  }, [entity, initialOverride])
+
+  useEffect(() => {
+    // 子组件 Plugin 的 mount useEffect 先于父组件执行，待其初始 setValue 完成后再开启变更追踪
+    isInitializingRef.current = false
+  }, [])
+
+  useEffect(() => {
+    touchedFieldsRef.current.clear()
+    touchedUserFieldsRef.current.clear()
+  }, [entity?.id])
+
+  const handleValueChange = (_values: any, changedValue: Record<string, any>) => {
+    if (isInitializingRef.current || !changedValue || typeof changedValue !== 'object') {
+      return
+    }
+    if (Object.prototype.hasOwnProperty.call(changedValue, 'override_text')) {
+      // 用户修改了 JSON 文本框，重置此前记录的控件触摸状态；之后再次操作控件会重新记入
+      touchedFieldsRef.current.clear()
+      touchedUserFieldsRef.current.clear()
+      return
+    }
+    Object.entries(changedValue).forEach(([key, val]) => {
+      if (key === 'override_text') return
+      if (key.startsWith('user.')) {
+        const subKey = key.slice('user.'.length)
+        if (subKey) {
+          touchedUserFieldsRef.current.add(subKey)
+        }
+        return
+      }
+      if (key === 'user') {
+        if (isPlainObject(val)) {
+          Object.keys(val).forEach(subKey => touchedUserFieldsRef.current.add(subKey))
+        } else {
+          touchedFieldsRef.current.add('user')
+        }
+        return
+      }
+      touchedFieldsRef.current.add(key)
+    })
+  }
 
   const { biliUsers } = useBiliUsers()
   const list = biliUsers?.map(item => {
@@ -89,46 +193,8 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
 
   const handleOk = async () => {
     let values = await api.current?.validate()
-    // 从 LiveStreamerEntity 接口定义中获取所有字段
-    const entityFields = new Set([
-      'id',
-      'url',
-      'remark',
-      'filename',
-      'split_time',
-      'split_size',
-      'upload_id',
-      'status',
-      'format',
-      'time_range',
-      'excluded_keywords',
-      'preprocessor',
-      'segment_processor',
-      'downloaded_processor',
-      'postprocessor',
-      'opt_args',
-      'override',
-    ])
 
     if (values) {
-      const isPlainObject = (val: any): val is Record<string, any> =>
-        Boolean(val) && typeof val === 'object' && !Array.isArray(val)
-      const valuesEqual = (a: any, b: any): boolean => {
-        if (a === b) return true
-        if (a == null || b == null || typeof a !== typeof b) return false
-        if (typeof a === 'object') {
-          try {
-            return JSON.stringify(a) === JSON.stringify(b)
-          } catch {
-            return false
-          }
-        }
-        return false
-      }
-
-      const initialOverride = isPlainObject(entity?.override) ? entity!.override : {}
-      const initialOverrideText = entity?.override ? JSON.stringify(entity.override, null, 2) : ''
-
       const nextValues = { ...values }
       const rawOverrideText = nextValues.override_text
       delete nextValues.override_text
@@ -153,38 +219,80 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
       }
 
       const overrideConfig: Record<string, any> = { ...baseOverride }
+      const touchedFields = touchedFieldsRef.current
+      const touchedUserFields = touchedUserFieldsRef.current
+
+      const candidateKeys = new Set<string>()
       Object.keys(nextValues).forEach(key => {
-        if (!entityFields.has(key)) {
-          const val = nextValues[key]
-          const origVal = initialOverride[key]
-          if (isPlainObject(val)) {
-            const existing = isPlainObject(overrideConfig[key]) ? overrideConfig[key] : {}
-            const origObj = isPlainObject(origVal) ? origVal : {}
-            const merged: Record<string, any> = { ...existing }
-            Object.entries(val).forEach(([subKey, subVal]) => {
-              if (overrideTextChanged && valuesEqual(subVal, origObj[subKey])) {
-                return
-              }
-              if (subVal !== undefined && subVal !== null && subVal !== '') {
-                merged[subKey] = subVal
-              } else {
-                delete merged[subKey]
-              }
-            })
-            if (Object.keys(merged).length > 0) {
-              overrideConfig[key] = merged
-            } else {
-              delete overrideConfig[key]
+        if (!ENTITY_FIELDS.has(key)) candidateKeys.add(key)
+      })
+      touchedFields.forEach(key => {
+        if (!ENTITY_FIELDS.has(key)) candidateKeys.add(key)
+      })
+      if (touchedUserFields.size > 0) {
+        candidateKeys.add('user')
+      }
+
+      candidateKeys.forEach(key => {
+        const val = nextValues[key]
+        const origVal = initialOverride[key]
+        const isTouchedTop = touchedFields.has(key)
+
+        if (key === 'user') {
+          const existingUser = isPlainObject(overrideConfig.user) ? { ...overrideConfig.user } : {}
+          const nextUser = isPlainObject(val) ? val : {}
+          const origUser = isPlainObject(origVal) ? origVal : {}
+          const userSubKeys = new Set<string>(Object.keys(nextUser))
+          touchedUserFields.forEach(subKey => userSubKeys.add(subKey))
+
+          userSubKeys.forEach(subKey => {
+            const subVal = nextUser[subKey]
+            const isTouchedSub = touchedUserFields.has(subKey) || isTouchedTop
+            if (overrideTextChanged && !isTouchedSub && valuesEqual(subVal, origUser[subKey])) {
+              return
             }
-          } else if (overrideTextChanged && valuesEqual(val, origVal)) {
-            // 用户直接清空或修改了 override_text，未改动的表单旧值不再回写覆盖
-          } else if (val !== undefined && val !== null && val !== '') {
-            overrideConfig[key] = val
+            if (subVal !== undefined && subVal !== null && subVal !== '') {
+              existingUser[subKey] = subVal
+            } else if (isTouchedSub) {
+              delete existingUser[subKey]
+            }
+          })
+
+          if (Object.keys(existingUser).length > 0) {
+            overrideConfig.user = existingUser
           } else {
+            delete overrideConfig.user
+          }
+          delete nextValues.user
+          return
+        }
+
+        if (isPlainObject(val)) {
+          const existing = isPlainObject(overrideConfig[key]) ? { ...overrideConfig[key] } : {}
+          const origObj = isPlainObject(origVal) ? origVal : {}
+          Object.entries(val).forEach(([subKey, subVal]) => {
+            if (overrideTextChanged && !isTouchedTop && valuesEqual(subVal, origObj[subKey])) {
+              return
+            }
+            if (subVal !== undefined && subVal !== null && subVal !== '') {
+              existing[subKey] = subVal
+            } else if (isTouchedTop) {
+              delete existing[subKey]
+            }
+          })
+          if (Object.keys(existing).length > 0) {
+            overrideConfig[key] = existing
+          } else if (isTouchedTop) {
             delete overrideConfig[key]
           }
-          delete nextValues[key]
+        } else if (overrideTextChanged && !isTouchedTop && valuesEqual(val, origVal)) {
+          // 用户直接清空或修改了 override_text，未在之后手动修改的表单旧值不再回写覆盖
+        } else if (val !== undefined && val !== null && val !== '') {
+          overrideConfig[key] = val
+        } else if (isTouchedTop) {
+          delete overrideConfig[key]
         }
+        delete nextValues[key]
       })
       nextValues.override = overrideConfig
 
@@ -297,13 +405,17 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
         paddingRight: 10,
       }}
     >
-      <Form initValues={entity} getFormApi={formApi => (api.current = formApi)}>
+      <Form
+        initValues={mergedInitValues}
+        getFormApi={formApi => (api.current = formApi)}
+        onValueChange={handleValueChange}
+      >
         <Form.TextArea
           field="override_text"
           label="配置覆写"
           placeholder="请输入 JSON 格式的配置"
           style={{ marginBottom: 12 }}
-          initValue={entity?.override ? JSON.stringify(entity.override, null, 2) : ''}
+          initValue={initialOverrideText}
           rules={[
             { required: false },
             {
@@ -321,12 +433,17 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
           ]}
         />
         <Form.Section>
-          <Collapse defaultActiveKey={['plugin']}>
+          <Collapse keepDOM defaultActiveKey={['plugin']}>
             {downloadSettings}
             {(() => {
               const Plugin = platformSetting()
               return Plugin ? (
-                <Plugin entity={entity} list={list} initValues={entity?.override} isOverride={true} />
+                <Plugin
+                  entity={entity}
+                  list={list}
+                  initValues={initialOverride}
+                  isOverride={true}
+                />
               ) : null
             })()}
           </Collapse>

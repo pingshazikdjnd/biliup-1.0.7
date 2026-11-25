@@ -1,5 +1,6 @@
+use crate::server::core::users::DynUsersRepository;
 use crate::server::errors::{AppError, AppResult};
-use axum::extract::Query;
+use axum::extract::{Query, State};
 use axum::Json;
 use biliup::uploader::credential::login_by_cookies;
 use bytes::{Bytes, BytesMut};
@@ -47,13 +48,26 @@ pub async fn archive_pre_endpoint(
     Ok(Json(bili.archive_pre().await?))
 }
 
+async fn ensure_registered_cookie_file(
+    users_repo: &DynUsersRepository,
+    user: &str,
+) -> AppResult<()> {
+    let users = users_repo.get_users().await?;
+    if !users.iter().any(|item| item.value == user) {
+        return Err(AppError::Forbidden("unregistered cookie file".into()));
+    }
+    Ok(())
+}
+
 pub async fn get_myinfo_endpoint(
+    State(users_repo): State<DynUsersRepository>,
     Query(params): Query<HashMap<String, String>>,
 ) -> AppResult<Json<serde_json::Value>> {
     let user = params
         .get("user")
         .filter(|u| !u.is_empty())
         .ok_or_else(|| AppError::BadRequest("missing user parameter".into()))?;
+    ensure_registered_cookie_file(&users_repo, user).await?;
     let bili = login_by_cookies(user, None).await?;
     Ok(Json(bili.my_info().await?))
 }
@@ -90,7 +104,47 @@ pub async fn get_proxy_endpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_proxy_url;
+    use super::{ensure_registered_cookie_file, get_myinfo_endpoint, validate_proxy_url};
+    use crate::server::core::users::{DynUsersRepository, User, UsersRepository};
+    use crate::server::errors::AppError;
+    use async_trait::async_trait;
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct FakeUsersRepo {
+        users: Vec<User>,
+    }
+
+    #[async_trait]
+    impl UsersRepository for FakeUsersRepo {
+        async fn create_user(&self, user: User) -> anyhow::Result<User> {
+            Ok(user)
+        }
+
+        async fn get_users(&self) -> anyhow::Result<Vec<User>> {
+            Ok(self.users.iter().map(|u| User {
+                id: u.id,
+                name: u.name.clone(),
+                value: u.value.clone(),
+                platform: u.platform.clone(),
+            }).collect())
+        }
+
+        async fn delete_user(&self, _id: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_user(&self, user: User) -> anyhow::Result<User> {
+            Ok(user)
+        }
+
+        async fn get_user_by_id(&self, _id: i64) -> anyhow::Result<User> {
+            anyhow::bail!("not implemented")
+        }
+    }
 
     #[test]
     fn test_validate_proxy_url_allowlist() {
@@ -101,5 +155,36 @@ mod tests {
         assert!(validate_proxy_url("file:///etc/passwd").is_err());
         assert!(validate_proxy_url("http://127.0.0.1:8080/secret").is_err());
         assert!(validate_proxy_url("https://user:pass@i0.hdslb.com/a.jpg").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_myinfo_cookie_allowlist() {
+        let repo: DynUsersRepository = Arc::new(FakeUsersRepo {
+            users: vec![User {
+                id: 1,
+                name: "tester".into(),
+                value: "data/registered.json".into(),
+                platform: "bilibili".into(),
+            }],
+        });
+
+        // 缺少 user 参数 -> 400
+        let missing_res = get_myinfo_endpoint(State(repo.clone()), Query(HashMap::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_res.into_response().status(), StatusCode::BAD_REQUEST);
+
+        // 未登记的路径 -> 403 Forbidden
+        let mut bad_params = HashMap::new();
+        bad_params.insert("user".into(), "../etc/passwd".into());
+        let bad_err = get_myinfo_endpoint(State(repo.clone()), Query(bad_params))
+            .await
+            .unwrap_err();
+        assert!(matches!(bad_err, AppError::Forbidden(_)));
+        assert_eq!(bad_err.into_response().status(), StatusCode::FORBIDDEN);
+
+        // 已登记路径可通过白名单校验
+        assert!(ensure_registered_cookie_file(&repo, "data/registered.json").await.is_ok());
+        assert!(ensure_registered_cookie_file(&repo, "data/other.json").await.is_err());
     }
 }

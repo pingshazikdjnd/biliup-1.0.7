@@ -3,6 +3,7 @@ import os
 import shutil
 import smtplib
 import ssl
+import tempfile
 import time
 import unittest
 from email import message_from_string
@@ -21,13 +22,19 @@ from biliup.common.notify import (
 from biliup.engine.download import DownloadBase
 from biliup.engine.upload import UploadBase
 from biliup.engine.event import Event
-from biliup.handler import is_unrecoverable_error, process_upload, UPLOAD
+from biliup.handler import (
+    clear_notified_exhausted_files,
+    is_unrecoverable_error,
+    process_upload,
+    UPLOAD,
+)
 import biliup.uploader as uploader
 
 
 class TestPR1UploadSafety(unittest.TestCase):
     def setUp(self):
         clear_cooldown()
+        clear_notified_exhausted_files()
         self._config_snapshot = {
             k: (v if k == 'PluginInfo' else copy.deepcopy(v))
             for k, v in config.data.items()
@@ -42,6 +49,7 @@ class TestPR1UploadSafety(unittest.TestCase):
         config.data.clear()
         config.data.update(self._config_snapshot)
         clear_cooldown()
+        clear_notified_exhausted_files()
 
     # 1. biliuprs.py upload_process exitcode 检查及 Pipe try/finally 资源关闭
     @patch('multiprocessing.get_context')
@@ -107,11 +115,14 @@ class TestPR1UploadSafety(unittest.TestCase):
         self.assertTrue(is_unrecoverable_error("21001 标签不合法"))
         self.assertTrue(is_unrecoverable_error("21044 违禁分区"))
         self.assertTrue(is_unrecoverable_error("21045 参数非法"))
+        self.assertTrue(is_unrecoverable_error('{"code":-101}'))
+        self.assertTrue(is_unrecoverable_error("The system cannot find the file specified. (os error 2)"))
 
-        # 瞬态错误（应返回 False）
+        # 瞬态错误及文件名/URL含数字不应误判为不可自愈（应返回 False）
         self.assertFalse(is_unrecoverable_error(ConnectionResetError("Connection reset by peer")))
         self.assertFalse(is_unrecoverable_error(TimeoutError("Read timed out")))
         self.assertFalse(is_unrecoverable_error("502 Bad Gateway"))
+        self.assertFalse(is_unrecoverable_error(RuntimeError("upload failed for clip_21001_room-101.flv: 502 Bad Gateway")))
         self.assertFalse(is_unrecoverable_error(None))
 
     # 4. handler.py process_upload: 子进程退出或上传失败绝不调用 uploaded() 删录像
@@ -344,10 +355,11 @@ class TestPR1UploadSafety(unittest.TestCase):
 
         downloader.run = fake_run_above
         with patch('biliup.engine.download.SessionLocal'):
-            downloader.start()
+            normal_info = downloader.start()
         self.assertEqual(above_runs, 3)
+        self.assertFalse(normal_info['disk_soft_triggered'])
 
-        # 测试 8.3: 软水位低于阈值时 start 循环提前 break
+        # 测试 8.3: 软水位低于阈值时 start 循环提前 break 且标记 disk_soft_triggered=True
         # 配置软水位 10GB，当前剩余 6GB -> run() 一次后检测到软水位不足，主动 break
         mock_disk_usage.return_value = Usage(total=100 * 1024**3, used=94 * 1024**3, free=6 * 1024**3)
 
@@ -362,9 +374,10 @@ class TestPR1UploadSafety(unittest.TestCase):
         with patch('biliup.engine.download.SessionLocal'):
             stream_info = downloader.start()
 
-        # 仅运行了一次就主动 break，未进入死循环
+        # 仅运行了一次就主动 break，未进入死循环，且返回 disk_soft_triggered=True
         self.assertEqual(run_count, 1)
         self.assertEqual(stream_info['name'], "test_streamer")
+        self.assertTrue(stream_info['disk_soft_triggered'])
 
         # 测试 8.4: 软水位检测抛出 OSError 时不中断 start() 及 download_success_callback()
         mock_disk_usage.side_effect = OSError("disk stats unavailable")
@@ -453,6 +466,179 @@ class TestPR1UploadSafety(unittest.TestCase):
         mock_send_notify.assert_called_once()
         self.assertEqual(mock_send_notify.call_args.kwargs['error_type'], 'max_upload_limit_reached')
         self.assertIn('3/3', mock_send_notify.call_args.kwargs['content'])
+
+    # 11. 软水位切稿 (disk_soft_triggered=True) 应穿透 delay 立即上传并删录像
+    @patch('biliup.handler.time.sleep')
+    @patch('biliup.handler.uploaded')
+    @patch('biliup.handler.upload')
+    @patch('biliup.handler.UploadBase.file_list')
+    @patch('biliup.handler.UploadBase.get_max_upload_count')
+    def test_disk_soft_triggered_skips_delay_and_uploads(
+        self, mock_get_count, mock_file_list, mock_upload, mock_uploaded, mock_sleep
+    ):
+        mock_file = UploadBase.FileInfo(video='soft_cut.mp4', danmaku=None)
+        mock_file_list.return_value = [mock_file]
+        mock_get_count.return_value = 0
+        mock_upload.return_value = [mock_file]
+
+        config['delay'] = 30
+        context['url_upload_count']['http://test.com'] = 0
+        context['PluginInfo'] = MagicMock()
+        # 模拟新一场录制已经抢占 url_status=1
+        context['PluginInfo'].url_status = {'http://test.com': 1}
+
+        stream_info = {
+            'name': 'test_streamer',
+            'url': 'http://test.com',
+            'title': 'test',
+            'disk_soft_triggered': True,
+        }
+        process_upload(Event(UPLOAD, (stream_info,)))
+
+        mock_sleep.assert_not_called()
+        mock_upload.assert_called_once()
+        mock_uploaded.assert_called_once_with('test_streamer', None, [mock_file])
+
+    # 12. -101 熔断后保留文件连续巡检不重复发 max_upload_limit_reached，清空新文件失败可再告警
+    @patch('biliup.handler.send_notification')
+    @patch('biliup.handler.uploaded')
+    @patch('biliup.handler.upload')
+    @patch('biliup.handler.UploadBase.file_list')
+    @patch('biliup.handler.UploadBase.get_max_upload_count')
+    def test_unrecoverable_circuit_break_no_repeat_alert_until_file_cleared(
+        self, mock_get_count, mock_file_list, mock_upload, mock_uploaded, mock_send_notify
+    ):
+        file_a = UploadBase.FileInfo(video='bad_a.mp4', danmaku=None)
+        file_b = UploadBase.FileInfo(video='bad_b.mp4', danmaku=None)
+        config['max_upload_limit'] = 5
+        context['url_upload_count']['http://test.com'] = 0
+        context['file_upload_count'] = {'bad_a.mp4': 0}
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {'http://test.com': 2}
+
+        mock_get_count.return_value = 0
+        mock_file_list.return_value = [file_a]
+        mock_upload.side_effect = RuntimeError("code: -101, message: 账号未登录")
+
+        stream_info = {'name': 'test_streamer', 'url': 'http://test.com', 'title': 'test'}
+
+        # 第 1 次触发 -101 熔断并告警
+        process_upload(Event(UPLOAD, (stream_info,)))
+        self.assertEqual(mock_send_notify.call_count, 1)
+        self.assertEqual(mock_send_notify.call_args.kwargs['error_type'], 'unrecoverable_upload_error')
+
+        # 第 2 次巡检，磁盘仍留有 bad_a.mp4，不得重复发送 max_upload_limit_reached
+        process_upload(Event(UPLOAD, (stream_info,)))
+        self.assertEqual(mock_send_notify.call_count, 1)
+        mock_uploaded.assert_not_called()
+
+        # 磁盘文件清空，自动清理已告警记录
+        mock_file_list.return_value = []
+        process_upload(Event(UPLOAD, (stream_info,)))
+        self.assertEqual(mock_send_notify.call_count, 1)
+
+        # 新文件出现并触发失败，可以正常再次告警
+        context['file_upload_count'] = {'bad_b.mp4': 0}
+        mock_file_list.return_value = [file_b]
+        process_upload(Event(UPLOAD, (stream_info,)))
+        self.assertEqual(mock_send_notify.call_count, 2)
+        self.assertEqual(mock_send_notify.call_args.kwargs['error_type'], 'unrecoverable_upload_error')
+
+    # 13. max_upload_limit=None 和 delay=None 且 url 缺失于 url_status 时不抛 TypeError/KeyError
+    @patch('biliup.handler.uploaded')
+    @patch('biliup.handler.upload')
+    @patch('biliup.handler.UploadBase.file_list')
+    @patch('biliup.handler.UploadBase.get_max_upload_count')
+    def test_none_max_upload_limit_and_none_delay_defaults(
+        self, mock_get_count, mock_file_list, mock_upload, mock_uploaded
+    ):
+        mock_file = UploadBase.FileInfo(video='ok.mp4', danmaku=None)
+        mock_file_list.return_value = [mock_file]
+        mock_get_count.return_value = 0
+        mock_upload.return_value = [mock_file]
+
+        config['max_upload_limit'] = None
+        config['delay'] = None
+        context['url_upload_count']['http://missing.com'] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {}
+
+        stream_info = {'name': 'test_streamer', 'url': 'http://missing.com', 'title': 'test'}
+        process_upload(Event(UPLOAD, (stream_info,)))
+
+        mock_upload.assert_called_once()
+        mock_uploaded.assert_called_once_with('test_streamer', None, [mock_file])
+
+    # 14. upload() 返回 None（并发占用）时不触发假成功 Webhook，并回退 file_upload_count
+    @patch('requests.post')
+    @patch('biliup.handler.uploaded')
+    @patch('biliup.handler.upload')
+    @patch('biliup.handler.UploadBase.file_list')
+    def test_upload_none_rolls_back_file_count_and_skips_webhook(
+        self, mock_file_list, mock_upload, mock_uploaded, mock_requests_post
+    ):
+        orig_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.chdir(tmpdir)
+            try:
+                video_name = 'concurrent_claimed.mp4'
+                with open(video_name, 'wb') as f:
+                    f.write(b'video')
+                mock_file = UploadBase.FileInfo(video=video_name, danmaku=None)
+                mock_file_list.return_value = [mock_file]
+                mock_upload.return_value = None
+
+                config['max_upload_limit'] = 5
+                config['streamers'] = {
+                    'test_streamer': {
+                        'postprocessor': [{'webhook': 'http://my-webhook.test/api'}]
+                    }
+                }
+                context['url_upload_count']['http://test.com'] = 0
+                context['file_upload_count'] = {video_name: 0}
+                context['PluginInfo'] = MagicMock()
+                context['PluginInfo'].url_status = {'http://test.com': 2}
+
+                stream_info = {'name': 'test_streamer', 'url': 'http://test.com', 'title': 'test'}
+                process_upload(Event(UPLOAD, (stream_info,)))
+
+                mock_upload.assert_called_once()
+                mock_uploaded.assert_not_called()
+                mock_requests_post.assert_not_called()
+                self.assertEqual(context['file_upload_count'][video_name], 0)
+            finally:
+                os.chdir(orig_cwd)
+
+    # 15. notify.py 清洗 SMTP 首尾空白并支持逗号/分号多收件人
+    @patch('smtplib.SMTP_SSL')
+    def test_notify_email_strips_whitespace_and_multiple_recipients(self, mock_smtp_ssl_cls):
+        mock_ssl_inst = MagicMock()
+        mock_smtp_ssl_cls.return_value = mock_ssl_inst
+
+        config['notify_email_enabled'] = True
+        config['notify_smtp_port'] = 465
+        config['notify_smtp_host'] = '  smtp.qq.com  '
+        config['notify_smtp_user'] = ' a@qq.com '
+        config['notify_smtp_pass'] = ' secret_pass '
+        config['notify_email_to'] = ' b@qq.com, c@qq.com ; d@qq.com '
+
+        clear_cooldown()
+        ok = send_notification("多收件人标题", "正文", streamer_name="主播M", error_type="test", sync=True)
+        self.assertTrue(ok)
+        mock_smtp_ssl_cls.assert_called_once()
+        self.assertEqual(mock_smtp_ssl_cls.call_args.args, ('smtp.qq.com', 465))
+        mock_ssl_inst.login.assert_called_once_with('a@qq.com', 'secret_pass')
+        mock_ssl_inst.sendmail.assert_called_once()
+        from_addr, recipients, raw_msg = mock_ssl_inst.sendmail.call_args.args
+        self.assertEqual(from_addr, 'a@qq.com')
+        self.assertEqual(recipients, ['b@qq.com', 'c@qq.com', 'd@qq.com'])
+        sent_msg = message_from_string(raw_msg)
+        self.assertEqual(sent_msg['To'], 'b@qq.com, c@qq.com, d@qq.com')
+
+        # 仅空白字符串应判定为配置不完整并跳过发送
+        config['notify_email_to'] = '  , ;  '
+        clear_cooldown()
+        self.assertFalse(send_notification("空收件人", "正文", streamer_name="主播M", error_type="test", sync=True))
 
 
 if __name__ == '__main__':

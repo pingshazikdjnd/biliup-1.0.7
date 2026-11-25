@@ -1,7 +1,10 @@
 import asyncio
 import base64
+import concurrent.futures
 import copy
+import json
 import os
+import stat
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -58,6 +61,7 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
         os.chdir(self._tmpdir.name)
 
     async def asyncTearDown(self):
+        web_mod._shutdown_qr_pool()
         os.chdir(self._orig_cwd)
         self._tmpdir.cleanup()
         web_mod.set_global_password(self._orig_password)
@@ -373,6 +377,49 @@ class TestPR2WebAuth(unittest.IsolatedAsyncioTestCase):
         with patch.object(web_mod, 'ClientSession', make_session_cls(side_effect=asyncio.TimeoutError())):
             r_timeout = await client.get(f'/bili/proxy?url={quote(target, safe="")}', headers=headers)
             self.assertEqual(r_timeout.status, 504)
+
+        # 5. 不对含 %2F / %25 的合法 URL 做二次解码
+        encoded_target = 'https://i0.hdslb.com/bfs/face/a%2Fb%2520c.jpg?sign=x%26y%3Dz'
+        encoded_resp = _FakeUpstreamResp(status=200, resp_headers={}, chunks=[b'ok'])
+        with patch.object(web_mod, 'ClientSession', make_session_cls(encoded_resp)):
+            r_encoded = await client.get(f'/bili/proxy?url={quote(encoded_target, safe="")}', headers=headers)
+            self.assertEqual(r_encoded.status, 200)
+        self.assertEqual(recorded_get_calls[-1][0], encoded_target)
+
+    async def test_qrcode_login_atomic_overwrite_and_cleanup(self):
+        client = await self._make_client(password=None)
+        os.makedirs('data', exist_ok=True)
+        target_file = os.path.join('data', '123456.json')
+        with open(target_file, 'w', encoding='utf-8') as f:
+            f.write('{"old": true}')
+
+        new_payload = json.dumps({
+            'token_info': {'mid': 123456, 'access_token': 'new_tok'},
+            'cookie_info': {'cookies': []},
+        })
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool, \
+             patch.object(web_mod, '_get_qr_pool', return_value=pool):
+            with patch.object(web_mod.stream_gears, 'login_by_qrcode', return_value=new_payload):
+                resp = await client.post('/v1/login_by_qrcode', json={'auth_code': 'abc'})
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(await resp.json(), {'filename': 'data/123456.json'})
+
+            with open(target_file, 'r', encoding='utf-8') as f:
+                self.assertEqual(f.read(), new_payload)
+            self.assertEqual([n for n in os.listdir('data') if n.endswith('.tmp')], [])
+            if os.name != 'nt':
+                self.assertEqual(stat.S_IMODE(os.stat(target_file).st_mode), 0o600)
+
+            # 写入/替换失败时保留原文件并清理 .tmp 残留
+            with patch.object(web_mod.stream_gears, 'login_by_qrcode', return_value='{"token_info": {"mid": 123456}, "new": 1}'):
+                with patch.object(web_mod.os, 'replace', side_effect=OSError('disk full')):
+                    err_resp = await client.post('/v1/login_by_qrcode', json={'auth_code': 'abc'})
+                    self.assertEqual(err_resp.status, 400)
+
+            with open(target_file, 'r', encoding='utf-8') as f:
+                self.assertEqual(f.read(), new_payload)
+            self.assertEqual([n for n in os.listdir('data') if n.endswith('.tmp')], [])
 
 
 if __name__ == '__main__':

@@ -10,6 +10,7 @@ import multiprocessing
 import os
 import pathlib
 import concurrent.futures
+import tempfile
 import threading
 import time
 
@@ -21,7 +22,7 @@ from aiohttp import web, ClientTimeout
 from aiohttp.client import ClientSession
 from sqlalchemy import select, update
 from sqlalchemy.exc import NoResultFound, MultipleResultsFound
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 
 import biliup.common.reload
 from biliup.config import config
@@ -226,7 +227,7 @@ async def cookie_login(request):
     if config.data.get("toml"):
         logger.debug("trying to login by cookie")
         try:
-            await asyncio.to_thread(stream_gears.login_by_cookies)
+            await asyncio.to_thread(stream_gears.login_by_cookies, 'cookies.json', None)
         except Exception:
             logger.exception("cookie_login failed (toml)")
             return web.HTTPBadRequest(text="login failed")
@@ -338,8 +339,28 @@ async def qrcode_login(request):
             raise ValueError("invalid mid")
         os.makedirs('data', exist_ok=True)
         filename = f'data/{mid}.json'
-        with open(filename, 'w', encoding='utf-8') as file:
-            file.write(res)
+        fd, tmp_path = tempfile.mkstemp(prefix=f'.{mid}.json.', suffix='.tmp', dir='data')
+        try:
+            if os.name != 'nt':
+                os.chmod(tmp_path, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as file:
+                fd = None
+                file.write(res)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(tmp_path, filename)
+            tmp_path = None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
         return web.json_response({
             'filename': filename
         })
@@ -785,7 +806,7 @@ async def proxy(request):
     raw_url = request.query.get('url')
     if not raw_url:
         return web.HTTPBadRequest(reason="Missing url parameter")
-    url = unquote(raw_url)
+    url = raw_url
     parsed_url = urlparse(url)
 
     if (

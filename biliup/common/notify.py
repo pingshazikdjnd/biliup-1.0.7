@@ -1,4 +1,5 @@
 import logging
+import re
 import smtplib
 import ssl
 import threading
@@ -34,13 +35,18 @@ def _send_email_sync(title: str, content: str, streamer_name: str, error_type: s
     if not is_notify_enabled():
         return False
 
-    host = config.get('notify_smtp_host')
+    raw_host = config.get('notify_smtp_host')
+    host = '' if raw_host is None else str(raw_host).strip()
     port = config.get('notify_smtp_port', 465)
-    user = config.get('notify_smtp_user')
-    password = config.get('notify_smtp_pass')
-    to_addr = config.get('notify_email_to')
+    raw_user = config.get('notify_smtp_user')
+    user = '' if raw_user is None else str(raw_user).strip()
+    raw_password = config.get('notify_smtp_pass')
+    password = '' if raw_password is None else str(raw_password).strip()
+    raw_to_addr = config.get('notify_email_to')
+    to_addr = '' if raw_to_addr is None else str(raw_to_addr).strip()
+    recipients = [addr.strip() for addr in re.split(r'[,;]', to_addr) if addr.strip()]
 
-    if not (host and user and password and to_addr):
+    if not (host and user and password and recipients):
         logger.warning("邮件告警已开启，但 SMTP 配置信息不完整，跳过发送")
         return False
 
@@ -60,9 +66,10 @@ def _send_email_sync(title: str, content: str, streamer_name: str, error_type: s
 
     server: Optional[smtplib.SMTP] = None
     try:
+        to_header = ', '.join(recipients)
         msg = MIMEText(content, 'plain', 'utf-8')
         msg['From'] = formataddr(('biliup', user))
-        msg['To'] = to_addr
+        msg['To'] = to_header
         msg['Subject'] = Header(title, 'utf-8')
 
         ssl_context = ssl.create_default_context()
@@ -75,8 +82,8 @@ def _send_email_sync(title: str, content: str, streamer_name: str, error_type: s
             server.ehlo()
 
         server.login(user, password)
-        server.sendmail(user, [to_addr], msg.as_string())
-        logger.info(f"邮件告警发送成功: [{title}] -> {to_addr}")
+        server.sendmail(user, recipients, msg.as_string())
+        logger.info(f"邮件告警发送成功: [{title}] -> {to_header}")
         return True
     except Exception as e:
         logger.error(f"邮件告警发送异常: {e}")

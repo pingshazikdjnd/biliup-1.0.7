@@ -1,13 +1,15 @@
 import json
 import logging
 import os
+import re
 import shutil
 import requests
 import subprocess
+import threading
 import time
 from functools import reduce
 from pathlib import Path
-from typing import List, Union
+from typing import Dict, List, Set, Union
 
 from biliup.config import config
 from .app import event_manager, context, pending_download_urls
@@ -26,6 +28,38 @@ DOWNLOADED = 'downloaded'
 UPLOAD = 'upload'
 UPLOADED = 'uploaded'
 logger = logging.getLogger('biliup')
+
+_notified_exhausted_lock = threading.Lock()
+_notified_exhausted_files: Dict[str, Set[str]] = {}
+
+
+def clear_notified_exhausted_files():
+    """清理已告警的耗尽/熔断文件记录（主要供测试使用）"""
+    with _notified_exhausted_lock:
+        _notified_exhausted_files.clear()
+
+
+def _mark_notified_exhausted(
+    name: str,
+    file_list: List[UploadBase.FileInfo],
+    max_upload_limit: int,
+    *,
+    all_files: bool = False,
+) -> None:
+    if all_files:
+        exhausted_videos = {item.video for item in file_list}
+    else:
+        with NamedLock("file_upload_count"):
+            file_upload_count = context.setdefault('file_upload_count', {})
+            exhausted_videos = {
+                item.video for item in file_list
+                if file_upload_count.get(item.video, 0) >= max_upload_limit
+            }
+        if not exhausted_videos:
+            exhausted_videos = {item.video for item in file_list}
+    if exhausted_videos:
+        with _notified_exhausted_lock:
+            _notified_exhausted_files.setdefault(name, set()).update(exhausted_videos)
 
 
 # @event_manager.register(CHECK, block='Asynchronous3')
@@ -105,6 +139,11 @@ def processed(stream_info):
     yield Event(UPLOAD, (stream_info,))
 
 
+_UNRECOVERABLE_CODE_RE = re.compile(
+    r'(?:^|[\s{,"\'(])(?:(?:error\s*)?code["\']?\s*[:=]\s*)?(?:-101|21001|21015|21016|21044|21045)(?=$|[\s},)"\':;，。])'
+)
+
+
 def is_unrecoverable_error(e: Union[Exception, str, None]) -> bool:
     if e is None:
         return False
@@ -112,7 +151,6 @@ def is_unrecoverable_error(e: Union[Exception, str, None]) -> bool:
         return True
     err_str = str(e).lower()
     unrecoverable_patterns = [
-        "-101",
         "未登录",
         "cookie失效",
         "cookie 失效",
@@ -124,13 +162,12 @@ def is_unrecoverable_error(e: Union[Exception, str, None]) -> bool:
         "文件不存在",
         "filenotfound",
         "no such file",
-        "21015",
-        "21016",
-        "21001",
-        "21044",
-        "21045",
+        "cannot find the file",
+        "os error 2",
     ]
-    return any(p in err_str for p in unrecoverable_patterns)
+    if any(p in err_str for p in unrecoverable_patterns):
+        return True
+    return bool(_UNRECOVERABLE_CODE_RE.search(err_str))
 
 
 @event_manager.register(UPLOAD, block='Asynchronous2')
@@ -150,10 +187,23 @@ def process_upload(stream_info):
     try:
         raw_file_list = UploadBase.file_list(name)
         if len(raw_file_list) <= 0:
+            with _notified_exhausted_lock:
+                _notified_exhausted_files.pop(name, None)
             logger.debug("无需上传")
             return
 
-        max_upload_limit = config.get("max_upload_limit", 999)
+        current_videos = {item.video for item in raw_file_list}
+        with _notified_exhausted_lock:
+            existing_notified = _notified_exhausted_files.get(name)
+            if existing_notified is not None:
+                pruned = existing_notified & current_videos
+                if pruned:
+                    _notified_exhausted_files[name] = pruned
+                else:
+                    _notified_exhausted_files.pop(name, None)
+
+        raw_limit = config.get("max_upload_limit", 999)
+        max_upload_limit = 999 if raw_limit is None else int(raw_limit)
         with NamedLock("file_upload_count"):
             file_upload_count = context.setdefault('file_upload_count', {})
             file_list = [
@@ -162,23 +212,30 @@ def process_upload(stream_info):
             ]
         file_count = len(file_list)
         if file_count <= 0:
-            logger.warning(f"上传次数达到阈值: {name}")
-            send_notification(
-                title=f"biliup 上传达到重试上限告警: {name}",
-                content=f"主播: {name}\nURL: {url}\n待传文件均已达到重试阈值 ({max_upload_limit})，已停止自动重试。",
-                streamer_name=name,
-                error_type="max_upload_limit_reached"
-            )
+            with _notified_exhausted_lock:
+                newly_exhausted = current_videos - _notified_exhausted_files.get(name, set())
+            if newly_exhausted:
+                logger.warning(f"上传次数达到阈值: {name}")
+                send_notification(
+                    title=f"biliup 上传达到重试上限告警: {name}",
+                    content=f"主播: {name}\nURL: {url}\n待传文件均已达到重试阈值 ({max_upload_limit})，已停止自动重试。",
+                    streamer_name=name,
+                    error_type="max_upload_limit_reached"
+                )
+                with _notified_exhausted_lock:
+                    _notified_exhausted_files.setdefault(name, set()).update(newly_exhausted)
+            else:
+                logger.debug(f"待传文件均已达到重试阈值且已告警过，跳过重复告警: {name}")
             return
 
         # 上传延迟检测
         url_status = context['PluginInfo'].url_status
-        if url_status[url] != 2:
-            delay = int(config.get('delay', 0))
+        if not stream_info.get('disk_soft_triggered') and url_status.get(url) != 2:
+            delay = int(config.get('delay') or 0)
             if delay:
                 logger.info(f'{name} -> {url} {delay}s 后检测是否上传')
                 time.sleep(delay)
-                if url_status[url] == 1:
+                if url_status.get(url) == 1:
                     # 上传延迟检测，启用的话会在一段时间后检测是否存在下载任务，若存在则跳过本次上传
                     return logger.info(f'{name} -> {url} 存在下载任务, 跳过本次上传')
 
@@ -205,6 +262,13 @@ def process_upload(stream_info):
                 res_files = upload(stream_info, target_files=[item.video for item in file_list])
                 if res_files:
                     filelist = res_files
+                else:
+                    logger.info(f"{name} 未实际占用待传文件，回退本批重试计数")
+                    with NamedLock("file_upload_count"):
+                        file_upload_count = context.setdefault('file_upload_count', {})
+                        for item in file_list:
+                            if item.video in file_upload_count:
+                                file_upload_count[item.video] = max(0, file_upload_count[item.video] - 1)
             except Exception as e:
                 expt = e
                 logger.error(f"{name} 上传异常: {e}")
@@ -220,6 +284,7 @@ def process_upload(stream_info):
                         streamer_name=name,
                         error_type="unrecoverable_upload_error"
                     )
+                    _mark_notified_exhausted(name, file_list, max_upload_limit, all_files=True)
                 elif upload_count + 1 >= max_upload_limit:
                     logger.warning(f"上传次数达到阈值: {name}")
                     send_notification(
@@ -228,9 +293,10 @@ def process_upload(stream_info):
                         streamer_name=name,
                         error_type="max_upload_limit_reached"
                     )
+                    _mark_notified_exhausted(name, file_list, max_upload_limit)
             finally:
                 post_processor = config['streamers'].get(name, {}).get("postprocessor", None)
-                if post_processor is not None:
+                if post_processor is not None and (expt is not None or filelist):
                     for processor in post_processor:
                         if isinstance(processor, dict) and processor.get('webhook') is not None:
                             try:
@@ -238,7 +304,7 @@ def process_upload(stream_info):
                                 res = requests.post(
                                     url = processor.get('webhook'),
                                     json = {
-                                        "stream_info": {**stream_info, **config['streamers'][stream_info['name']]},
+                                        "stream_info": {**stream_info, **config['streamers'].get(stream_info['name'], {})},
                                         "caught_error": str(expt) if expt else ""
                                     },
                                     timeout = 15
@@ -257,6 +323,7 @@ def process_upload(stream_info):
                 streamer_name=name,
                 error_type="max_upload_limit_reached"
             )
+            _mark_notified_exhausted(name, file_list, max_upload_limit)
 
         if filelist:
             uploaded(name, stream_info.get('live_cover_path'), filelist)

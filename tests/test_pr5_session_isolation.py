@@ -376,10 +376,11 @@ class TestPR5SessionIsolation(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(client.close)
 
         event_loop_tid = threading.get_ident()
-        seen_login_tids = []
+        seen_login_calls = []
 
-        def _fake_sg_login():
-            seen_login_tids.append(threading.get_ident())
+        def _fake_sg_login(file, proxy):
+            seen_login_calls.append((threading.get_ident(), file, proxy))
+            return True
 
         self._register_cookie_paths(path_a)
         config.data['toml'] = True
@@ -397,8 +398,9 @@ class TestPR5SessionIsolation(unittest.IsolatedAsyncioTestCase):
 
             resp_login = await client.get('/api/login_by_cookie')
             self.assertEqual(resp_login.status, 200)
-            self.assertEqual(len(seen_login_tids), 1)
-            self.assertNotEqual(seen_login_tids[0], event_loop_tid)
+            self.assertEqual(len(seen_login_calls), 1)
+            self.assertNotEqual(seen_login_calls[0][0], event_loop_tid)
+            self.assertEqual((seen_login_calls[0][1], seen_login_calls[0][2]), ('cookies.json', None))
 
 
 if __name__ == '__main__':

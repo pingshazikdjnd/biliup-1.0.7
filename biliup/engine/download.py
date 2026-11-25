@@ -401,6 +401,7 @@ class DownloadBase(ABC):
         with SessionLocal() as db:
             self.database_row_id = add_stream_info(db, self.fname, self.url, start_time)  # 返回数据库中此行记录的 id
         ret = True
+        disk_soft_triggered = False
         while ret:
             # 下载结果
             try:
@@ -440,6 +441,7 @@ class DownloadBase(ABC):
                                 f"{self.plugin_msg}: 磁盘剩余空间 ({free_gb:.2f} GB) 低于软水位阈值 ({disk_upload_threshold_gb} GB)，"
                                 f"提前结束本轮录制会话以立即触发上传与清理"
                             )
+                            disk_soft_triggered = True
                             break
 
         self.download_cover(
@@ -471,6 +473,7 @@ class DownloadBase(ABC):
             'live_cover_path': self.live_cover_path,
             'is_download': self.is_download,
             'platform': self.platform,
+            'disk_soft_triggered': disk_soft_triggered,
         }
         return stream_info
 

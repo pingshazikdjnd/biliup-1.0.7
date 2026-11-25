@@ -18,8 +18,8 @@ pub enum AppError {
     Unauthorized,
     #[error("username or password is incorrect")]
     InvalidLoginAttempt,
-    #[error("user does not have privilege to access this resource")]
-    Forbidden,
+    #[error("{0}")]
+    Forbidden(String),
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
@@ -60,6 +60,7 @@ impl IntoResponse for AppError {
                 StatusCode::BAD_REQUEST,
                 Self::InvalidLoginAttempt.to_string(),
             ),
+            Self::Forbidden(err) => (StatusCode::FORBIDDEN, err),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, Self::Unauthorized.to_string()),
             Self::AnyhowError(err) => 'e: {
                 for cause in err.chain() {

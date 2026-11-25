@@ -136,6 +136,7 @@ fn download_with_callback(
 }
 
 #[pyfunction]
+#[pyo3(signature = (file = "cookies.json".to_string(), proxy = None))]
 fn login_by_cookies(py: Python<'_>, file: String, proxy: Option<String>) -> PyResult<bool> {
     py.allow_threads(|| {
         let rt = tokio::runtime::Runtime::new()
