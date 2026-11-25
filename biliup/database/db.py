@@ -3,7 +3,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import logging
 
@@ -63,18 +63,54 @@ def get_stream_info(db: Session, name: str) -> dict:
     return {}
 
 
-def get_stream_info_by_filename(db: Session, filename: str) -> dict:
+def get_stream_info_by_filename(db: Session, filename: str, streamer_name: Optional[str] = None) -> dict:
     """通过文件名获取下载信息, 若不存在则返回空字典"""
     try:
-        # stream_info = FileList.get(FileList.file == filename).streamer_info
-        stmt = select(FileList).where(FileList.file == filename)
-        stream_info = db.execute(stmt).scalar_one().streamerinfo
-        stream_info_dict = stream_info.as_dict()
+        base_name = os.path.basename(filename) if filename else ''
+        exact_candidates = [filename] if filename == base_name else [filename, base_name]
+        stmt = (
+            select(FileList)
+            .join(FileList.streamerinfo)
+            .where(FileList.file.in_(exact_candidates))
+        )
+        if streamer_name:
+            stmt = stmt.where(StreamerInfo.name == streamer_name)
+        stmt = stmt.order_by(desc(FileList.id))
+        file_row = db.execute(stmt).scalars().first()
+
+        if file_row is None and base_name:
+            stem_input = base_name[:-5] if base_name.endswith('.part') else base_name
+            target_stem = Path(stem_input).stem
+            if target_stem:
+                escaped_stem = (
+                    target_stem.replace('\\', '\\\\')
+                    .replace('%', '\\%')
+                    .replace('_', '\\_')
+                )
+                stem_stmt = (
+                    select(FileList)
+                    .join(FileList.streamerinfo)
+                    .where(FileList.file.like(f"%{escaped_stem}.%", escape="\\"))
+                )
+                if streamer_name:
+                    stem_stmt = stem_stmt.where(StreamerInfo.name == streamer_name)
+                stem_stmt = stem_stmt.order_by(desc(FileList.id))
+                for candidate in db.execute(stem_stmt).scalars():
+                    cand_base = os.path.basename(candidate.file or '')
+                    cand_name = cand_base[:-5] if cand_base.endswith('.part') else cand_base
+                    if Path(cand_name).stem == target_stem:
+                        file_row = candidate
+                        break
+
+        if file_row is None:
+            return {}
+        stream_info_dict = file_row.streamerinfo.as_dict()
     except Exception as e:
         logger.debug(f"{e}")
         return {}
     stream_info_dict = {key: value for key, value in stream_info_dict.items() if value}  # 清除字典中的空元素
-    stream_info_dict["date"] = datetime_to_struct_time(stream_info_dict["date"])  # 将开播时间转回 struct_time 类型
+    if "date" in stream_info_dict and stream_info_dict["date"] is not None:
+        stream_info_dict["date"] = datetime_to_struct_time(stream_info_dict["date"])  # 将开播时间转回 struct_time 类型
     return stream_info_dict
 
 

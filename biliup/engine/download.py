@@ -677,6 +677,13 @@ class DownloadBase(ABC):
                 self.__download_segment_callback(f'{fmt_file_name}.{self.suffix}')
                 return True
             else:
+                part_path = f'{fmt_file_name}.{self.suffix}.part'
+                if self.database_row_id and os.path.isfile(part_path) and os.path.getsize(part_path) > 0:
+                    try:
+                        with SessionLocal() as db:
+                            update_file_list(db, self.database_row_id, f'{fmt_file_name}.{self.suffix}')
+                    except Exception:
+                        logger.warning(f'{self.plugin_msg}: 登记中断分段到数据库失败 ({part_path})', exc_info=True)
                 return False
         finally:
             try:

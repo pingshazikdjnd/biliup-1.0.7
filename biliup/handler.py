@@ -14,7 +14,7 @@ from typing import Dict, List, Set, Union
 from biliup.config import config
 from .app import event_manager, context, pending_download_urls
 from .common.notify import send_notification
-from .common.tools import NamedLock, processor
+from .common.tools import NamedLock, get_file_create_timestamp, processor
 from .common.util import check_timerange
 from .database.db import get_stream_info_by_filename, SessionLocal
 from .downloader import biliup_download
@@ -188,6 +188,83 @@ def is_unrecoverable_error(e: Union[Exception, str, None]) -> bool:
     return bool(_UNRECOVERABLE_CODE_RE.search(err_str))
 
 
+def _date_sort_key(date_val):
+    if isinstance(date_val, time.struct_time) or (isinstance(date_val, tuple) and len(date_val) >= 6):
+        return tuple(date_val[:6])
+    return None
+
+
+def _pick_earlier_date(current_date, candidate_date):
+    cur_key = _date_sort_key(current_date)
+    cand_key = _date_sort_key(candidate_date)
+    if cand_key is None:
+        return current_date
+    if cur_key is None or cand_key < cur_key:
+        return candidate_date
+    return current_date
+
+
+def _get_file_create_struct_time(file_path: str):
+    if not file_path or not os.path.exists(file_path):
+        return None
+    try:
+        return time.localtime(get_file_create_timestamp(file_path))
+    except (OSError, ValueError) as e:
+        logger.debug(f"获取文件创建时间失败 ({file_path}): {e}")
+        return None
+
+
+def _resolve_upload_stream_info(stream_info: dict, name: str, file_list: List[UploadBase.FileInfo]) -> dict:
+    """以首段视频对应的最早开播时间校准 date，并在标题缺失时补全数据库元数据。"""
+    if not file_list:
+        return stream_info
+
+    earliest_date = stream_info.get("date")
+    missing_title = not stream_info.get("title")
+    fallback_meta: dict = {}
+
+    try:
+        with SessionLocal() as db:
+            for idx, item in enumerate(file_list):
+                record = get_stream_info_by_filename(db, item.video, streamer_name=name)
+                if idx == 0:
+                    if record and record.get("date"):
+                        earliest_date = _pick_earlier_date(earliest_date, record["date"])
+                    else:
+                        earliest_date = _pick_earlier_date(
+                            earliest_date,
+                            _get_file_create_struct_time(item.video),
+                        )
+                if missing_title and record:
+                    for key, val in record.items():
+                        fallback_meta.setdefault(key, val)
+                    if fallback_meta.get("title"):
+                        break
+                elif not missing_title:
+                    break
+    except Exception as e:
+        logger.debug(f"反查上传元数据失败 ({name}): {e}")
+        earliest_date = _pick_earlier_date(
+            earliest_date,
+            _get_file_create_struct_time(file_list[0].video),
+        )
+
+    if missing_title:
+        merged = {**fallback_meta, **stream_info, "name": name}
+        if not merged.get("title") and fallback_meta.get("title"):
+            merged["title"] = fallback_meta["title"]
+        if not merged.get("live_cover_path") and fallback_meta.get("live_cover_path"):
+            merged["live_cover_path"] = fallback_meta["live_cover_path"]
+        if earliest_date is not None:
+            merged["date"] = earliest_date
+        formatted, _ = fmt_title_and_desc(merged)
+        stream_info.update(formatted)
+    elif earliest_date is not None:
+        stream_info["date"] = earliest_date
+
+    return stream_info
+
+
 @event_manager.register(UPLOAD, block='Asynchronous2')
 def process_upload(stream_info):
     url = stream_info['url']
@@ -259,17 +336,7 @@ def process_upload(stream_info):
                     # 上传延迟检测，启用的话会在一段时间后检测是否存在下载任务，若存在则跳过本次上传
                     return logger.info(f'{name} -> {url} 存在下载任务, 跳过本次上传')
 
-        if ("title" not in stream_info) or (not stream_info["title"]):  # 如果 data 中不存在标题, 说明下载信息已丢失, 则尝试从数据库获取
-            with SessionLocal() as db:
-                i = 0
-                # 按创建时间排序可能导致首个结果无法获取到数据
-                while i < file_count:
-                    data = get_stream_info_by_filename(db, file_list[i].video)
-                    if data:
-                        break
-                    i += 1
-            data, _ = fmt_title_and_desc({**data, "name": name})  # 如果 restart, data 中会缺失 name 项
-            stream_info.update(data)
+        stream_info = _resolve_upload_stream_info(stream_info, name, file_list)
 
         upload_count = UploadBase.get_max_upload_count(file_list)
         filelist = None
