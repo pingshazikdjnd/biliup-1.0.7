@@ -329,6 +329,7 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
         <Select.Option value="ffmpeg">ffmpeg</Select.Option>
         <Select.Option value="stream-gears">stream-gears（默认）</Select.Option>
         <Select.Option value="sync-downloader">sync-downloader（边录边传）</Select.Option>
+        <Select.Option value="mesio">mesio（FLV/HLS 时间戳修复）</Select.Option>
       </Form.Select>
 
       <Form.InputNumber

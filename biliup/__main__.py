@@ -117,11 +117,16 @@ def arg_parser():
 
 async def main(args):
     from biliup.app import event_manager
+    from biliup.engine.download import recover_stale_mesio_tmp
+
+    # 启动时删除临时文件夹，并恢复异常退出残留的 mesio 分段录像
+    shutil.rmtree('./cache/temp', ignore_errors=True)
+    try:
+        recover_stale_mesio_tmp()
+    except Exception:
+        logging.getLogger('biliup').warning('恢复残留 mesio 临时目录失败', exc_info=True)
 
     event_manager.start()
-
-    # 启动时删除临时文件夹
-    shutil.rmtree('./cache/temp', ignore_errors=True)
 
     interval = config.get('check_sourcecode', 15)
 
