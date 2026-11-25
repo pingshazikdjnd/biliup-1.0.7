@@ -45,7 +45,7 @@ def _mark_notified_exhausted(
     max_upload_limit: int,
     *,
     all_files: bool = False,
-) -> None:
+) -> Set[str]:
     if all_files:
         exhausted_videos = {item.video for item in file_list}
     else:
@@ -57,9 +57,25 @@ def _mark_notified_exhausted(
             }
         if not exhausted_videos:
             exhausted_videos = {item.video for item in file_list}
-    if exhausted_videos:
-        with _notified_exhausted_lock:
-            _notified_exhausted_files.setdefault(name, set()).update(exhausted_videos)
+    if not exhausted_videos:
+        return set()
+    with _notified_exhausted_lock:
+        existing = _notified_exhausted_files.setdefault(name, set())
+        newly_marked = exhausted_videos - existing
+        existing.update(newly_marked)
+        return newly_marked
+
+
+def _unmark_notified_exhausted(name: str, videos: Set[str]) -> None:
+    if not videos:
+        return
+    with _notified_exhausted_lock:
+        existing = _notified_exhausted_files.get(name)
+        if not existing:
+            return
+        existing.difference_update(videos)
+        if not existing:
+            _notified_exhausted_files.pop(name, None)
 
 
 # @event_manager.register(CHECK, block='Asynchronous3')
@@ -142,6 +158,7 @@ def processed(stream_info):
 _UNRECOVERABLE_CODE_RE = re.compile(
     r'(?:^|[\s{,"\'(])(?:(?:error\s*)?code["\']?\s*[:=]\s*)?(?:-101|21001|21015|21016|21044|21045)(?=$|[\s},)"\':;，。])'
 )
+_UNRECOVERABLE_OS_ERROR_RE = re.compile(r'\bos error 2(?![0-9])')
 
 
 def is_unrecoverable_error(e: Union[Exception, str, None]) -> bool:
@@ -163,9 +180,10 @@ def is_unrecoverable_error(e: Union[Exception, str, None]) -> bool:
         "filenotfound",
         "no such file",
         "cannot find the file",
-        "os error 2",
     ]
     if any(p in err_str for p in unrecoverable_patterns):
+        return True
+    if _UNRECOVERABLE_OS_ERROR_RE.search(err_str):
         return True
     return bool(_UNRECOVERABLE_CODE_RE.search(err_str))
 
@@ -214,16 +232,18 @@ def process_upload(stream_info):
         if file_count <= 0:
             with _notified_exhausted_lock:
                 newly_exhausted = current_videos - _notified_exhausted_files.get(name, set())
+                if newly_exhausted:
+                    _notified_exhausted_files.setdefault(name, set()).update(newly_exhausted)
             if newly_exhausted:
                 logger.warning(f"上传次数达到阈值: {name}")
+                exhausted_batch = set(newly_exhausted)
                 send_notification(
                     title=f"biliup 上传达到重试上限告警: {name}",
                     content=f"主播: {name}\nURL: {url}\n待传文件均已达到重试阈值 ({max_upload_limit})，已停止自动重试。",
                     streamer_name=name,
-                    error_type="max_upload_limit_reached"
+                    error_type="max_upload_limit_reached",
+                    on_failure=lambda vids=exhausted_batch: _unmark_notified_exhausted(name, vids),
                 )
-                with _notified_exhausted_lock:
-                    _notified_exhausted_files.setdefault(name, set()).update(newly_exhausted)
             else:
                 logger.debug(f"待传文件均已达到重试阈值且已告警过，跳过重复告警: {name}")
             return
@@ -278,22 +298,24 @@ def process_upload(stream_info):
                         file_upload_count = context.setdefault('file_upload_count', {})
                         for item in file_list:
                             file_upload_count[item.video] = max_upload_limit
+                    marked_videos = _mark_notified_exhausted(name, file_list, max_upload_limit, all_files=True)
                     send_notification(
                         title=f"biliup 上传不可自愈错误告警: {name}",
                         content=f"主播: {name}\nURL: {url}\n错误信息: {e}\n该批文件已被标记跳过重试，请检查账号状态或Cookie。",
                         streamer_name=name,
-                        error_type="unrecoverable_upload_error"
+                        error_type="unrecoverable_upload_error",
+                        on_failure=lambda vids=marked_videos: _unmark_notified_exhausted(name, vids),
                     )
-                    _mark_notified_exhausted(name, file_list, max_upload_limit, all_files=True)
                 elif upload_count + 1 >= max_upload_limit:
                     logger.warning(f"上传次数达到阈值: {name}")
+                    marked_videos = _mark_notified_exhausted(name, file_list, max_upload_limit)
                     send_notification(
                         title=f"biliup 上传达到重试上限告警: {name}",
                         content=f"主播: {name}\nURL: {url}\n部分或全部待传文件重试次数已达到阈值 ({upload_count + 1}/{max_upload_limit})，达到上限的文件将停止自动重试（其余未达上限文件仍会在后续重试）。最后一次错误: {e}",
                         streamer_name=name,
-                        error_type="max_upload_limit_reached"
+                        error_type="max_upload_limit_reached",
+                        on_failure=lambda vids=marked_videos: _unmark_notified_exhausted(name, vids),
                     )
-                    _mark_notified_exhausted(name, file_list, max_upload_limit)
             finally:
                 post_processor = config['streamers'].get(name, {}).get("postprocessor", None)
                 if post_processor is not None and (expt is not None or filelist):
@@ -317,13 +339,14 @@ def process_upload(stream_info):
                  
         else:
             logger.warning(f"上传次数达到阈值: {name}")
+            marked_videos = _mark_notified_exhausted(name, file_list, max_upload_limit)
             send_notification(
                 title=f"biliup 上传达到重试上限告警: {name}",
                 content=f"主播: {name}\nURL: {url}\n上传重试次数已达到阈值 ({upload_count}/{max_upload_limit})，已停止自动重试。",
                 streamer_name=name,
-                error_type="max_upload_limit_reached"
+                error_type="max_upload_limit_reached",
+                on_failure=lambda vids=marked_videos: _unmark_notified_exhausted(name, vids),
             )
-            _mark_notified_exhausted(name, file_list, max_upload_limit)
 
         if filelist:
             uploaded(name, stream_info.get('live_cover_path'), filelist)

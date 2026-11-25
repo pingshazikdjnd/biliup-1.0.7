@@ -4,6 +4,7 @@ import shutil
 import smtplib
 import ssl
 import tempfile
+import threading
 import time
 import unittest
 from email import message_from_string
@@ -117,11 +118,15 @@ class TestPR1UploadSafety(unittest.TestCase):
         self.assertTrue(is_unrecoverable_error("21045 参数非法"))
         self.assertTrue(is_unrecoverable_error('{"code":-101}'))
         self.assertTrue(is_unrecoverable_error("The system cannot find the file specified. (os error 2)"))
+        self.assertTrue(is_unrecoverable_error("os error 2: file missing"))
 
-        # 瞬态错误及文件名/URL含数字不应误判为不可自愈（应返回 False）
+        # 瞬态错误、资源临时受限 (os error 24/28) 及文件名/URL含数字不应误判为不可自愈（应返回 False）
         self.assertFalse(is_unrecoverable_error(ConnectionResetError("Connection reset by peer")))
         self.assertFalse(is_unrecoverable_error(TimeoutError("Read timed out")))
         self.assertFalse(is_unrecoverable_error("502 Bad Gateway"))
+        self.assertFalse(is_unrecoverable_error("Too many open files (os error 24)"))
+        self.assertFalse(is_unrecoverable_error("No space left on device (os error 28)"))
+        self.assertFalse(is_unrecoverable_error("Resource temporarily unavailable (os error 20)"))
         self.assertFalse(is_unrecoverable_error(RuntimeError("upload failed for clip_21001_room-101.flv: 502 Bad Gateway")))
         self.assertFalse(is_unrecoverable_error(None))
 
@@ -609,10 +614,11 @@ class TestPR1UploadSafety(unittest.TestCase):
             finally:
                 os.chdir(orig_cwd)
 
-    # 15. notify.py 清洗 SMTP 首尾空白并支持逗号/分号多收件人
+    # 15. notify.py 清洗主机/收件人首尾空白、原样保留密码空白、支持多收件人并记录部分拒收
     @patch('smtplib.SMTP_SSL')
     def test_notify_email_strips_whitespace_and_multiple_recipients(self, mock_smtp_ssl_cls):
         mock_ssl_inst = MagicMock()
+        mock_ssl_inst.sendmail.return_value = {}
         mock_smtp_ssl_cls.return_value = mock_ssl_inst
 
         config['notify_email_enabled'] = True
@@ -627,7 +633,7 @@ class TestPR1UploadSafety(unittest.TestCase):
         self.assertTrue(ok)
         mock_smtp_ssl_cls.assert_called_once()
         self.assertEqual(mock_smtp_ssl_cls.call_args.args, ('smtp.qq.com', 465))
-        mock_ssl_inst.login.assert_called_once_with('a@qq.com', 'secret_pass')
+        mock_ssl_inst.login.assert_called_once_with('a@qq.com', ' secret_pass ')
         mock_ssl_inst.sendmail.assert_called_once()
         from_addr, recipients, raw_msg = mock_ssl_inst.sendmail.call_args.args
         self.assertEqual(from_addr, 'a@qq.com')
@@ -635,10 +641,111 @@ class TestPR1UploadSafety(unittest.TestCase):
         sent_msg = message_from_string(raw_msg)
         self.assertEqual(sent_msg['To'], 'b@qq.com, c@qq.com, d@qq.com')
 
+        # 部分收件人被拒收时记录 warning 日志
+        clear_cooldown()
+        mock_ssl_inst.sendmail.return_value = {'c@qq.com': (450, b'Mailbox busy')}
+        with self.assertLogs('biliup', level='WARNING') as log_ctx:
+            ok_partial = send_notification("部分拒收标题", "正文", streamer_name="主播M2", error_type="test", sync=True)
+        self.assertTrue(ok_partial)
+        self.assertTrue(any('部分收件人被拒收' in msg and 'c@qq.com' in msg for msg in log_ctx.output))
+
         # 仅空白字符串应判定为配置不完整并跳过发送
         config['notify_email_to'] = '  , ;  '
         clear_cooldown()
         self.assertFalse(send_notification("空收件人", "正文", streamer_name="主播M", error_type="test", sync=True))
+
+    # 16. SMTP 发送失败触发 on_failure 撤回已告警标记，下次巡检可重新告警；未开启或冷却期不触发 on_failure
+    @patch('smtplib.SMTP_SSL')
+    @patch('biliup.handler.uploaded')
+    @patch('biliup.handler.upload')
+    @patch('biliup.handler.UploadBase.file_list')
+    def test_process_upload_retries_alert_after_smtp_failure(
+        self, mock_file_list, mock_upload, mock_uploaded, mock_smtp_ssl_cls
+    ):
+        def _wait_notify_threads():
+            for t in list(threading.enumerate()):
+                if t.name.startswith('NotifyThread-'):
+                    t.join(timeout=5)
+
+        # 未开启告警或冷却期内跳过时不得触发 on_failure
+        callback_hits = []
+        config['notify_email_enabled'] = False
+        send_notification(
+            "未开启", "正文", streamer_name="主播X", error_type="test",
+            sync=True, on_failure=lambda: callback_hits.append('disabled')
+        )
+        self.assertEqual(callback_hits, [])
+
+        config['notify_email_enabled'] = True
+        config['notify_smtp_port'] = 465
+        config['notify_smtp_host'] = 'smtp.qq.com'
+        config['notify_smtp_user'] = 'a@qq.com'
+        config['notify_smtp_pass'] = 'pass'
+        config['notify_email_to'] = 'b@qq.com'
+
+        mock_ok_inst = MagicMock()
+        mock_ok_inst.sendmail.return_value = {}
+        mock_smtp_ssl_cls.return_value = mock_ok_inst
+        send_notification("首次", "正文", streamer_name="主播X", error_type="test", sync=True)
+        send_notification(
+            "冷却跳过", "正文", streamer_name="主播X", error_type="test",
+            sync=True, on_failure=lambda: callback_hits.append('cooldown')
+        )
+        self.assertEqual(callback_hits, [])
+
+        # process_upload: 首次 SMTP 连接失败 -> on_failure 撤回标记 -> 下次巡检重新发送并成功 -> 第3次不再重复发
+        clear_cooldown()
+        clear_notified_exhausted_files()
+        mock_smtp_ssl_cls.reset_mock()
+        mock_file = UploadBase.FileInfo(video='stuck.mp4', danmaku=None)
+        mock_file_list.return_value = [mock_file]
+        config['max_upload_limit'] = 3
+        context['file_upload_count'] = {'stuck.mp4': 3}
+        context['url_upload_count']['http://test.com'] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {'http://test.com': 2}
+
+        mock_smtp_ssl_cls.side_effect = [OSError("SMTP connect timeout"), mock_ok_inst]
+        stream_info = {'name': 'test_streamer', 'url': 'http://test.com', 'title': 'test'}
+
+        # 第 1 次巡检：SMTP 抛异常 -> 触发 on_failure 撤回标记
+        process_upload(Event(UPLOAD, (stream_info,)))
+        _wait_notify_threads()
+        mock_upload.assert_not_called()
+        mock_uploaded.assert_not_called()
+        self.assertEqual(mock_smtp_ssl_cls.call_count, 1)
+
+        # 第 2 次巡检：因为上次发送失败已撤回标记，本次允许重新发送并成功
+        process_upload(Event(UPLOAD, (stream_info,)))
+        _wait_notify_threads()
+        self.assertEqual(mock_smtp_ssl_cls.call_count, 2)
+        mock_ok_inst.sendmail.assert_called_once()
+
+        # 第 3 次巡检：上次已成功告警且文件仍在，不再重复发送
+        process_upload(Event(UPLOAD, (stream_info,)))
+        _wait_notify_threads()
+        self.assertEqual(mock_smtp_ssl_cls.call_count, 2)
+
+        # 不可自愈错误分支首次发送失败同样会撤回标记，下次巡检重发成功
+        clear_cooldown()
+        clear_notified_exhausted_files()
+        mock_bad_file = UploadBase.FileInfo(video='bad_unrec.mp4', danmaku=None)
+        mock_file_list.return_value = [mock_bad_file]
+        context['file_upload_count'] = {'bad_unrec.mp4': 0}
+        mock_upload.side_effect = RuntimeError("code: -101, message: 账号未登录")
+        mock_ok_inst2 = MagicMock()
+        mock_ok_inst2.sendmail.return_value = {}
+        mock_smtp_ssl_cls.side_effect = [OSError("SMTP network down"), mock_ok_inst2]
+
+        with patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0):
+            process_upload(Event(UPLOAD, (stream_info,)))
+            _wait_notify_threads()
+        self.assertEqual(mock_smtp_ssl_cls.call_count, 3)
+
+        process_upload(Event(UPLOAD, (stream_info,)))
+        _wait_notify_threads()
+        self.assertEqual(mock_smtp_ssl_cls.call_count, 4)
+        mock_ok_inst2.sendmail.assert_called_once()
 
 
 if __name__ == '__main__':

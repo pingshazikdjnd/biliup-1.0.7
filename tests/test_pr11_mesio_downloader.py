@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import errno
 import json
 import os
 import queue
@@ -11,6 +12,8 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import psutil
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -189,6 +192,8 @@ class TestPR11MesioDownloader(unittest.TestCase):
         self.assertIsNone(download_mod._parse_duration_to_seconds('invalid'))
         self.assertIsNone(download_mod._parse_duration_to_seconds('01:70:00'))
         self.assertIsNone(download_mod._parse_duration_to_seconds('-00:05:00'))
+        self.assertIsNone(download_mod._parse_duration_to_seconds('00:00:²'))
+        self.assertIsNone(download_mod._parse_duration_to_seconds('00:00:١'))
 
         with patch('biliup.engine.download.shutil.which', return_value='/usr/bin/mesio') as which_mock:
             self.assertEqual(download_mod._resolve_mesio_binary(None), '/usr/bin/mesio')
@@ -204,6 +209,8 @@ class TestPR11MesioDownloader(unittest.TestCase):
         bin_file = os.path.join(bin_dir, 'mesio.exe')
         with open(bin_file, 'wb') as f:
             f.write(b'exe')
+        if os.name != 'nt':
+            os.chmod(bin_file, 0o755)
         self.assertEqual(download_mod._resolve_mesio_binary(f'  {bin_file}  '), bin_file)
         self.assertIsNone(download_mod._resolve_mesio_binary(os.path.join(bin_dir, 'missing.exe')))
 
@@ -365,6 +372,23 @@ class TestPR11MesioDownloader(unittest.TestCase):
             dl.database_row_id = db_mod.add_stream_info(db, dl.fname, dl.url, time.localtime())
 
         state = {'session_dir': None, 'stage1_ok': False, 'stage2_ok': False}
+        poll1_done = threading.Event()
+        seg0_db_done = threading.Event()
+        poll2_done = threading.Event()
+        seg1_db_done = threading.Event()
+        stage3_ready = threading.Event()
+        drive_errors = []
+        driver_threads = []
+
+        orig_update_file_list = download_mod.update_file_list
+
+        def tracked_update_file_list(db, row_id, file_name):
+            res = orig_update_file_list(db, row_id, file_name)
+            if file_name == 'static_rec.flv':
+                seg0_db_done.set()
+            elif file_name == 'static_rec_p001.flv':
+                seg1_db_done.set()
+            return res
 
         def fake_popen(cmd, **kwargs):
             sdir = _extract_session_dir(cmd)
@@ -377,27 +401,24 @@ class TestPR11MesioDownloader(unittest.TestCase):
 
             def on_poll(proc, count):
                 if count == 1:
+                    poll1_done.set()
                     return None
                 if count == 2:
                     # 验证阶段 1 后：seg_000.flv 已移出为 static_rec.flv，而 0B 的 seg_001.flv 仍在隔离目录
+                    self.assertTrue(seg0_db_done.wait(timeout=5))
                     self.assertTrue(os.path.isfile('static_rec.flv'))
                     self.assertFalse(os.path.exists(os.path.join(sdir, 'seg_000.flv')))
                     self.assertTrue(os.path.isfile(os.path.join(sdir, 'seg_001.flv')))
                     state['stage1_ok'] = True
+                    poll2_done.set()
                     return None
                 if count == 3:
-                    # 验证阶段 2 后：Closed segment 日志触发唯一的 seg_001.flv 被立即移出为 static_rec_p001.flv
+                    # 验证阶段 2 后：进程存活期间由 Closed segment 日志触发 seg_001.flv 被立即移出为 static_rec_p001.flv
+                    self.assertTrue(stage3_ready.wait(timeout=5))
+                    self.assertTrue(seg1_db_done.is_set())
                     self.assertTrue(os.path.isfile('static_rec_p001.flv'))
                     self.assertFalse(os.path.exists(os.path.join(sdir, 'seg_001.flv')))
                     state['stage2_ok'] = True
-                    # 阶段 3：退出前写入收尾 seg_002.flv (512B)、seg_003.mp4 (256B) 与 0B seg_004.flv
-                    with open(os.path.join(sdir, 'seg_002.flv'), 'wb') as f:
-                        f.write(b'F' * 512)
-                    with open(os.path.join(sdir, 'seg_003.mp4'), 'wb') as f:
-                        f.write(b'M' * 256)
-                    with open(os.path.join(sdir, 'seg_004.flv'), 'wb') as f:
-                        pass
-                    proc.stdout.push_eof()
                     return 0
                 return 0
 
@@ -406,28 +427,45 @@ class TestPR11MesioDownloader(unittest.TestCase):
             proc.stdout.push(b'mesio started\n')
 
             def _drive():
-                # 等待 poll #1 完成后注入 seg_001 字节与 Closed segment 日志唤醒第 2 轮
-                while proc.poll_count < 1:
-                    time.sleep(0.01)
-                time.sleep(0.02)
-                with open(os.path.join(sdir, 'seg_001.flv'), 'wb') as f:
-                    f.write(b'B' * 2048)
-                closed_line = f'2026-11-25 INFO Closed segment path={os.path.join(sdir, "seg_001.flv")} tags=42\n'
-                proc.stdout.push(closed_line.encode('utf-8'))
-                # 等待 poll #2 完成后再推送一行唤醒第 3 轮退出
-                while proc.poll_count < 2:
-                    time.sleep(0.01)
-                time.sleep(0.02)
-                proc.stdout.push(b'mesio finishing\n')
+                try:
+                    # 等待第 1 轮 poll 与 seg_000 移出及 DB 登记完成后，再注入 seg_001 字节与 Closed segment 日志
+                    self.assertTrue(poll1_done.wait(timeout=5))
+                    self.assertTrue(seg0_db_done.wait(timeout=5))
+                    with open(os.path.join(sdir, 'seg_001.flv'), 'wb') as f:
+                        f.write(b'B' * 2048)
+                    closed_line = f'2026-11-25 INFO Closed segment path={os.path.join(sdir, "seg_001.flv")} tags=42\n'
+                    proc.stdout.push(closed_line.encode('utf-8'))
+                    # 等待第 2 轮 poll 与进程存活期间 seg_001 移出及 DB 登记完成，再准备收尾分段并退出
+                    self.assertTrue(poll2_done.wait(timeout=5))
+                    self.assertTrue(seg1_db_done.wait(timeout=5))
+                    self.assertIsNone(proc.returncode)
+                    with open(os.path.join(sdir, 'seg_002.flv'), 'wb') as f:
+                        f.write(b'F' * 512)
+                    with open(os.path.join(sdir, 'seg_003.mp4'), 'wb') as f:
+                        f.write(b'M' * 256)
+                    with open(os.path.join(sdir, 'seg_004.flv'), 'wb') as f:
+                        pass
+                    stage3_ready.set()
+                    proc.stdout.push_eof()
+                except Exception as exc:
+                    drive_errors.append(exc)
+                    stage3_ready.set()
+                    proc.stdout.push_eof()
 
-            threading.Thread(target=_drive, daemon=True).start()
+            t = threading.Thread(target=_drive, daemon=True)
+            driver_threads.append(t)
+            t.start()
             return proc
 
         with patch('biliup.engine.download.SessionLocal', self._TestSession), \
-                patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen):
+                patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen), \
+                patch('biliup.engine.download.update_file_list', side_effect=tracked_update_file_list):
             ret = dl.mesio_download('/usr/bin/mesio')
 
+        for t in driver_threads:
+            t.join(timeout=5)
         self._join_segment_threads(dl)
+        self.assertEqual(drive_errors, [])
         self.assertTrue(ret)
         self.assertTrue(state['stage1_ok'])
         self.assertTrue(state['stage2_ok'])
@@ -487,6 +525,7 @@ class TestPR11MesioDownloader(unittest.TestCase):
             return real_strftime(fmt, t)
 
         with patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                patch('biliup.engine.download.os.name', 'nt'), \
                 patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen), \
                 patch('biliup.engine.download.os.rename', side_effect=flaky_rename), \
                 patch('biliup.engine.download.time.sleep'), \
@@ -594,7 +633,8 @@ class TestPR11MesioDownloader(unittest.TestCase):
             dl.database_row_id = db_mod.add_stream_info(db, dl.fname, dl.url, time.localtime())
 
         proc_holder = {}
-        monotonic_vals = iter([100.0, 100.0, 120.0, 120.0])
+        now_clock = {'value': 100.0}
+        pre_deadline_killed = []
 
         def fake_popen(cmd, **kwargs):
             sdir = _extract_session_dir(cmd)
@@ -602,19 +642,30 @@ class TestPR11MesioDownloader(unittest.TestCase):
                 f.write(b'H' * 100)
             with open(os.path.join(sdir, 'seg_001.flv'), 'wb') as f:
                 f.write(b'T' * 50)
-            proc = FakePopenProcess(cmd, returncode=-9)
+
+            def on_poll(proc, count):
+                if count == 2:
+                    pre_deadline_killed.append(proc.killed)
+                    now_clock['value'] = 105.0
+                elif count == 3:
+                    pre_deadline_killed.append(proc.killed)
+                    now_clock['value'] = 120.0
+                return None
+
+            proc = FakePopenProcess(cmd, returncode=-9, on_poll=on_poll)
             proc.stdout.push(b'started\n')
             proc_holder['proc'] = proc
             return proc
 
         with patch('biliup.engine.download.SessionLocal', self._TestSession), \
                 patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen), \
-                patch('biliup.engine.download.time.monotonic', side_effect=lambda: next(monotonic_vals, 120.0)), \
+                patch('biliup.engine.download.time.monotonic', side_effect=lambda: now_clock['value']), \
                 patch('biliup.engine.download.shutil.disk_usage', return_value=SimpleNamespace(free=2 * 1024**3)):
             ret = dl.mesio_download('/usr/bin/mesio')
 
         self._join_segment_threads(dl)
         self.assertTrue(ret)
+        self.assertEqual(pre_deadline_killed, [False, False])
         self.assertTrue(proc_holder['proc'].killed)
         self.assertTrue(os.path.isfile('timeout_seg.flv'))
         self.assertTrue(os.path.isfile('timeout_seg_p001.flv'))
@@ -744,6 +795,332 @@ class TestPR11MesioDownloader(unittest.TestCase):
                 mock_em_start.assert_called_once()
 
         asyncio.run(_run_main())
+
+    def test_soft_watermark_triggers_on_nonempty_active_segment_and_timerange_preserves_flag(self):
+        # 1. moved == 0 时：0 字节空文件不误停机，当前分段一旦写入非空字节即触发软水位优雅停机
+        config['disk_upload_threshold_gb'] = 10.0
+        dl = DummyMesioDownloader(fname='long_seg_up')
+        dl.downloader = 'mesio'
+        dl.filename_prefix = 'long_seg'
+
+        with self._TestSession() as db:
+            dl.database_row_id = db_mod.add_stream_info(db, dl.fname, dl.url, time.localtime())
+
+        state = {'signals_at_zero_bytes': None}
+
+        def fake_popen(cmd, **kwargs):
+            sdir = _extract_session_dir(cmd)
+            seg_path = os.path.join(sdir, 'seg_000.flv')
+            with open(seg_path, 'wb') as f:
+                pass
+
+            def on_poll(proc, count):
+                if count == 2:
+                    state['signals_at_zero_bytes'] = list(proc.signals)
+                    with open(seg_path, 'wb') as f:
+                        f.write(b'LIVE' * 128)
+                return None
+
+            def on_signal(proc, sig):
+                proc.returncode = 0
+                proc.stdout.push_eof()
+
+            proc = FakePopenProcess(cmd, returncode=0, on_poll=on_poll, on_signal=on_signal)
+            return proc
+
+        with patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen), \
+                patch('biliup.engine.download.shutil.disk_usage', return_value=SimpleNamespace(free=2 * 1024**3)):
+            ret = dl.mesio_download('/usr/bin/mesio')
+
+        self._join_segment_threads(dl)
+        self.assertTrue(ret)
+        self.assertEqual(state['signals_at_zero_bytes'], [])
+        self.assertTrue(dl._mesio_soft_triggered)
+        self.assertTrue(os.path.isfile('long_seg.flv'))
+
+        # 2. stopped_by_timerange 期间或结束时遇低磁盘，start() 仍返回 disk_soft_triggered=True
+        subdir = os.path.join(self._tmpdir.name, 'timerange_soft')
+        os.makedirs(subdir, exist_ok=True)
+        prev_cwd = os.getcwd()
+        os.chdir(subdir)
+        try:
+            config['disk_upload_threshold_gb'] = 10.0
+            dl_tr = DummyMesioDownloader(fname='timerange_up')
+            dl_tr.downloader = 'mesio'
+            dl_tr.filename_prefix = 'tr_seg'
+            dl_tr.time_range = '["00:00:00", "01:00:00"]'
+
+            disk_state = {'free_gb': 20}
+
+            def fake_disk_usage(_path):
+                return SimpleNamespace(total=100 * 1024**3, used=80 * 1024**3, free=disk_state['free_gb'] * 1024**3)
+
+            def fake_popen_tr(cmd, **kwargs):
+                sdir = _extract_session_dir(cmd)
+                with open(os.path.join(sdir, 'seg_000.flv'), 'wb') as f:
+                    f.write(b'TR' * 128)
+
+                def on_signal(proc, sig):
+                    # 停机排空期间磁盘跌破软水位
+                    disk_state['free_gb'] = 1
+                    proc.returncode = 0
+                    proc.stdout.push_eof()
+
+                return FakePopenProcess(cmd, returncode=0, on_signal=on_signal)
+
+            bg_loop = asyncio.new_event_loop()
+            bg_thread = threading.Thread(target=bg_loop.run_forever, daemon=True)
+            bg_thread.start()
+            try:
+                with patch.object(download_mod, 'loop', bg_loop), \
+                        patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                        patch('biliup.engine.download._resolve_mesio_binary', return_value='/usr/bin/mesio'), \
+                        patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen_tr), \
+                        patch('biliup.engine.download.check_timerange', side_effect=[True, False]), \
+                        patch('biliup.engine.download.shutil.disk_usage', side_effect=fake_disk_usage):
+                    stream_info = dl_tr.start()
+            finally:
+                bg_loop.call_soon_threadsafe(bg_loop.stop)
+                bg_thread.join(timeout=2)
+                bg_loop.close()
+
+            self.assertTrue(dl_tr._mesio_soft_triggered)
+            self.assertTrue(stream_info['disk_soft_triggered'])
+            self.assertTrue(os.path.isfile('tr_seg.flv'))
+        finally:
+            os.chdir(prev_cwd)
+
+    def test_publish_mesio_file_collision_safe_posix_and_windows_and_concurrent(self):
+        with open('clip.flv', 'wb') as f:
+            f.write(b'original')
+
+        # 1. POSIX os.link 遇 FileExistsError 自动分配 _p001，绝不覆盖原文件
+        src_posix = os.path.join(self._tmpdir.name, 'src_posix.flv')
+        with open(src_posix, 'wb') as f:
+            f.write(b'posix_new')
+
+        link_calls = []
+        unlink_calls = []
+
+        def fake_link(src, dst):
+            link_calls.append((src, dst))
+            if dst == 'clip.flv':
+                raise FileExistsError('exists')
+            with open(dst, 'wb') as f:
+                with open(src, 'rb') as sf:
+                    f.write(sf.read())
+
+        def fake_unlink(path):
+            unlink_calls.append(path)
+            os.remove(path)
+
+        with patch('biliup.engine.download.os.name', 'posix'), \
+                patch('biliup.engine.download.os.link', side_effect=fake_link), \
+                patch('biliup.engine.download.os.unlink', side_effect=fake_unlink):
+            dst_posix = download_mod._publish_mesio_file(src_posix, 'clip', '.flv', '.')
+
+        self.assertEqual(dst_posix, 'clip_p001.flv')
+        self.assertEqual([d for _, d in link_calls], ['clip.flv', 'clip_p001.flv'])
+        self.assertEqual(unlink_calls, [src_posix])
+        self.assertFalse(os.path.exists(src_posix))
+        with open('clip.flv', 'rb') as f:
+            self.assertEqual(f.read(), b'original')
+        with open('clip_p001.flv', 'rb') as f:
+            self.assertEqual(f.read(), b'posix_new')
+
+        # 2. POSIX os.link 返回不支持硬链接的 OSError 时，锁内确认目标不存在后再回退 _rename_with_retry
+        src_fb = os.path.join(self._tmpdir.name, 'src_fb.flv')
+        with open(src_fb, 'wb') as f:
+            f.write(b'posix_fallback')
+
+        def unsupported_link(src, dst):
+            raise OSError(errno.EOPNOTSUPP, 'operation not supported')
+
+        with patch('biliup.engine.download.os.name', 'posix'), \
+                patch('biliup.engine.download.os.link', side_effect=unsupported_link):
+            dst_fb = download_mod._publish_mesio_file(src_fb, 'clip', '.flv', '.')
+
+        self.assertEqual(dst_fb, 'clip_p002.flv')
+        with open('clip.flv', 'rb') as f:
+            self.assertEqual(f.read(), b'original')
+        with open('clip_p002.flv', 'rb') as f:
+            self.assertEqual(f.read(), b'posix_fallback')
+
+        # 3. Windows os.rename 遇 FileExistsError 竞态时自动重试下一后缀
+        src_nt = os.path.join(self._tmpdir.name, 'src_nt.flv')
+        with open(src_nt, 'wb') as f:
+            f.write(b'nt_new')
+        real_rename = os.rename
+        nt_targets = []
+
+        def race_rename(src, dst):
+            nt_targets.append(dst)
+            if dst == 'clip_p003.flv':
+                with open(dst, 'wb') as f:
+                    f.write(b'raced_other')
+                raise FileExistsError('raced')
+            return real_rename(src, dst)
+
+        with patch('biliup.engine.download.os.name', 'nt'), \
+                patch('biliup.engine.download.os.rename', side_effect=race_rename):
+            dst_nt = download_mod._publish_mesio_file(src_nt, 'clip', '.flv', '.')
+
+        self.assertEqual(nt_targets, ['clip_p003.flv', 'clip_p004.flv'])
+        self.assertEqual(dst_nt, 'clip_p004.flv')
+        with open('clip_p003.flv', 'rb') as f:
+            self.assertEqual(f.read(), b'raced_other')
+        with open('clip_p004.flv', 'rb') as f:
+            self.assertEqual(f.read(), b'nt_new')
+
+        # 4. 多线程同前缀并发发布绝不互相覆盖
+        worker_count = 6
+        barrier = threading.Barrier(worker_count)
+        results = []
+        errors = []
+        res_lock = threading.Lock()
+
+        def _worker(idx):
+            try:
+                src_w = os.path.join(self._tmpdir.name, f'worker_{idx}.flv')
+                with open(src_w, 'wb') as f:
+                    f.write(f'payload_{idx}'.encode('utf-8'))
+                barrier.wait(timeout=5)
+                out = download_mod._publish_mesio_file(src_w, 'race_clip', '.flv', '.')
+                with res_lock:
+                    results.append((idx, out))
+            except Exception as exc:
+                with res_lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=_worker, args=(i,)) for i in range(worker_count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), worker_count)
+        self.assertEqual(len({dst for _, dst in results}), worker_count)
+        for idx, dst in results:
+            with open(dst, 'rb') as f:
+                self.assertEqual(f.read(), f'payload_{idx}'.encode('utf-8'))
+
+    def test_recover_skips_live_mesio_pid_and_retries_pending_db_registration(self):
+        # 1. mesio_download 成功启动后写入 pid 到 .meta.json
+        dl = DummyMesioDownloader(fname='pid_up')
+        dl.downloader = 'mesio'
+        dl.database_row_id = 55
+        recorded_meta = {}
+
+        def fake_popen_pid(cmd, **kwargs):
+            sdir = _extract_session_dir(cmd)
+            proc = FakePopenProcess(cmd, returncode=1)
+            proc.pid = 77889
+
+            def capture_on_poll(p, count):
+                with open(os.path.join(sdir, '.meta.json'), 'r', encoding='utf-8') as f:
+                    recorded_meta.update(json.load(f))
+                p.stdout.push_eof()
+                return 1
+
+            proc._on_poll = capture_on_poll
+            return proc
+
+        with patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen_pid):
+            dl.mesio_download('/usr/bin/mesio')
+        self.assertEqual(recorded_meta.get('pid'), 77889)
+
+        # 2. _is_live_mesio_pid 校验存活 mesio / 僵尸 / 非 mesio 进程 / psutil.Error
+        live_proc = MagicMock()
+        live_proc.is_running.return_value = True
+        live_proc.status.return_value = psutil.STATUS_RUNNING
+        live_proc.name.return_value = 'mesio.exe'
+        with patch('biliup.engine.download.psutil.Process', return_value=live_proc):
+            self.assertTrue(download_mod._is_live_mesio_pid(54321))
+
+        zombie_proc = MagicMock()
+        zombie_proc.is_running.return_value = True
+        zombie_proc.status.return_value = psutil.STATUS_ZOMBIE
+        with patch('biliup.engine.download.psutil.Process', return_value=zombie_proc):
+            self.assertFalse(download_mod._is_live_mesio_pid(54321))
+
+        other_proc = MagicMock()
+        other_proc.is_running.return_value = True
+        other_proc.status.return_value = psutil.STATUS_RUNNING
+        other_proc.name.return_value = 'python.exe'
+        other_proc.cmdline.return_value = ['python', '-m', 'http.server']
+        with patch('biliup.engine.download.psutil.Process', return_value=other_proc):
+            self.assertFalse(download_mod._is_live_mesio_pid(54321))
+
+        with patch('biliup.engine.download.psutil.Process', side_effect=psutil.NoSuchProcess(54321)):
+            self.assertFalse(download_mod._is_live_mesio_pid(54321))
+
+        # 3. recover_stale_mesio_tmp 跳过存活 mesio PID 会话，且 DB 登记失败后可二次恢复补登记
+        with self._TestSession() as db:
+            row_id = db_mod.add_stream_info(db, 'retry_up', 'https://live.bilibili.com/777', time.localtime())
+
+        live_dir = os.path.join('.mesio_tmp', '201_live')
+        os.makedirs(live_dir, exist_ok=True)
+        with open(os.path.join(live_dir, '.meta.json'), 'w', encoding='utf-8') as f:
+            json.dump({'name': 'live_up', 'base_name': 'live_rec', 'database_row_id': row_id, 'pid': 54321}, f)
+        with open(os.path.join(live_dir, 'seg_000.flv'), 'wb') as f:
+            f.write(b'LIVE_ACTIVE')
+
+        retry_dir = os.path.join('.mesio_tmp', '202_retry')
+        os.makedirs(retry_dir, exist_ok=True)
+        with open(os.path.join(retry_dir, '.meta.json'), 'w', encoding='utf-8') as f:
+            json.dump({'name': 'retry_up', 'base_name': 'custom_rec', 'database_row_id': row_id}, f)
+        with open(os.path.join(retry_dir, 'seg_000.flv'), 'wb') as f:
+            f.write(b'RETRY_DATA')
+
+        # 第 1 次恢复：live_dir 因活动 PID 被跳过；retry_dir 移出文件但 DB 登记抛异常
+        with patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                patch('biliup.engine.download._is_live_mesio_pid', side_effect=lambda p: p == 54321), \
+                patch('biliup.engine.download.update_file_list', side_effect=RuntimeError('database is locked')):
+            with self.assertLogs('biliup', level='WARNING') as warn_logs:
+                rec1 = download_mod.recover_stale_mesio_tmp()
+
+        self.assertEqual(rec1, ['custom_rec.flv'])
+        self.assertTrue(any('54321' in msg for msg in warn_logs.output))
+        self.assertTrue(os.path.isfile(os.path.join(live_dir, 'seg_000.flv')))
+        self.assertTrue(os.path.isfile(os.path.join(live_dir, '.meta.json')))
+        self.assertTrue(os.path.isfile('custom_rec.flv'))
+        self.assertTrue(os.path.isfile(os.path.join(retry_dir, '.meta.json')))
+        with open(os.path.join(retry_dir, '.meta.json'), 'r', encoding='utf-8') as f:
+            retry_meta = json.load(f)
+        self.assertEqual(retry_meta.get('pending_db_files'), ['custom_rec.flv'])
+
+        # 清理活动会话以便测试二次恢复清理整个 .mesio_tmp
+        shutil.rmtree(live_dir)
+
+        # 第 2 次恢复：DB 恢复正常，补登记 pending_db_files 并彻底清理 retry_dir 与 .mesio_tmp
+        with patch('biliup.engine.download.SessionLocal', self._TestSession):
+            rec2 = download_mod.recover_stale_mesio_tmp()
+
+        self.assertEqual(rec2, [])
+        self.assertFalse(os.path.exists('.mesio_tmp'))
+        with self._TestSession() as db:
+            self.assertEqual(db_mod.get_file_list(db, row_id), ['custom_rec.flv'])
+
+    def test_upload_file_list_discovers_older_streamer_info_recovery_files(self):
+        with self._TestSession() as db:
+            old_row_id = db_mod.add_stream_info(db, 'hist_up', 'https://live.bilibili.com/555', time.localtime())
+            db_mod.update_file_list(db, old_row_id, 'custom_old_session.flv')
+            # 主播重启后开始新录制，写入更新的 StreamerInfo 记录
+            _new_row_id = db_mod.add_stream_info(db, 'hist_up', 'https://live.bilibili.com/555', time.localtime())
+
+        with open('custom_old_session.flv', 'wb') as f:
+            f.write(b'OLD_RECOVERED')
+        with open('unrelated_other.flv', 'wb') as f:
+            f.write(b'OTHER')
+
+        app_mod.context['PluginInfo'] = SimpleNamespace(url_status={}, inverted_index={})
+        config['filtering_threshold'] = 0
+        with patch('biliup.engine.upload.SessionLocal', self._TestSession):
+            scanned = UploadBase.file_list('hist_up')
+
+        self.assertEqual([item.video for item in scanned], ['custom_old_session.flv'])
 
 
 if __name__ == '__main__':

@@ -80,19 +80,6 @@ const ENTITY_FIELDS = new Set([
 const isPlainObject = (val: any): val is Record<string, any> =>
   Boolean(val) && typeof val === 'object' && !Array.isArray(val)
 
-const valuesEqual = (a: any, b: any): boolean => {
-  if (a === b) return true
-  if (a == null || b == null || typeof a !== typeof b) return false
-  if (typeof a === 'object') {
-    try {
-      return JSON.stringify(a) === JSON.stringify(b)
-    } catch {
-      return false
-    }
-  }
-  return false
-}
-
 const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
   visible,
   entity,
@@ -235,20 +222,18 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
 
       candidateKeys.forEach(key => {
         const val = nextValues[key]
-        const origVal = initialOverride[key]
         const isTouchedTop = touchedFields.has(key)
 
         if (key === 'user') {
           const existingUser = isPlainObject(overrideConfig.user) ? { ...overrideConfig.user } : {}
           const nextUser = isPlainObject(val) ? val : {}
-          const origUser = isPlainObject(origVal) ? origVal : {}
           const userSubKeys = new Set<string>(Object.keys(nextUser))
           touchedUserFields.forEach(subKey => userSubKeys.add(subKey))
 
           userSubKeys.forEach(subKey => {
             const subVal = nextUser[subKey]
             const isTouchedSub = touchedUserFields.has(subKey) || isTouchedTop
-            if (overrideTextChanged && !isTouchedSub && valuesEqual(subVal, origUser[subKey])) {
+            if (overrideTextChanged && !isTouchedSub) {
               return
             }
             if (subVal !== undefined && subVal !== null && subVal !== '') {
@@ -269,9 +254,8 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
 
         if (isPlainObject(val)) {
           const existing = isPlainObject(overrideConfig[key]) ? { ...overrideConfig[key] } : {}
-          const origObj = isPlainObject(origVal) ? origVal : {}
           Object.entries(val).forEach(([subKey, subVal]) => {
-            if (overrideTextChanged && !isTouchedTop && valuesEqual(subVal, origObj[subKey])) {
+            if (overrideTextChanged && !isTouchedTop) {
               return
             }
             if (subVal !== undefined && subVal !== null && subVal !== '') {
@@ -285,7 +269,7 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
           } else if (isTouchedTop) {
             delete overrideConfig[key]
           }
-        } else if (overrideTextChanged && !isTouchedTop && valuesEqual(val, origVal)) {
+        } else if (overrideTextChanged && !isTouchedTop) {
           // 用户直接清空或修改了 override_text，未在之后手动修改的表单旧值不再回写覆盖
         } else if (val !== undefined && val !== null && val !== '') {
           overrideConfig[key] = val

@@ -5,8 +5,6 @@ import shutil
 
 from typing import NamedTuple, Optional, List
 
-from sqlalchemy import desc
-
 from biliup.common.tools import NamedLock, get_file_create_timestamp
 from biliup.config import config
 from biliup.database import models
@@ -74,14 +72,17 @@ class UploadBase:
         # 数据库中保存的文件名, 不含后缀
         save = set()
         with SessionLocal() as db:
-            dbinfo = db.query(models.StreamerInfo).filter(models.StreamerInfo.name == index).order_by(
-                desc(models.StreamerInfo.id)).first()
-            if dbinfo:
-                save = {
-                    pathlib.Path(f.file[:-5] if f.file.endswith('.part') else f.file).stem
-                    for f in dbinfo.filelist
-                    if f.file
-                }
+            db_files = (
+                db.query(models.FileList.file)
+                .join(models.StreamerInfo, models.FileList.streamer_info_id == models.StreamerInfo.id)
+                .filter(models.StreamerInfo.name == index)
+                .all()
+            )
+            save = {
+                pathlib.Path(file_name[:-5] if file_name.endswith('.part') else file_name).stem
+                for (file_name,) in db_files
+                if file_name
+            }
         for file_name in os.listdir('.'):
             base_name = file_name[:-5] if file_name.endswith('.part') else file_name
             file_stem = pathlib.Path(base_name).stem

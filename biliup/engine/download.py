@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import errno
 import inspect
 import itertools
 import json
@@ -18,10 +19,12 @@ from typing import AsyncGenerator, List, Callable, Optional
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 
+import psutil
 import requests
 from requests.utils import DEFAULT_ACCEPT_ENCODING, parse_header_links
 from httpx import HTTPStatusError
 
+from biliup.common.tools import NamedLock
 from biliup.common.util import client, loop, check_timerange
 from biliup.database.db import add_stream_info, SessionLocal, get_stream_info, update_cover_path, update_room_title, update_file_list
 from biliup.plugins import random_user_agent
@@ -46,7 +49,7 @@ def _parse_duration_to_seconds(duration_str: Optional[str]) -> Optional[int]:
     if not duration_str or not isinstance(duration_str, str):
         return None
     parts = duration_str.strip().split(':')
-    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+    if len(parts) != 3 or any(not (part.isascii() and part.isdigit()) for part in parts):
         return None
     hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2])
     if minutes >= 60 or seconds >= 60:
@@ -71,20 +74,96 @@ def _resolve_mesio_binary(mesio_path: Optional[str]) -> Optional[str]:
     return shutil.which('mesio')
 
 
+_HARDLINK_UNSUPPORTED_ERRNOS = {
+    errno.EPERM,
+    errno.EOPNOTSUPP,
+    errno.EXDEV,
+    errno.EMLINK,
+}
+if hasattr(errno, 'ENOTSUP'):
+    _HARDLINK_UNSUPPORTED_ERRNOS.add(errno.ENOTSUP)
+
+
+def _format_media_target(base_name: str, ext: str, target_dir: str, idx: int) -> str:
+    use_cwd = not target_dir or target_dir == '.'
+    candidate = f'{base_name}{ext}' if idx == 0 else f'{base_name}_p{idx:03d}{ext}'
+    return candidate if use_cwd else os.path.join(target_dir, candidate)
+
+
 def _allocate_unique_media_target(base_name: str, ext: str, target_dir: str = '.') -> str:
     if ext and not ext.startswith('.'):
         ext = f'.{ext}'
-    use_cwd = not target_dir or target_dir == '.'
-    candidate = f'{base_name}{ext}'
-    target_path = candidate if use_cwd else os.path.join(target_dir, candidate)
-    if not (os.path.exists(target_path) or os.path.islink(target_path)):
-        return target_path
-    for idx in itertools.count(1):
-        candidate = f'{base_name}_p{idx:03d}{ext}'
-        target_path = candidate if use_cwd else os.path.join(target_dir, candidate)
+    for idx in itertools.count(0):
+        target_path = _format_media_target(base_name, ext, target_dir, idx)
         if not (os.path.exists(target_path) or os.path.islink(target_path)):
             return target_path
-    return target_path
+    return _format_media_target(base_name, ext, target_dir, 0)
+
+
+def _publish_mesio_file(src_path: str, base_name: str, ext: str, target_dir: str = '.') -> str:
+    if ext and not ext.startswith('.'):
+        ext = f'.{ext}'
+    with NamedLock('mesio_publish_target'):
+        for idx in itertools.count(0):
+            dst = _format_media_target(base_name, ext, target_dir, idx)
+            if os.name == 'nt':
+                if os.path.exists(dst) or os.path.islink(dst):
+                    continue
+                try:
+                    _rename_with_retry(src_path, dst)
+                    return dst
+                except FileExistsError:
+                    continue
+            else:
+                try:
+                    os.link(src_path, dst)
+                except FileExistsError:
+                    continue
+                except OSError as e:
+                    if e.errno not in _HARDLINK_UNSUPPORTED_ERRNOS:
+                        raise
+                    if os.path.exists(dst) or os.path.islink(dst):
+                        continue
+                    try:
+                        _rename_with_retry(src_path, dst)
+                        return dst
+                    except FileExistsError:
+                        continue
+                os.unlink(src_path)
+                return dst
+    return dst
+
+
+def _write_mesio_meta(meta_path: str, meta: dict) -> None:
+    meta_dir = os.path.dirname(meta_path) or '.'
+    tmp_meta_path = os.path.join(meta_dir, f'.meta.json.tmp.{os.getpid()}.{threading.get_ident()}')
+    try:
+        with open(tmp_meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False)
+        os.replace(tmp_meta_path, meta_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_meta_path):
+                os.remove(tmp_meta_path)
+        except OSError:
+            pass
+        raise
+
+
+def _is_live_mesio_pid(pid: int) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        proc = psutil.Process(pid)
+        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+            return False
+        proc_name = (proc.name() or '').lower()
+        if 'mesio' in proc_name:
+            return True
+        cmdline = proc.cmdline() or []
+        return any('mesio' in str(arg).lower() for arg in cmdline)
+    except psutil.Error:
+        return False
 
 
 def _normalize_mesio_path(path_str: str) -> str:
@@ -124,12 +203,27 @@ def _list_sorted_mesio_media(session_dir: str):
     return [(src_path, name, ext, size) for _, src_path, name, ext, size in entries]
 
 
+def _try_register_mesio_file(database_row_id: Optional[int], file_basename: str, log_target: str) -> bool:
+    if database_row_id is None:
+        return True
+    try:
+        from biliup.database.models import StreamerInfo
+        with SessionLocal() as db:
+            if db.get(StreamerInfo, database_row_id) is not None:
+                update_file_list(db, database_row_id, file_basename)
+        return True
+    except Exception as e:
+        logger.warning(f"登记恢复的 mesio 录像到数据库失败 ({log_target}): {e}")
+        return False
+
+
 def recover_stale_mesio_tmp(tmp_root: str = '.mesio_tmp', target_dir: str = '.') -> List[str]:
     recovered: List[str] = []
     if not os.path.isdir(tmp_root):
         return recovered
     if target_dir and target_dir != '.':
         os.makedirs(target_dir, exist_ok=True)
+    use_cwd = not target_dir or target_dir == '.'
 
     for entry in sorted(os.listdir(tmp_root)):
         session_dir = os.path.join(tmp_root, entry)
@@ -138,11 +232,15 @@ def recover_stale_mesio_tmp(tmp_root: str = '.mesio_tmp', target_dir: str = '.')
         meta_path = os.path.join(session_dir, '.meta.json')
         base_name = entry
         database_row_id = None
+        meta: Optional[dict] = None
+        live_pid = None
+        orig_pending_db_files: List[str] = []
         if os.path.isfile(meta_path):
             try:
                 with open(meta_path, 'r', encoding='utf-8') as f:
-                    meta = json.load(f)
-                if isinstance(meta, dict):
+                    loaded_meta = json.load(f)
+                if isinstance(loaded_meta, dict):
+                    meta = loaded_meta
                     meta_base = meta.get('base_name')
                     if isinstance(meta_base, str) and meta_base.strip():
                         base_name = os.path.basename(meta_base.strip()) or entry
@@ -154,34 +252,55 @@ def recover_stale_mesio_tmp(tmp_root: str = '.mesio_tmp', target_dir: str = '.')
                                 database_row_id = parsed_row_id
                         except (TypeError, ValueError):
                             pass
+                    raw_pid = meta.get('pid')
+                    if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0:
+                        live_pid = raw_pid
+                    raw_pending = meta.get('pending_db_files')
+                    if isinstance(raw_pending, list):
+                        for item in raw_pending:
+                            if isinstance(item, str) and item.strip():
+                                fname = os.path.basename(item.strip())
+                                if fname and fname not in orig_pending_db_files:
+                                    orig_pending_db_files.append(fname)
             except Exception as e:
                 logger.warning(f"读取残留 mesio 会话元数据失败 ({meta_path}): {e}")
 
+        if live_pid is not None and _is_live_mesio_pid(live_pid):
+            logger.warning(f"检测到活动 mesio 进程 (pid={live_pid}) 仍在写入，跳过恢复会话目录: {session_dir}")
+            continue
+
+        reg_failed = False
+        pending_db_files: List[str] = []
+        for fname in orig_pending_db_files:
+            pending_target = fname if use_cwd else os.path.join(target_dir, fname)
+            if not os.path.isfile(pending_target):
+                continue
+            if not _try_register_mesio_file(database_row_id, fname, pending_target):
+                reg_failed = True
+                if fname not in pending_db_files:
+                    pending_db_files.append(fname)
+
         move_failed = False
-        for src_path, name, ext, size in _list_sorted_mesio_media(session_dir):
+        for src_path, _name, ext, size in _list_sorted_mesio_media(session_dir):
             if size == 0:
                 try:
                     os.remove(src_path)
                 except OSError as e:
                     logger.warning(f"删除残留空媒体文件失败 ({src_path}): {e}")
                 continue
-            dst = _allocate_unique_media_target(base_name, ext, target_dir)
             try:
-                _rename_with_retry(src_path, dst)
+                dst = _publish_mesio_file(src_path, base_name, ext, target_dir)
                 recovered.append(dst)
                 logger.info(f"恢复残留 mesio 录像: {src_path} -> {dst}")
             except OSError as e:
                 move_failed = True
-                logger.error(f"恢复残留 mesio 录像失败 ({src_path} -> {dst}): {e}")
+                logger.error(f"恢复残留 mesio 录像失败 ({src_path}): {e}")
                 continue
-            if database_row_id is not None:
-                try:
-                    from biliup.database.models import StreamerInfo
-                    with SessionLocal() as db:
-                        if db.get(StreamerInfo, database_row_id) is not None:
-                            update_file_list(db, database_row_id, os.path.basename(dst))
-                except Exception as e:
-                    logger.warning(f"登记恢复的 mesio 录像到数据库失败 ({dst}): {e}")
+            dst_name = os.path.basename(dst)
+            if not _try_register_mesio_file(database_row_id, dst_name, dst):
+                reg_failed = True
+                if dst_name not in pending_db_files:
+                    pending_db_files.append(dst_name)
 
         for name in os.listdir(session_dir):
             if name == '.meta.json':
@@ -194,7 +313,23 @@ def recover_stale_mesio_tmp(tmp_root: str = '.mesio_tmp', target_dir: str = '.')
                 except OSError:
                     pass
 
-        if not move_failed and os.path.isfile(meta_path):
+        if reg_failed or pending_db_files:
+            updated_meta = dict(meta) if isinstance(meta, dict) else {'base_name': base_name}
+            if database_row_id is not None and 'database_row_id' not in updated_meta:
+                updated_meta['database_row_id'] = database_row_id
+            updated_meta['pending_db_files'] = pending_db_files
+            try:
+                _write_mesio_meta(meta_path, updated_meta)
+            except OSError as e:
+                logger.warning(f"更新残留 mesio 元数据失败 ({meta_path}): {e}")
+        elif move_failed and orig_pending_db_files and isinstance(meta, dict) and os.path.isfile(meta_path):
+            updated_meta = dict(meta)
+            updated_meta.pop('pending_db_files', None)
+            try:
+                _write_mesio_meta(meta_path, updated_meta)
+            except OSError as e:
+                logger.warning(f"更新残留 mesio 元数据失败 ({meta_path}): {e}")
+        elif not move_failed and not reg_failed and not pending_db_files and os.path.isfile(meta_path):
             try:
                 os.remove(meta_path)
             except OSError as e:
@@ -568,17 +703,13 @@ class DownloadBase(ABC):
         safe_fallback = re.sub(r'[\\/:*?"<>|%\s]+', '_', str(self.fname or 'mesio')).strip('_') or 'mesio'
         session_base_name = _render_base_name(f'{safe_fallback}_{int(time.time())}')
         meta_path = os.path.join(session_tmp_dir, '.meta.json')
+        session_meta = {
+            'name': self.fname,
+            'base_name': session_base_name,
+            'database_row_id': self.database_row_id,
+        }
         try:
-            with open(meta_path, 'w', encoding='utf-8') as f:
-                json.dump(
-                    {
-                        'name': self.fname,
-                        'base_name': session_base_name,
-                        'database_row_id': self.database_row_id,
-                    },
-                    f,
-                    ensure_ascii=False,
-                )
+            _write_mesio_meta(meta_path, session_meta)
         except OSError as e:
             logger.warning(f"{self.plugin_msg}: 写入 mesio 会话元数据失败: {e}")
 
@@ -686,15 +817,17 @@ class DownloadBase(ABC):
                         continue
 
                 base_name = _render_base_name(session_base_name)
-                dst = _allocate_unique_media_target(base_name, ext, '.')
                 try:
-                    _rename_with_retry(src_path, dst)
+                    dst = _publish_mesio_file(src_path, base_name, ext, '.')
                 except OSError as e:
-                    logger.warning(f"{self.plugin_msg}: 移出 mesio 分段失败 ({src_path} -> {dst}): {e}")
+                    logger.warning(f"{self.plugin_msg}: 移出 mesio 分段失败 ({src_path}): {e}")
                     continue
                 self.__download_segment_callback(dst)
                 moved_count += 1
             return moved_count
+
+        def _has_nonempty_session_media() -> bool:
+            return any(size > 0 for _, _, _, size in _list_sorted_mesio_media(session_tmp_dir))
 
         def _send_graceful_stop():
             if proc is None:
@@ -729,6 +862,14 @@ class DownloadBase(ABC):
                 proc = None
 
             if proc is not None:
+                proc_pid = getattr(proc, 'pid', None)
+                if isinstance(proc_pid, int) and not isinstance(proc_pid, bool) and proc_pid > 0:
+                    session_meta['pid'] = proc_pid
+                    try:
+                        _write_mesio_meta(meta_path, session_meta)
+                    except OSError as e:
+                        logger.warning(f"{self.plugin_msg}: 更新 mesio 进程 PID 元数据失败: {e}")
+
                 if proc.stdout is not None:
                     log_thread = threading.Thread(
                         target=_read_stdout,
@@ -746,7 +887,7 @@ class DownloadBase(ABC):
                     segments_moved += moved
 
                     if not exited and not stop_requested:
-                        if moved > 0:
+                        if moved > 0 or _has_nonempty_session_media():
                             low_disk = _get_low_disk_soft_info(self.plugin_msg)
                             if low_disk is not None:
                                 free_gb, disk_upload_threshold_gb = low_disk
@@ -837,6 +978,8 @@ class DownloadBase(ABC):
             return False
 
         if stopped_by_timerange:
+            if not self._mesio_soft_triggered and _get_low_disk_soft_info(self.plugin_msg) is not None:
+                self._mesio_soft_triggered = True
             return False
 
         if segments_moved == 0:
@@ -927,11 +1070,11 @@ class DownloadBase(ABC):
             end_time = time.localtime()
 
             # 每段录制完成后、进入下一轮循环前，检测磁盘软水位
-            if ret:
-                if getattr(self, '_mesio_soft_triggered', False):
-                    disk_soft_triggered = True
-                    break
+            if getattr(self, '_mesio_soft_triggered', False):
+                disk_soft_triggered = True
+                break
 
+            if ret:
                 low_disk = _get_low_disk_soft_info(self.plugin_msg)
                 if low_disk is not None:
                     free_gb, disk_upload_threshold_gb = low_disk
