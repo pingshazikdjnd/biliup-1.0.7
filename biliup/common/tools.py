@@ -1,6 +1,10 @@
 import logging
+import os
+import platform
 import subprocess
+import sys
 import threading
+from typing import Optional
 
 logger = logging.getLogger('biliup')
 
@@ -36,14 +40,11 @@ def silence_event_loop_closed(func):
     return wrapper
 
 
-def get_file_create_timestamp(file: str) -> float:
+def get_file_birth_timestamp(file: str) -> Optional[float]:
     """
-    跨平台获取文件创建时间
-    如无法获取则返回修改时间
+    跨平台获取文件真实创建时间（birth time）
+    如平台或文件系统不支持则返回 None
     """
-    import os
-    import sys
-    import platform
     stat_result = os.stat(file)
 
     if hasattr(stat_result, "st_birthtime"):
@@ -54,14 +55,24 @@ def get_file_create_timestamp(file: str) -> float:
 
     if platform.system() == 'Linux':
         try:
-            import subprocess
-            time = float(subprocess.check_output(["stat", "-c", "%W", file]).decode('utf8'))
-            if time > 0:
-                return time
-        except:
+            birth_time = float(subprocess.check_output(["stat", "-c", "%W", file]).decode('utf8'))
+            if birth_time > 0:
+                return birth_time
+        except Exception:
             pass
 
-    return stat_result.st_mtime
+    return None
+
+
+def get_file_create_timestamp(file: str) -> float:
+    """
+    跨平台获取文件创建时间
+    如无法获取则返回修改时间
+    """
+    birth_ts = get_file_birth_timestamp(file)
+    if birth_ts is not None:
+        return birth_ts
+    return os.stat(file).st_mtime
 
 
 def processor(processors, data):
