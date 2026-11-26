@@ -19,6 +19,12 @@ top = false
 - 🔧已修复的问题
 - ⚠️需要手动操作的更新信息
 
+## 1.0.8
+
+### Patch Changes
+
+- 2587db5: 改用 semver 版本号，引入 GitHub App 机器人 + Changesets 自动打包发版
+
 ## 1.0.7.009
 ### What's Changed
 - 💡 新增外挂 mesio 下载器支持（FLV/HLS 实时时间戳修复）：支持全局/单主播覆写 `mesio` 与 `mesio_path`，采用 `.mesio_tmp` 隔离会话目录分段原子移出、软水位实时停机穿透 `delay`、冷启动残留自动恢复与 `ffmpeg` 回退
