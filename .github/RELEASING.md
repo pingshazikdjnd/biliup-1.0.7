@@ -1,6 +1,6 @@
 # 发版与自动打包指南
 
-本仓库采用 **GitHub App 机器人 + Changesets** 的自动化发版体系，并在 `v*` tag 触发后统一完成全平台 Wheel、Windows 桌面安装包（PyInstaller + Tauri）及可选 Termux Wheel 构建，最后一次性发布包含全部产物的 GitHub Release。
+本仓库采用 **GitHub App 机器人 + Changesets** 的自动化发版体系，并在 `v*` tag 触发后统一完成全平台 Wheel 与 Windows 桌面安装包（PyInstaller + Tauri）构建，最后一次性发布包含全部产物的 GitHub Release。
 
 ## 整体流程
 
@@ -48,7 +48,7 @@ flowchart LR
 3. 需要正式发版时，**合并 `Version Packages` PR** 到 `dev-1.0.7`：
    - `release.yml` 检测到无未消费的 changeset 且版本号相对上一父提交变化，即自动打 `vX.Y.Z` tag 并推送。
 4. `build-release.yml` 由 `v*` tag 触发：
-   - 并行调用可复用 workflow `ci.yml` 构建全部 Linux / musllinux / Windows / macOS wheels 与 sdist，同时构建 Windows Tauri 安装包与 Termux wheel。
+   - 并行调用可复用 workflow `ci.yml` 构建全部 Linux / musllinux / Windows / macOS wheels 与 sdist，同时构建 Windows Tauri 安装包。
    - 全部核心产物就绪并通过完整性校验（至少含 `.whl`、`*-setup.exe`、`*.msi`）后，执行防篡改溯源签名（artifact attestation）并一次性发布 GitHub Release。
 
 ---
@@ -77,8 +77,7 @@ flowchart LR
 
 ## 变更说明与已知限制
 
-- **旧 workflow 整合**：已将原 `releases.yml`、`pyinstaller-publish.yml`（两者重复）以及 `Termux-publish.yml` 整合进 `.github/workflows/build-release.yml` 统一编排；`ci.yml` 改造为可复用的纯构建 workflow（并升级至 `actions/setup-node@v4`）；保留 `Build Old Version.yml` 与 `docs-publish.yml`。
-- **Termux 为可选构建**：`termux` job 设置了 `continue-on-error: true`（依赖外部 `packages.termux.dev` 实时拉包），Termux 构建失败不会阻断其余全平台产物发布 Release。
+- **旧 workflow 整合**：已将原重复的 `releases.yml` 与 `pyinstaller-publish.yml` 整合进 `.github/workflows/build-release.yml` 统一编排，并移除了不使用的 `Termux-publish.yml`；`ci.yml` 改造为可复用的纯构建 workflow（并升级至 `actions/setup-node@v4`）；保留 `Build Old Version.yml` 与 `docs-publish.yml`。
 - **Docker 发布暂未在 tag 启用**：`.github/workflows/docker-publish.yml` 已移除 `tags: v*` 触发器，原因是其中的 `IMAGE_NAME` 仍指向上游组织镜像 `ghcr.io/biliup/caution`；如需从本 fork 发布 Docker 镜像，请先将 `IMAGE_NAME` 改为你自己的仓库路径后再恢复 tag 触发。
 - **前端内置更新日志仍需手动维护**：WebUI 首页 `app/page.tsx` 中的更新日志数组与 `REPO_RELEASES_URL` 不会由 Changesets 自动修改，发版前后如需在网页端展示请继续手动维护。
 
