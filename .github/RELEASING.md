@@ -38,13 +38,15 @@ flowchart LR
 
 ## 日常开发与发版操作
 
-1. 在基于 `dev-1.0.7` 的功能或修复分支开发完成后，运行：
-   ```bash
-   npm run changeset
-   ```
-   选择 `biliup` 与变更级别（`patch` / `minor` / `major`），填写中文更新说明，并将生成的 `.changeset/<随机名>.md` 一并提交到 PR。
+1. **平时提 PR 不用手动写 `.changeset`**：只要 PR 标题或提交信息遵循常规提交规范（Conventional Commits），合并到 `dev-1.0.7` 后机器人会自动识别：
+   - `feat: ...` → 升 **minor** 版本（例如 `1.0.8` → `1.1.0`）
+   - `fix: ...` / `perf: ...` / `revert: ...` → 升 **patch** 版本（例如 `1.0.8` → `1.0.9`）
+   - `feat!: ...` 或提交正文含 `BREAKING CHANGE:` → 升 **major** 版本
+   - `docs:` / `chore:` / `ci:` / `test:` / `style:` / `refactor:` → **不触发发版**
+   - 如需自定义更详细的 Release 说明，仍可在 PR 中运行 `npm run changeset` 手动生成 `.changeset/*.md`（同一提交存在手动 changeset 时优先采用手动文件）。
 2. PR 合并到 `dev-1.0.7` 后：
-   - `.github/workflows/release.yml` 自动创建或更新 `chore(release): version packages` PR。
+   - `.github/workflows/release.yml` 自动读取自上次发版 tag 以来新增的 PR 标题/提交并生成变更条目，由机器人创建或更新 `chore(release): version packages` PR。
+   - 若尚未合并 `Version Packages` PR，后续继续合并的 `feat:` / `fix:` PR 会自动汇总追加到同一个 `Version Packages` PR 中。
 3. 需要正式发版时，**合并 `Version Packages` PR** 到 `dev-1.0.7`：
    - `release.yml` 检测到无未消费的 changeset 且版本号相对上一父提交变化，即自动打 `vX.Y.Z` tag 并推送。
 4. `build-release.yml` 由 `v*` tag 触发：
