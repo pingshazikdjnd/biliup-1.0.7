@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 function extractSection(markdown, version) {
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
@@ -66,6 +66,18 @@ function updateJsonVersion(filePath, version) {
   });
 }
 
+function updateNpmLockVersion(filePath, version) {
+  if (!existsSync(filePath)) return;
+  writePreservingEol(filePath, (norm) => {
+    const lock = JSON.parse(norm);
+    lock.version = version;
+    if (lock.packages && lock.packages[""]) {
+      lock.packages[""].version = version;
+    }
+    return `${JSON.stringify(lock, null, 2)}\n`;
+  });
+}
+
 function updateCargoPackageVersion(filePath, version) {
   writePreservingEol(filePath, (norm) => {
     let replaced = false;
@@ -109,6 +121,7 @@ updateCargoPackageVersion("crates/stream-gears/Cargo.toml", version);
 updateCargoPackageVersion("tauri-app/src-tauri/Cargo.toml", version);
 updateJsonVersion("tauri-app/src-tauri/tauri.conf.json", version);
 updateJsonVersion("tauri-app/package.json", version);
+updateNpmLockVersion("tauri-app/package-lock.json", version);
 
 writePreservingEol("Cargo.lock", (norm) => {
   let updated = updateCargoLockPackageVersion(norm, "stream-gears", version);
