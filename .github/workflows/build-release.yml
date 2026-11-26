@@ -111,7 +111,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Extract release notes
         run: node .github/scripts/release-notes.mjs "${GITHUB_REF_NAME#v}" CHANGELOG.md > notes.md

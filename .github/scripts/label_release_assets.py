@@ -156,11 +156,12 @@ def main() -> int:
     )
     assets = release.get("assets", [])
     existing_names = {a["name"] for a in assets}
+    version = tag[1:] if tag.startswith("v") else tag
 
     updated = 0
     for asset in assets:
         name = asset["name"]
-        result = classify_asset(name, tag)
+        result = classify_asset(name, version)
         if not result:
             continue
         new_name, label = result
