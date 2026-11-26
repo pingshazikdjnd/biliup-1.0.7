@@ -154,6 +154,10 @@ class TestWebSecurityAndCrud(unittest.IsolatedAsyncioTestCase):
                 ' C:/Windows/System32/a.json',
                 'C:../secret.json',
                 'C:Windows/System32/a.json',
+                '/Windows/System32/a.json',
+                '\\Windows\\System32\\a.json',
+                '/Program Files/app/a.json',
+                '\\ProgramData\\secret.json',
                 'cookies.json ',
             ]
             for bad_val in invalid_values:
@@ -183,6 +187,95 @@ class TestWebSecurityAndCrud(unittest.IsolatedAsyncioTestCase):
                 payload = await resp.json()
                 self.assertEqual(payload[0]['value'], ok_val)
                 self.assertEqual(payload[0]['platform'], 'bilibili-cookies')
+
+    async def test_cookie_symlink_validation_blocks_sensitive_and_non_json_targets(self):
+        client = await self._make_client(password=None)
+
+        good_cookie = os.path.join(self._tmpdir.name, 'good_cookies.json')
+        secret_txt = os.path.join(self._tmpdir.name, 'secret.txt')
+        with open(good_cookie, 'w', encoding='utf-8') as f:
+            f.write('{}')
+        with open(secret_txt, 'w', encoding='utf-8') as f:
+            f.write('secret')
+
+        link_non_json = 'evil_non_json.json'
+        link_sensitive = 'evil_sys.json'
+        link_ok = 'ok_link.json'
+
+        created_real_symlinks = False
+        try:
+            os.symlink(secret_txt, link_non_json)
+            os.symlink(
+                'C:\\Windows\\System32\\a.json' if os.name == 'nt' else '/etc/shadow.json',
+                link_sensitive,
+            )
+            os.symlink(good_cookie, link_ok)
+            created_real_symlinks = True
+        except OSError:
+            created_real_symlinks = False
+
+        with patch.object(web_mod, 'SessionLocal', self._TestSession):
+            with self._TestSession() as db:
+                db.add(Configuration(key='bilibili-cookies', value=link_non_json))
+                db.commit()
+
+            if created_real_symlinks:
+                self.assertFalse(web_mod._validate_cookie_file_path(link_non_json))
+                self.assertFalse(web_mod._validate_cookie_file_path(link_sensitive))
+                self.assertTrue(web_mod._validate_cookie_file_path(link_ok))
+                self.assertFalse(web_mod._is_registered_cookie_file(link_non_json))
+
+                resp_bad = await client.post(
+                    '/v1/users',
+                    json={'platform': 'bilibili-cookies', 'value': link_non_json},
+                )
+                self.assertEqual(resp_bad.status, 400)
+                resp_sys = await client.post(
+                    '/v1/users',
+                    json={'platform': 'bilibili-cookies', 'value': link_sensitive},
+                )
+                self.assertEqual(resp_sys.status, 400)
+                resp_ok = await client.post(
+                    '/v1/users',
+                    json={'platform': 'bilibili-cookies', 'value': link_ok},
+                )
+                self.assertEqual(resp_ok.status, 200)
+            else:
+                # Windows 未开开发者模式导致 os.symlink 返回 1314 时，使用受控 mock 覆盖软链接目标校验分支
+                def fake_islink(p):
+                    return str(p).replace('\\', '/') in {link_non_json, link_sensitive, link_ok}
+
+                def fake_realpath(p):
+                    if p == link_non_json:
+                        return os.path.abspath(secret_txt)
+                    if p == link_sensitive:
+                        return '/etc/shadow.json'
+                    if p == link_ok:
+                        return os.path.abspath(good_cookie)
+                    return os.path.abspath(p)
+
+                with patch('biliup.web.os.path.islink', side_effect=fake_islink), \
+                        patch('biliup.web.os.path.realpath', side_effect=fake_realpath):
+                    self.assertFalse(web_mod._validate_cookie_file_path(link_non_json))
+                    self.assertFalse(web_mod._validate_cookie_file_path(link_sensitive))
+                    self.assertTrue(web_mod._validate_cookie_file_path(link_ok))
+                    self.assertFalse(web_mod._is_registered_cookie_file(link_non_json))
+
+                    resp_bad = await client.post(
+                        '/v1/users',
+                        json={'platform': 'bilibili-cookies', 'value': link_non_json},
+                    )
+                    self.assertEqual(resp_bad.status, 400)
+                    resp_sys = await client.post(
+                        '/v1/users',
+                        json={'platform': 'bilibili-cookies', 'value': link_sensitive},
+                    )
+                    self.assertEqual(resp_sys.status, 400)
+                    resp_ok = await client.post(
+                        '/v1/users',
+                        json={'platform': 'bilibili-cookies', 'value': link_ok},
+                    )
+                    self.assertEqual(resp_ok.status, 200)
 
     async def test_crud_missing_record_returns_400_or_404(self):
         client = await self._make_client(password=None)

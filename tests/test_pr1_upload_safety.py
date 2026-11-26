@@ -1332,6 +1332,87 @@ class TestPR1UploadSafety(unittest.TestCase):
         self.assertEqual(context['url_upload_count'][url], 0)
         self.assertNotIn(url, handler_mod._pending_soft_upload_urls)
 
+    # 22. P1(Sourcery #5): 已是 soft 事件的空扫描期间若再次到达软水位标记，同样不应吞掉而应重扫
+    def test_soft_empty_scan_rescans_when_concurrent_soft_arrives(self):
+        name = 'soft_empty_race_streamer'
+        url = 'http://p1-soft-empty-race.test/live'
+        new_seg = UploadBase.FileInfo(video='soft_new_seg.flv', danmaku=None)
+        config['delay'] = 30
+        config['max_upload_limit'] = 5
+        config['streamers'] = {name: {'url': url}}
+        context['url_upload_count'][url] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {url: 1}
+
+        scan_calls = {'count': 0}
+
+        def fake_file_list(target_name):
+            scan_calls['count'] += 1
+            if scan_calls['count'] == 1:
+                handler_mod._mark_pending_soft_upload(url)
+                return []
+            return [new_seg]
+
+        with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                patch('biliup.handler.UploadBase.file_list', side_effect=fake_file_list) as mock_file_list, \
+                patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
+                patch('biliup.handler._wait_upload_delay') as mock_wait_delay, \
+                patch('biliup.handler.upload', return_value=[new_seg]) as mock_upload, \
+                patch('biliup.handler.uploaded') as mock_uploaded:
+            process_upload(Event(UPLOAD, ({
+                'name': name,
+                'url': url,
+                'title': 't',
+                'disk_soft_triggered': True,
+            },)))
+
+        self.assertEqual(mock_file_list.call_count, 2)
+        mock_wait_delay.assert_not_called()
+        mock_upload.assert_called_once()
+        self.assertEqual(mock_upload.call_args.kwargs['target_files'], ['soft_new_seg.flv'])
+        mock_uploaded.assert_called_once_with(name, None, [new_seg])
+        self.assertEqual(context['url_upload_count'][url], 0)
+        self.assertNotIn(url, handler_mod._pending_soft_upload_urls)
+
+    # 23. P1(Sourcery #5): 活跃上传执行期间若软水位事件抵达，结束释放计数后必须补发一次 soft UPLOAD
+    def test_active_upload_dispatches_soft_followup_on_finish(self):
+        name = 'active_soft_followup_streamer'
+        url = 'http://p1-active-soft-followup.test/live'
+        seg1 = UploadBase.FileInfo(video='seg1.flv', danmaku=None)
+        config['delay'] = 0
+        config['max_upload_limit'] = 5
+        config['streamers'] = {name: {'url': url}}
+        context['url_upload_count'][url] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {url: 1}
+
+        def fake_upload(stream_info, target_files=None):
+            # 模拟正在上传 seg1 时，分片 2 触发了新的软水位 UPLOAD 事件
+            process_upload(Event(UPLOAD, ({
+                'name': name,
+                'url': url,
+                'title': 't',
+                'disk_soft_triggered': True,
+            },)))
+            self.assertIn(url, handler_mod._pending_soft_upload_urls)
+            return [seg1]
+
+        with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                patch('biliup.handler.UploadBase.file_list', return_value=[seg1]), \
+                patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
+                patch('biliup.handler.upload', side_effect=fake_upload), \
+                patch('biliup.handler.uploaded'), \
+                patch.object(handler_mod.event_manager, 'send_event') as mock_send_event:
+            process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+
+        self.assertEqual(context['url_upload_count'][url], 0)
+        self.assertNotIn(url, handler_mod._pending_soft_upload_urls)
+        mock_send_event.assert_called_once_with(Event(UPLOAD, ({
+            'name': name,
+            'url': url,
+            'disk_soft_triggered': True,
+        },)))
+
 
 if __name__ == '__main__':
     unittest.main()

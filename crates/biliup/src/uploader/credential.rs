@@ -86,8 +86,20 @@ fn cookie_path_parts(path: &Path) -> (&Path, &str) {
     (parent, file_name)
 }
 
-fn refresh_lock_path(path: &Path) -> PathBuf {
+fn canonical_cookie_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
     let (parent, file_name) = cookie_path_parts(path);
+    if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+        return canonical_parent.join(file_name);
+    }
+    path.to_path_buf()
+}
+
+fn refresh_lock_path(path: &Path) -> PathBuf {
+    let resolved = canonical_cookie_path(path);
+    let (parent, file_name) = cookie_path_parts(&resolved);
     parent.join(format!(".{file_name}.refresh.lock"))
 }
 
@@ -861,8 +873,8 @@ impl Default for Credential {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoginInfo, TokenInfo, read_login_info, refresh_login_info_with_lock,
-        write_login_info_atomic,
+        LoginInfo, RefreshLockGuard, TokenInfo, read_login_info, refresh_lock_path,
+        refresh_login_info_with_lock, write_login_info_atomic,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -1059,6 +1071,66 @@ mod tests {
         let disk = read_login_info(&target).unwrap();
         assert_eq!(disk.token_info.access_token, "access_v2");
         assert_eq!(disk.token_info.refresh_token, "refresh_v2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_refresh_lock_path_canonicalizes_aliases() {
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_lock_alias_test_{}",
+            std::process::id()
+        ));
+        let sub_dir = dir.join("sub");
+        let alias_dir = dir.join("alias_dir");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::create_dir_all(&alias_dir).unwrap();
+
+        let target = dir.join("cookies.json");
+        let v1 = sample_login_info(55555, "access_v1", "refresh_v1");
+        write_login_info_atomic(&target, &v1).unwrap();
+
+        let dot_alias = sub_dir.join("..").join("cookies.json");
+        assert_eq!(refresh_lock_path(&dot_alias), refresh_lock_path(&target));
+
+        let symlink_alias = alias_dir.join("alias.json");
+        #[cfg(unix)]
+        let symlink_created = std::os::unix::fs::symlink(&target, &symlink_alias).is_ok();
+        #[cfg(windows)]
+        let symlink_created = std::os::windows::fs::symlink_file(&target, &symlink_alias).is_ok();
+        if symlink_created {
+            assert_eq!(refresh_lock_path(&symlink_alias), refresh_lock_path(&target));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_lock_guard_holds_os_level_file_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_os_lock_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cookies.json");
+        let v1 = sample_login_info(66666, "access_v1", "refresh_v1");
+        write_login_info_atomic(&target, &v1).unwrap();
+
+        let guard = RefreshLockGuard::acquire(&target).await.unwrap();
+        let lock_path = refresh_lock_path(&target);
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        drop(guard);
+        probe.try_lock().unwrap();
+        let _ = probe.unlock();
 
         let _ = std::fs::remove_dir_all(&dir);
     }

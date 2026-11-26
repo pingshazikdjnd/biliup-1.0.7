@@ -145,8 +145,37 @@ _WINDOWS_SENSITIVE_PREFIXES = (
 )
 
 
+def _is_sensitive_cookie_path(norm_path: str) -> bool:
+    """检查规范化后的 Cookie 路径是否指向敏感系统目录（含无盘符 Windows 根路径）"""
+    cleaned = norm_path[4:] if norm_path.startswith('//?/') else norm_path
+    collapsed = re.sub(r'/+', '/', cleaned).lower()
+    if collapsed.startswith(_UNIX_SENSITIVE_PREFIXES):
+        return True
+    if re.match(r'^[a-z]:/', collapsed) and collapsed[3:].startswith(_WINDOWS_SENSITIVE_PREFIXES):
+        return True
+    if collapsed.startswith('/') and collapsed[1:].startswith(_WINDOWS_SENSITIVE_PREFIXES):
+        return True
+    return False
+
+
+def _has_symlink_component(path_str: str) -> bool:
+    """仅检查提交路径本身及其显式父路径段中是否存在符号链接，不向上穿越当前工作目录"""
+    p = pathlib.Path(path_str)
+    parts = p.parts
+    if not parts:
+        return False
+    cur = pathlib.Path(parts[0])
+    if not p.anchor and os.path.islink(cur):
+        return True
+    for part in parts[1:]:
+        cur = cur / part
+        if os.path.islink(cur):
+            return True
+    return False
+
+
 def _validate_cookie_file_path(value) -> bool:
-    """校验用户提交的 Cookie 文件路径，防止目录穿越与敏感系统路径注入"""
+    """校验用户提交的 Cookie 文件路径，防止目录穿越、软链接逃逸与敏感系统路径注入"""
     if not isinstance(value, str) or not value.strip():
         return False
     if value != value.strip():
@@ -163,17 +192,24 @@ def _validate_cookie_file_path(value) -> bool:
     basename = norm.rsplit('/', 1)[-1]
     if not basename.lower().endswith('.json') or len(basename) <= 5:
         return False
-    collapsed = re.sub(r'/+', '/', norm).lower()
-    if collapsed.startswith(_UNIX_SENSITIVE_PREFIXES):
+    if _is_sensitive_cookie_path(norm):
         return False
-    if re.match(r'^[a-z]:/', collapsed) and collapsed[3:].startswith(_WINDOWS_SENSITIVE_PREFIXES):
-        return False
+    if _has_symlink_component(value):
+        resolved = os.path.realpath(value).replace('\\', '/')
+        resolved_clean = resolved[4:] if resolved.startswith('//?/') else resolved
+        resolved_basename = resolved_clean.rsplit('/', 1)[-1]
+        if not resolved_basename.lower().endswith('.json') or len(resolved_basename) <= 5:
+            return False
+        if _is_sensitive_cookie_path(resolved_clean):
+            return False
     return True
 
 
 def _is_registered_cookie_file(file_path: str) -> bool:
     """校验传入的 Cookie 文件路径是否已登记在 bilibili-cookies 或现有投稿模板中"""
     if not file_path:
+        return False
+    if not _validate_cookie_file_path(file_path):
         return False
     with SessionLocal() as db:
         registered = db.scalars(

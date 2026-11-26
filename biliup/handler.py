@@ -417,12 +417,9 @@ def process_upload(stream_info):
     # 上传开始
     try:
         raw_file_list = UploadBase.file_list(name)
-        if len(raw_file_list) <= 0:
-            if not is_soft_event and _consume_pending_soft_upload(url):
-                is_soft_event = True
-                raw_file_list = UploadBase.file_list(name)
-            else:
-                _consume_pending_soft_upload(url)
+        while len(raw_file_list) <= 0 and _consume_pending_soft_upload(url):
+            is_soft_event = True
+            raw_file_list = UploadBase.file_list(name)
         if len(raw_file_list) <= 0:
             with _notified_exhausted_lock:
                 _notified_exhausted_files.pop(name, None)
@@ -618,8 +615,18 @@ def process_upload(stream_info):
     finally:
         # 上传结束
         # 有可能有两个同url的上传线程 保证计数正确
+        should_dispatch_soft_followup = False
         with NamedLock(f'upload_count_{url}'):
             url_upload_count[url] = max(0, url_upload_count.get(url, 1) - 1)
+            if url_upload_count[url] == 0 and _consume_pending_soft_upload(url):
+                should_dispatch_soft_followup = True
+        if should_dispatch_soft_followup:
+            logger.info(f'{name} -> {url} 检测到上传期间到达的软水位事件，触发后续上传')
+            event_manager.send_event(Event(UPLOAD, ({
+                'name': name,
+                'url': url,
+                'disk_soft_triggered': True,
+            },)))
 
 
 def uploaded(name, live_cover_path, data: List):
