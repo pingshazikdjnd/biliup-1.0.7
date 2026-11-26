@@ -6,8 +6,8 @@
 
 ```mermaid
 flowchart LR
-  A["开发分支运行 npm run changeset"] --> B["合并 PR 到 dev-1.0.7"]
-  B --> C["release.yml：App Token 驱动 Changesets"]
+  A["按规范写 PR 标题（或手动 npm run changeset）"] --> B["合并 PR 到 dev-1.0.7"]
+  B --> C["release.yml：auto-changeset + Changesets"]
   C --> D{"存在未消费的 .changeset/*.md?"}
   D -- 是 --> E["机器人创建/更新 Version Packages PR"]
   E --> F["同步版本到 Cargo / Tauri / CHANGELOG"]
@@ -48,7 +48,7 @@ flowchart LR
    - `.github/workflows/release.yml` 自动读取自上次发版 tag 以来新增的 PR 标题/提交并生成变更条目，由机器人创建或更新 `chore(release): version packages` PR。
    - 若尚未合并 `Version Packages` PR，后续继续合并的 `feat:` / `fix:` PR 会自动汇总追加到同一个 `Version Packages` PR 中。
 3. 需要正式发版时，**合并 `Version Packages` PR** 到 `dev-1.0.7`：
-   - `release.yml` 检测到无未消费的 changeset 且版本号相对上一父提交变化，即自动打 `vX.Y.Z` tag 并推送。
+   - `release.yml` 检测到无未消费的 changeset 且远端尚无当前版本号对应的 tag（且非基线版本），即自动打 `vX.Y.Z` tag 并推送。
 4. `build-release.yml` 由 `v*` tag 触发：
    - 并行调用可复用 workflow `ci.yml` 构建全部 Linux / musllinux / Windows / macOS wheels 与 sdist，同时构建 Windows Tauri 安装包。
    - 全部核心产物就绪并通过完整性校验（至少含 `.whl`、`*-setup.exe`、`*.msi`）后，执行防篡改溯源签名（artifact attestation）并一次性发布 GitHub Release。
