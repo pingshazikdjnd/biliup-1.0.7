@@ -1,8 +1,13 @@
+import asyncio
 import copy
+import importlib
+import json
+import multiprocessing as mp
 import os
 import shutil
 import smtplib
 import ssl
+import sys
 import tempfile
 import threading
 import time
@@ -11,7 +16,13 @@ from email import message_from_string
 from unittest.mock import MagicMock, patch, call
 from collections import namedtuple
 
+import requests
+
 import tests  # noqa: F401
+import biliup.app as app_mod
+import biliup.handler as handler_mod
+import biliup.plugins.bili_webup as bili_webup_mod
+import biliup.plugins.biliuprs as biliuprs_mod
 from biliup.config import config
 from biliup.app import context
 from biliup.common.notify import (
@@ -20,13 +31,19 @@ from biliup.common.notify import (
     _send_email_sync,
     is_notify_enabled,
 )
+from biliup.engine.decorators import Plugin
 from biliup.engine.download import DownloadBase
 from biliup.engine.upload import UploadBase
 from biliup.engine.event import Event
 from biliup.handler import (
     clear_notified_exhausted_files,
+    clear_pending_soft_upload_urls,
     is_unrecoverable_error,
+    process,
+    processed,
     process_upload,
+    DOWNLOAD,
+    DOWNLOADED,
     UPLOAD,
 )
 import biliup.uploader as uploader
@@ -36,6 +53,8 @@ class TestPR1UploadSafety(unittest.TestCase):
     def setUp(self):
         clear_cooldown()
         clear_notified_exhausted_files()
+        clear_pending_soft_upload_urls()
+        UploadBase.reset_last_claimed_videos()
         self._config_snapshot = {
             k: (v if k == 'PluginInfo' else copy.deepcopy(v))
             for k, v in config.data.items()
@@ -51,6 +70,8 @@ class TestPR1UploadSafety(unittest.TestCase):
         config.data.update(self._config_snapshot)
         clear_cooldown()
         clear_notified_exhausted_files()
+        clear_pending_soft_upload_urls()
+        UploadBase.reset_last_claimed_videos()
 
     # 1. biliuprs.py upload_process exitcode 检查及 Pipe try/finally 资源关闭
     @patch('multiprocessing.get_context')
@@ -746,6 +767,651 @@ class TestPR1UploadSafety(unittest.TestCase):
         _wait_notify_threads()
         self.assertEqual(mock_smtp_ssl_cls.call_count, 4)
         mock_ok_inst2.sendmail.assert_called_once()
+
+    # 13. P1-4: bili_web 在 -101 或缺失 cookie 文件时不吞异常并命中首次熔断；成功 Cookie 登录不覆写磁盘文件；store 原子写入并清理临时文件
+    def test_bili_web_unrecoverable_circuit_break_and_cookie_file_preservation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cookie_path = os.path.join(tmpdir, '12345.json')
+            raw_cookie_text = json.dumps(
+                {
+                    'cookie_info': {
+                        'cookies': [
+                            {'name': 'SESSDATA', 'value': 'sess_1'},
+                            {'name': 'bili_jct', 'value': 'jct_1'},
+                        ]
+                    },
+                    'token_info': {
+                        'access_token': 'acc_tok',
+                        'refresh_token': 'ref_tok',
+                    },
+                },
+                indent=2,
+            )
+            with open(cookie_path, 'w', encoding='utf-8') as f:
+                f.write(raw_cookie_text)
+
+            # 13a. 正常 Cookie 登录不调用 store() 且不改写/截断磁盘 Cookie 文件
+            bili = bili_webup_mod.BiliBili(bili_webup_mod.Data())
+            ok_nav = MagicMock()
+            ok_nav.json.return_value = {'code': 0, 'data': {'isLogin': True}}
+            with patch.object(bili._BiliBili__session, 'get', return_value=ok_nav), \
+                 patch.object(bili, 'store', wraps=bili.store) as store_spy:
+                bili.login('bili.cookie', cookie_path)
+            store_spy.assert_not_called()
+            with open(cookie_path, 'r', encoding='utf-8') as f:
+                self.assertEqual(f.read(), raw_cookie_text)
+
+            # 13b. bili_web 上传在 nav 返回 -101 时触发首次熔断
+            mock_file_101 = UploadBase.FileInfo(video='web_101.mp4', danmaku=None)
+            config['max_upload_limit'] = 5
+            config['streamers'] = {
+                'test_streamer': {
+                    'url': 'http://test.com',
+                    'uploader': 'bili_web',
+                    'user_cookie': cookie_path,
+                    'title': 'test',
+                }
+            }
+            context['url_upload_count']['http://test.com'] = 0
+            context['file_upload_count'] = {'web_101.mp4': 0}
+            context['PluginInfo'] = MagicMock()
+            context['PluginInfo'].url_status = {'http://test.com': 2}
+
+            err_nav = MagicMock()
+            err_nav.json.return_value = {'code': -101, 'message': '账号未登录'}
+            with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                 patch('biliup.engine.upload.UploadBase.file_list', return_value=[mock_file_101]), \
+                 patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
+                 patch('biliup.handler.uploaded') as mock_uploaded, \
+                 patch('biliup.handler.send_notification') as mock_notify, \
+                 patch.object(requests.Session, 'get', return_value=err_nav):
+                process_upload(Event(UPLOAD, ({'name': 'test_streamer', 'url': 'http://test.com', 'title': 'test'},)))
+
+            mock_uploaded.assert_not_called()
+            self.assertEqual(context['file_upload_count']['web_101.mp4'], 5)
+            mock_notify.assert_called_once()
+            self.assertEqual(mock_notify.call_args.kwargs['error_type'], 'unrecoverable_upload_error')
+            self.assertIn('-101', mock_notify.call_args.kwargs['content'])
+
+            # 13c. bili_web 上传在 cookie 文件缺失时抛 FileNotFoundError 并触发首次熔断
+            clear_cooldown()
+            clear_notified_exhausted_files()
+            missing_cookie = os.path.join(tmpdir, 'missing_cookie.json')
+            mock_file_missing = UploadBase.FileInfo(video='web_missing.mp4', danmaku=None)
+            config['streamers']['test_streamer']['user_cookie'] = missing_cookie
+            context['file_upload_count'] = {'web_missing.mp4': 0}
+
+            with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                 patch('biliup.engine.upload.UploadBase.file_list', return_value=[mock_file_missing]), \
+                 patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
+                 patch('biliup.handler.uploaded') as mock_uploaded, \
+                 patch('biliup.handler.send_notification') as mock_notify:
+                process_upload(Event(UPLOAD, ({'name': 'test_streamer', 'url': 'http://test.com', 'title': 'test'},)))
+
+            mock_uploaded.assert_not_called()
+            self.assertEqual(context['file_upload_count']['web_missing.mp4'], 5)
+            mock_notify.assert_called_once()
+            self.assertEqual(mock_notify.call_args.kwargs['error_type'], 'unrecoverable_upload_error')
+
+            # 13d. store() 原子写入并在替换失败时清理临时文件且保留原文件
+            bili_store = bili_webup_mod.BiliBili(bili_webup_mod.Data())
+            bili_store.persistence_path = cookie_path
+            bili_store.cookies = {'SESSDATA': 'new_sess'}
+            bili_store.access_token = 'new_acc'
+            bili_store.refresh_token = 'new_ref'
+
+            with patch.object(bili_webup_mod.os, 'replace', side_effect=OSError('replace failed')):
+                with self.assertRaises(OSError):
+                    bili_store.store()
+            with open(cookie_path, 'r', encoding='utf-8') as f:
+                self.assertEqual(f.read(), raw_cookie_text)
+            self.assertEqual([n for n in os.listdir(tmpdir) if n.startswith('.cookie_')], [])
+
+            bili_store.store()
+            with open(cookie_path, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            self.assertEqual(saved['SESSDATA'], 'new_sess')
+            self.assertEqual(saved['access_token'], 'new_acc')
+            self.assertEqual(saved['refresh_token'], 'new_ref')
+            self.assertEqual([n for n in os.listdir(tmpdir) if n.startswith('.cookie_')], [])
+
+    # 14. P1-7: 真实 spawn 子进程发送 128KB 异常信息在 5 秒内结束并上抛 RuntimeError，不发生Pipe死锁
+    def test_biliuprs_spawn_large_error_no_pipe_deadlock(self):
+        # 14a. stream_gears_upload 捕获 128KB 异常并发送有界消息，finally 中关闭 ex_conn
+        parent_conn, child_conn = mp.Pipe()
+        worker_errors = []
+
+        def _run_stream_gears_upload():
+            try:
+                biliuprs_mod.stream_gears_upload(child_conn, 'AUTO')
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        try:
+            with patch.object(
+                biliuprs_mod.stream_gears,
+                'upload',
+                side_effect=RuntimeError('X' * (128 * 1024)),
+            ):
+                t = threading.Thread(target=_run_stream_gears_upload, daemon=True)
+                t.start()
+                received = parent_conn.recv()
+                with self.assertRaises(EOFError):
+                    parent_conn.recv()
+                t.join(timeout=5)
+                self.assertFalse(t.is_alive())
+            self.assertEqual(worker_errors, [])
+            self.assertEqual(received, 'X' * 8192)
+            self.assertLessEqual(len(received), 8192)
+        finally:
+            try:
+                parent_conn.close()
+            except Exception:
+                pass
+            try:
+                child_conn.close()
+            except Exception:
+                pass
+
+        # 14b. 真实 spawn 子进程抛 128KB 字符串 RuntimeError，5 秒内结束并上抛 RuntimeError 无死锁
+        fake_files = [UploadBase.FileInfo(video='test_spawn.mp4', danmaku=None)]
+        up_rs = biliuprs_mod.BiliWeb(
+            'test_streamer',
+            {'format_title': 'test_title', 'url': 'http://example.com'},
+            user_cookie='fake_cookie.json',
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            helper_path = os.path.join(tmpdir, '_spawn_pipe_helper.py')
+            with open(helper_path, 'w', encoding='utf-8') as f:
+                f.write(
+                    "def run_large_error(ex_conn, lines, *args, **kwargs):\n"
+                    "    try:\n"
+                    "        raise RuntimeError('E' * (128 * 1024))\n"
+                    "    except Exception as e:\n"
+                    "        ex_conn.send(str(e))\n"
+                    "    finally:\n"
+                    "        ex_conn.close()\n"
+                )
+            sys.path.insert(0, tmpdir)
+            try:
+                helper_mod = importlib.import_module('_spawn_pipe_helper')
+                with patch.object(biliuprs_mod, 'stream_gears_upload', helper_mod.run_large_error):
+                    t0 = time.monotonic()
+                    with self.assertRaises(RuntimeError) as ctx_err:
+                        up_rs.upload(fake_files)
+                    elapsed = time.monotonic() - t0
+                self.assertLess(elapsed, 5.0)
+                self.assertEqual(len(str(ctx_err.exception)), 128 * 1024)
+            finally:
+                if tmpdir in sys.path:
+                    sys.path.remove(tmpdir)
+                sys.modules.pop('_spawn_pipe_helper', None)
+
+    # 15. P1-1a: process 在 downloaded_processor 完成及 UPLOAD 派发前保持 url_status == 1，阻止 singleton_check 抢跑；保留 DOWNLOADED 兼容注册
+    def test_p1_1_process_holds_url_status_through_downloaded_processor_and_upload_dispatch(self):
+        streamer = 'p11_proc_streamer'
+        url = 'http://p11-proc.test/live'
+        config['streamers'] = {
+            streamer: {
+                'url': url,
+                'downloaded_processor': [{'run': 'echo post'}],
+            }
+        }
+        pi = MagicMock()
+        pi.url_status = {url: 0}
+        pi.inverted_index = {url: streamer}
+        context['PluginInfo'] = pi
+        context['url_upload_count'][url] = 0
+
+        class DummyPlatform:
+            def __init__(self, n, u):
+                pass
+
+            async def acheck_stream(self, is_check=False):
+                return True
+
+            def should_record(self):
+                return True
+
+        timeline = []
+        singleton_events = []
+
+        def fake_download(n, u, cfg):
+            timeline.append(('download', pi.url_status[url]))
+            return {'name': n, 'url': u, 'title': 't', 'disk_soft_triggered': True}
+
+        def fake_processor(procs, payload):
+            timeline.append(('downloaded_processor', pi.url_status[url]))
+            asyncio.run(app_mod.singleton_check(DummyPlatform, streamer, url))
+
+        def capture_send_event(ev):
+            if ev.type_ == UPLOAD and 'title' not in ev.args[0]:
+                singleton_events.append(ev)
+                return
+            timeline.append(('send_upload', pi.url_status[url], ev.type_, ev.args[0].get('disk_soft_triggered')))
+
+        with patch('biliup.handler.biliup_download', side_effect=fake_download), \
+                patch('biliup.handler.UploadBase.file_list', return_value=[UploadBase.FileInfo('seg.flv', None)]), \
+                patch('biliup.handler.processor', side_effect=fake_processor), \
+                patch('biliup.handler.check_timerange', return_value=True), \
+                patch.object(handler_mod.event_manager, 'send_event', side_effect=capture_send_event), \
+                patch.object(app_mod.event_manager, 'send_event', side_effect=capture_send_event):
+            process(Event(DOWNLOAD, (streamer, url)))
+
+        self.assertEqual(singleton_events, [])
+        self.assertEqual(
+            timeline,
+            [
+                ('download', 1),
+                ('downloaded_processor', 1),
+                ('send_upload', 1, UPLOAD, True),
+            ],
+        )
+        self.assertEqual(pi.url_status[url], 0)
+        self.assertIn(url, handler_mod._pending_soft_upload_urls)
+
+        # 外部直接发送 Event(DOWNLOADED, ...) 仍由 processed 兼容执行 downloaded_processor 并派发 UPLOAD
+        clear_pending_soft_upload_urls()
+        processed_events = []
+        with patch('biliup.handler.UploadBase.file_list', return_value=[UploadBase.FileInfo('seg.flv', None)]), \
+                patch('biliup.handler.processor') as mock_proc2, \
+                patch.object(handler_mod.event_manager, 'send_event', side_effect=lambda ev: processed_events.append(ev)):
+            processed(Event(DOWNLOADED, ({'name': streamer, 'url': url, 'title': 't', 'disk_soft_triggered': True},)))
+
+        mock_proc2.assert_called_once()
+        self.assertEqual(len(processed_events), 1)
+        self.assertEqual(processed_events[0].type_, UPLOAD)
+        self.assertIn(url, handler_mod._pending_soft_upload_urls)
+
+    # 16. P1-1b: 软水位事件唤醒处于 delay 等待中的同 url 上传并穿透 url_status == 1 立即上传
+    def test_p1_1_soft_upload_wakes_delay_waiter_and_bypasses_url_status_1(self):
+        orig_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.chdir(tmpdir)
+            try:
+                video_name = 'soft_wake.mp4'
+                with open(video_name, 'wb') as f:
+                    f.write(b'video')
+                mock_file = UploadBase.FileInfo(video=video_name, danmaku=None)
+
+                name = 'wake_streamer'
+                url = 'http://p11-wake.test/live'
+                config['delay'] = 30
+                config['max_upload_limit'] = 5
+                config['streamers'] = {name: {'url': url}}
+                context['url_upload_count'][url] = 0
+                context['file_upload_count'] = {video_name: 0}
+                context['PluginInfo'] = MagicMock()
+                context['PluginInfo'].url_status = {url: 0}
+
+                errors = []
+                with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                        patch('biliup.handler.UploadBase.file_list', return_value=[mock_file]), \
+                        patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
+                        patch('biliup.handler.upload', return_value=[mock_file]) as mock_upload, \
+                        patch('biliup.handler.uploaded') as mock_uploaded:
+
+                    def run_bare():
+                        try:
+                            process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+                        except Exception as exc:
+                            errors.append(exc)
+
+                    def run_soft():
+                        try:
+                            process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't', 'disk_soft_triggered': True},)))
+                        except Exception as exc:
+                            errors.append(exc)
+
+                    t1 = threading.Thread(target=run_bare)
+                    t1.start()
+
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        with handler_mod._soft_upload_lock:
+                            waiting = url in handler_mod._upload_delay_events
+                        if waiting:
+                            break
+                        time.sleep(0.01)
+                    self.assertTrue(waiting)
+
+                    # 模拟延迟期间 url_status 被置为 1
+                    context['PluginInfo'].url_status[url] = 1
+                    t0 = time.monotonic()
+                    t2 = threading.Thread(target=run_soft)
+                    t2.start()
+
+                    t2.join(timeout=3.0)
+                    t1.join(timeout=3.0)
+                    elapsed = time.monotonic() - t0
+
+                self.assertEqual(errors, [])
+                self.assertFalse(t1.is_alive())
+                self.assertFalse(t2.is_alive())
+                self.assertLess(elapsed, 3.0)
+                mock_upload.assert_called_once()
+                mock_uploaded.assert_called_once_with(name, None, [mock_file])
+                self.assertEqual(context['url_upload_count'][url], 0)
+                self.assertNotIn(url, handler_mod._pending_soft_upload_urls)
+                self.assertNotIn(url, handler_mod._upload_delay_events)
+            finally:
+                os.chdir(orig_cwd)
+
+    # 17. P1-1b: 裸 UPLOAD 进入 process_upload 时若已有待处理软水位标记，直接穿透 delay 与 url_status == 1
+    def test_p1_1_bare_upload_consumes_pending_soft_flag_and_skips_delay(self):
+        name = 'pending_soft_streamer'
+        url = 'http://p11-pending.test/live'
+        mock_file = UploadBase.FileInfo(video='pending_soft.mp4', danmaku=None)
+        config['delay'] = 30
+        config['max_upload_limit'] = 5
+        config['streamers'] = {name: {'url': url}}
+        context['url_upload_count'][url] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {url: 1}
+
+        handler_mod._mark_pending_soft_upload(url)
+        with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                patch('biliup.handler.UploadBase.file_list', return_value=[mock_file]), \
+                patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
+                patch('biliup.handler._wait_upload_delay') as mock_wait_delay, \
+                patch('biliup.handler.upload', return_value=[mock_file]) as mock_upload, \
+                patch('biliup.handler.uploaded') as mock_uploaded:
+            process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+
+        mock_wait_delay.assert_not_called()
+        mock_upload.assert_called_once()
+        mock_uploaded.assert_called_once_with(name, None, [mock_file])
+        self.assertNotIn(url, handler_mod._pending_soft_upload_urls)
+
+    # 18. P1-6a: get_max_upload_count 仅调用一次 os.listdir('.')，遇已消失文件安全跳过不抛 KeyError
+    def test_p1_6_get_max_upload_count_single_listdir_and_vanished_file_safe(self):
+        orig_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.chdir(tmpdir)
+            try:
+                with open('present.mp4', 'wb') as f:
+                    f.write(b'ok')
+                context['file_upload_count'] = {
+                    'present.mp4': 2,
+                    'vanished.mp4': 1,
+                    'stale.mp4': 4,
+                }
+                real_listdir = os.listdir
+                with patch('biliup.engine.upload.os.listdir', wraps=real_listdir) as spy_listdir:
+                    max_cnt = UploadBase.get_max_upload_count([
+                        UploadBase.FileInfo(video='vanished.mp4', danmaku=None),
+                        UploadBase.FileInfo(video='present.mp4', danmaku=None),
+                    ])
+                    self.assertEqual(spy_listdir.call_count, 1)
+                    self.assertEqual(max_cnt, 2)
+                    self.assertEqual(context['file_upload_count'], {'present.mp4': 3})
+
+                    max_cnt_all_vanished = UploadBase.get_max_upload_count([
+                        UploadBase.FileInfo(video='vanished.mp4', danmaku=None),
+                    ])
+                    self.assertEqual(spy_listdir.call_count, 2)
+                    self.assertEqual(max_cnt_all_vanished, 0)
+                    self.assertEqual(context['file_upload_count'], {'present.mp4': 3})
+            finally:
+                os.chdir(orig_cwd)
+
+    # 19. P1-6b: process_upload 在 delay 结束后剔除已消失文件；全消失时提前返回
+    def test_p1_6_process_upload_refilters_vanished_files_after_delay(self):
+        orig_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.chdir(tmpdir)
+            try:
+                with open('vanish.mp4', 'wb') as f:
+                    f.write(b'v1')
+                with open('keep.mp4', 'wb') as f:
+                    f.write(b'v2')
+
+                name = 'refilter_streamer'
+                url = 'http://p16-refilter.test/live'
+                config['delay'] = 10
+                config['max_upload_limit'] = 5
+                config['streamers'] = {name: {'url': url}}
+                context['url_upload_count'][url] = 0
+                context['file_upload_count'] = {'vanish.mp4': 0, 'keep.mp4': 0}
+                context['PluginInfo'] = MagicMock()
+                context['PluginInfo'].url_status = {url: 0}
+
+                file_vanish = UploadBase.FileInfo(video='vanish.mp4', danmaku=None)
+                file_keep = UploadBase.FileInfo(video='keep.mp4', danmaku=None)
+
+                def _remove_vanish(_url, _delay):
+                    os.remove('vanish.mp4')
+                    return False
+
+                with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                        patch('biliup.handler.UploadBase.file_list', return_value=[file_vanish, file_keep]), \
+                        patch('biliup.handler._wait_upload_delay', side_effect=_remove_vanish), \
+                        patch('biliup.handler.upload', return_value=[file_keep]) as mock_upload, \
+                        patch('biliup.handler.uploaded') as mock_uploaded:
+                    process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+
+                mock_upload.assert_called_once()
+                self.assertEqual(mock_upload.call_args.kwargs.get('target_files'), ['keep.mp4'])
+                mock_uploaded.assert_called_once_with(name, None, [file_keep])
+                self.assertEqual(context['file_upload_count'], {'keep.mp4': 1})
+
+                # 若 delay 结束后全部待传文件都已消失，应直接跳过后续上传
+                os.remove('keep.mp4')
+                with open('vanish_all.mp4', 'wb') as f:
+                    f.write(b'v3')
+                file_all = UploadBase.FileInfo(video='vanish_all.mp4', danmaku=None)
+
+                def _remove_all(_url, _delay):
+                    os.remove('vanish_all.mp4')
+                    return False
+
+                with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                        patch('biliup.handler.UploadBase.file_list', return_value=[file_all]), \
+                        patch('biliup.handler._wait_upload_delay', side_effect=_remove_all), \
+                        patch('biliup.handler.UploadBase.get_max_upload_count') as mock_get_count, \
+                        patch('biliup.handler.upload') as mock_upload2:
+                    process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+
+                mock_get_count.assert_not_called()
+                mock_upload2.assert_not_called()
+            finally:
+                os.chdir(orig_cwd)
+
+    # 20. P1-6c: 部分认领时回退未被认领文件的计数，且异常/熔断仅作用于实际认领文件
+    def test_p1_6_partial_claim_rolls_back_unclaimed_counts_and_scopes_circuit_break(self):
+        orig_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.chdir(tmpdir)
+            try:
+                with open('file_a.mp4', 'wb') as f:
+                    f.write(b'a')
+                with open('file_b.mp4', 'wb') as f:
+                    f.write(b'b')
+
+                file_a = UploadBase.FileInfo(video='file_a.mp4', danmaku=None)
+                file_b = UploadBase.FileInfo(video='file_b.mp4', danmaku=None)
+                name = 'partial_streamer'
+                url = 'http://p16-partial.test/live'
+
+                behavior = {'mode': 'ok', 'claimed': []}
+
+                class FakePartialUploader(UploadBase):
+                    def upload(self, file_list):
+                        behavior['claimed'].append(list(file_list))
+                        if behavior['mode'] == 'ok':
+                            return list(file_list)
+                        if behavior['mode'] == 'unrecoverable':
+                            raise RuntimeError('code: -101, message: 账号未登录')
+                        raise TimeoutError('transient timeout')
+
+                config['max_upload_limit'] = 3
+                config['delay'] = 0
+                config['streamers'] = {
+                    name: {'url': url, 'uploader': 'fake_partial', 'title': 't'}
+                }
+                context['PluginInfo'] = MagicMock()
+                context['PluginInfo'].url_status = {url: 2}
+
+                with patch.dict(Plugin.upload_plugins, {'fake_partial': FakePartialUploader}), \
+                        patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                        patch('biliup.engine.upload.UploadBase.file_list', return_value=[file_a, file_b]):
+
+                    # A. 部分认领成功：file_b 被手动上传占用未认领，其计数回退为 0
+                    context['upload_filename'] = ['file_b']
+                    context['url_upload_count'][url] = 0
+                    context['file_upload_count'] = {'file_a.mp4': 0, 'file_b.mp4': 0}
+                    with patch('biliup.handler.uploaded') as mock_uploaded:
+                        process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+                    self.assertEqual(behavior['claimed'][-1], [file_a])
+                    mock_uploaded.assert_called_once_with(name, None, [file_a])
+                    self.assertEqual(context['file_upload_count']['file_a.mp4'], 1)
+                    self.assertEqual(context['file_upload_count']['file_b.mp4'], 0)
+
+                    # B. 部分认领遇 -101 不可自愈错误：仅熔断 file_a，file_b 回退且不被标记耗尽
+                    clear_notified_exhausted_files()
+                    behavior['mode'] = 'unrecoverable'
+                    context['upload_filename'] = ['file_b']
+                    context['url_upload_count'][url] = 0
+                    context['file_upload_count'] = {'file_a.mp4': 0, 'file_b.mp4': 0}
+                    with patch('biliup.handler.send_notification') as mock_notify:
+                        process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+                    self.assertEqual(context['file_upload_count']['file_a.mp4'], 3)
+                    self.assertEqual(context['file_upload_count']['file_b.mp4'], 0)
+                    mock_notify.assert_called_once()
+                    self.assertEqual(mock_notify.call_args.kwargs['error_type'], 'unrecoverable_upload_error')
+                    self.assertEqual(handler_mod._notified_exhausted_files.get(name), {'file_a.mp4'})
+
+                    # C. 部分认领遇瞬态失败：未认领文件 file_b 原本计数 2，回退后保持 2；file_a 仅为 1 不误报上限
+                    clear_notified_exhausted_files()
+                    behavior['mode'] = 'transient'
+                    context['upload_filename'] = ['file_b']
+                    context['url_upload_count'][url] = 0
+                    context['file_upload_count'] = {'file_a.mp4': 0, 'file_b.mp4': 2}
+                    with patch('biliup.handler.send_notification') as mock_notify2:
+                        process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+                    self.assertEqual(context['file_upload_count']['file_a.mp4'], 1)
+                    self.assertEqual(context['file_upload_count']['file_b.mp4'], 2)
+                    mock_notify2.assert_not_called()
+            finally:
+                os.chdir(orig_cwd)
+
+    # 21. P1: 空列表扫描期间并发到达软水位标记时，不吞事件，重扫并跳过 delay 完成上传
+    def test_empty_scan_rescans_when_pending_soft_upload_arrives(self):
+        name = 'empty_race_streamer'
+        url = 'http://p1-empty-soft-race.test/live'
+        new_seg = UploadBase.FileInfo(video='new_seg.flv', danmaku=None)
+        config['delay'] = 30
+        config['max_upload_limit'] = 5
+        config['streamers'] = {name: {'url': url}}
+        context['url_upload_count'][url] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {url: 1}
+
+        scan_calls = {'count': 0}
+
+        def fake_file_list(target_name):
+            scan_calls['count'] += 1
+            if scan_calls['count'] == 1:
+                handler_mod._mark_pending_soft_upload(url)
+                return []
+            return [new_seg]
+
+        with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                patch('biliup.handler.UploadBase.file_list', side_effect=fake_file_list) as mock_file_list, \
+                patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
+                patch('biliup.handler._wait_upload_delay') as mock_wait_delay, \
+                patch('biliup.handler.upload', return_value=[new_seg]) as mock_upload, \
+                patch('biliup.handler.uploaded') as mock_uploaded:
+            process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+
+        self.assertEqual(mock_file_list.call_count, 2)
+        mock_wait_delay.assert_not_called()
+        mock_upload.assert_called_once()
+        self.assertEqual(mock_upload.call_args.kwargs['target_files'], ['new_seg.flv'])
+        mock_uploaded.assert_called_once_with(name, None, [new_seg])
+        self.assertEqual(context['url_upload_count'][url], 0)
+        self.assertNotIn(url, handler_mod._pending_soft_upload_urls)
+
+    # 22. P1(Sourcery #5): 已是 soft 事件的空扫描期间若再次到达软水位标记，同样不应吞掉而应重扫
+    def test_soft_empty_scan_rescans_when_concurrent_soft_arrives(self):
+        name = 'soft_empty_race_streamer'
+        url = 'http://p1-soft-empty-race.test/live'
+        new_seg = UploadBase.FileInfo(video='soft_new_seg.flv', danmaku=None)
+        config['delay'] = 30
+        config['max_upload_limit'] = 5
+        config['streamers'] = {name: {'url': url}}
+        context['url_upload_count'][url] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {url: 1}
+
+        scan_calls = {'count': 0}
+
+        def fake_file_list(target_name):
+            scan_calls['count'] += 1
+            if scan_calls['count'] == 1:
+                handler_mod._mark_pending_soft_upload(url)
+                return []
+            return [new_seg]
+
+        with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                patch('biliup.handler.UploadBase.file_list', side_effect=fake_file_list) as mock_file_list, \
+                patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
+                patch('biliup.handler._wait_upload_delay') as mock_wait_delay, \
+                patch('biliup.handler.upload', return_value=[new_seg]) as mock_upload, \
+                patch('biliup.handler.uploaded') as mock_uploaded:
+            process_upload(Event(UPLOAD, ({
+                'name': name,
+                'url': url,
+                'title': 't',
+                'disk_soft_triggered': True,
+            },)))
+
+        self.assertEqual(mock_file_list.call_count, 2)
+        mock_wait_delay.assert_not_called()
+        mock_upload.assert_called_once()
+        self.assertEqual(mock_upload.call_args.kwargs['target_files'], ['soft_new_seg.flv'])
+        mock_uploaded.assert_called_once_with(name, None, [new_seg])
+        self.assertEqual(context['url_upload_count'][url], 0)
+        self.assertNotIn(url, handler_mod._pending_soft_upload_urls)
+
+    # 23. P1(Sourcery #5): 活跃上传执行期间若软水位事件抵达，结束释放计数后必须补发一次 soft UPLOAD
+    def test_active_upload_dispatches_soft_followup_on_finish(self):
+        name = 'active_soft_followup_streamer'
+        url = 'http://p1-active-soft-followup.test/live'
+        seg1 = UploadBase.FileInfo(video='seg1.flv', danmaku=None)
+        config['delay'] = 0
+        config['max_upload_limit'] = 5
+        config['streamers'] = {name: {'url': url}}
+        context['url_upload_count'][url] = 0
+        context['PluginInfo'] = MagicMock()
+        context['PluginInfo'].url_status = {url: 1}
+
+        def fake_upload(stream_info, target_files=None):
+            # 模拟正在上传 seg1 时，分片 2 触发了新的软水位 UPLOAD 事件
+            process_upload(Event(UPLOAD, ({
+                'name': name,
+                'url': url,
+                'title': 't',
+                'disk_soft_triggered': True,
+            },)))
+            self.assertIn(url, handler_mod._pending_soft_upload_urls)
+            return [seg1]
+
+        with patch('biliup.handler.SessionLocal', side_effect=RuntimeError('skip db')), \
+                patch('biliup.handler.UploadBase.file_list', return_value=[seg1]), \
+                patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
+                patch('biliup.handler.upload', side_effect=fake_upload), \
+                patch('biliup.handler.uploaded'), \
+                patch.object(handler_mod.event_manager, 'send_event') as mock_send_event:
+            process_upload(Event(UPLOAD, ({'name': name, 'url': url, 'title': 't'},)))
+
+        self.assertEqual(context['url_upload_count'][url], 0)
+        self.assertNotIn(url, handler_mod._pending_soft_upload_urls)
+        mock_send_event.assert_called_once_with(Event(UPLOAD, ({
+            'name': name,
+            'url': url,
+            'disk_soft_triggered': True,
+        },)))
 
 
 if __name__ == '__main__':

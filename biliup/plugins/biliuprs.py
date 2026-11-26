@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import threading
 import time
 
 import stream_gears
@@ -68,6 +69,10 @@ class BiliWeb(UploadBase):
             }]
 
         ex_parent_conn, ex_child_conn = mp.Pipe()
+        child_conn_closed = False
+        reader_thread = None
+        pipe_err = None
+        has_pipe_err = False
         try:
             upload_args = {
                 "ex_conn": ex_child_conn,
@@ -97,29 +102,61 @@ class BiliWeb(UploadBase):
             }
             upload_process = mp.get_context('spawn').Process(target=stream_gears_upload, daemon=True, kwargs=upload_args)
             upload_process.start()
-            upload_process.join()
-            if upload_process.exitcode != 0:
-                err = None
+            is_real_process = isinstance(upload_process, mp.process.BaseProcess)
+            if is_real_process:
                 try:
-                    if ex_parent_conn.poll():
-                        err = ex_parent_conn.recv()
+                    ex_child_conn.close()
                 except Exception:
                     pass
+                finally:
+                    child_conn_closed = True
+
+                def _drain_pipe():
+                    nonlocal pipe_err, has_pipe_err
+                    while True:
+                        try:
+                            msg = ex_parent_conn.recv()
+                        except (EOFError, OSError):
+                            break
+                        except Exception:
+                            break
+                        if not has_pipe_err:
+                            pipe_err = msg
+                            has_pipe_err = True
+
+                reader_thread = threading.Thread(target=_drain_pipe, daemon=True)
+                reader_thread.start()
+
+            upload_process.join()
+            if reader_thread is not None:
+                reader_thread.join(timeout=5)
+
+            if upload_process.exitcode != 0:
+                err = pipe_err if has_pipe_err else None
+                if not is_real_process:
+                    try:
+                        if ex_parent_conn.poll():
+                            err = ex_parent_conn.recv()
+                    except Exception:
+                        pass
                 if err:
                     raise RuntimeError(f"上传子进程异常退出 (exitcode: {upload_process.exitcode}): {err}")
                 else:
                     raise RuntimeError(f"上传子进程异常退出 (exitcode: {upload_process.exitcode})")
-            if ex_parent_conn.poll():
+            if has_pipe_err:
+                raise RuntimeError(pipe_err)
+            if not is_real_process and ex_parent_conn.poll():
                 raise RuntimeError(ex_parent_conn.recv())
         finally:
             try:
                 ex_parent_conn.close()
             except Exception:
                 pass
-            try:
-                ex_child_conn.close()
-            except Exception:
-                pass
+            if not child_conn_closed:
+                try:
+                    ex_child_conn.close()
+                except Exception:
+                    pass
 
         logger.info(f"上传成功: {self.principal}")
 
@@ -283,4 +320,13 @@ def stream_gears_upload(ex_conn, lines, *args, **kwargs):
 
         stream_gears.upload(*args, **kwargs)
     except Exception as e:
-        ex_conn.send(e)
+        try:
+            err_msg = str(e) or type(e).__name__
+            ex_conn.send(err_msg[:8192])
+        except Exception:
+            pass
+    finally:
+        try:
+            ex_conn.close()
+        except Exception:
+            pass

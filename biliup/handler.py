@@ -40,6 +40,70 @@ def clear_notified_exhausted_files():
         _notified_exhausted_files.clear()
 
 
+_soft_upload_lock = threading.Lock()
+_pending_soft_upload_urls: Set[str] = set()
+_upload_delay_events: Dict[str, threading.Event] = {}
+
+
+def clear_pending_soft_upload_urls():
+    """清理待处理的软水位上传标记与延迟唤醒事件（主要供测试使用）"""
+    with _soft_upload_lock:
+        _pending_soft_upload_urls.clear()
+        for evt in _upload_delay_events.values():
+            evt.set()
+        _upload_delay_events.clear()
+
+
+def _mark_pending_soft_upload(url: str) -> None:
+    if not url:
+        return
+    with _soft_upload_lock:
+        _pending_soft_upload_urls.add(url)
+        evt = _upload_delay_events.get(url)
+        if evt is not None:
+            evt.set()
+
+
+def _consume_pending_soft_upload(url: str) -> bool:
+    if not url:
+        return False
+    with _soft_upload_lock:
+        if url in _pending_soft_upload_urls:
+            _pending_soft_upload_urls.discard(url)
+            return True
+        return False
+
+
+def _wait_upload_delay(url: str, delay: int) -> bool:
+    """等待上传延迟；若等待前或等待期间收到软水位标记则立即返回 True。"""
+    delay_event = threading.Event()
+    with _soft_upload_lock:
+        if url in _pending_soft_upload_urls:
+            _pending_soft_upload_urls.discard(url)
+            return True
+        _upload_delay_events[url] = delay_event
+    try:
+        delay_event.wait(timeout=delay)
+    finally:
+        with _soft_upload_lock:
+            if _upload_delay_events.get(url) is delay_event:
+                _upload_delay_events.pop(url, None)
+            woken_by_soft = url in _pending_soft_upload_urls
+            if woken_by_soft:
+                _pending_soft_upload_urls.discard(url)
+    return woken_by_soft
+
+
+def _rollback_file_upload_counts(items: List[UploadBase.FileInfo]) -> None:
+    if not items:
+        return
+    with NamedLock("file_upload_count"):
+        file_upload_count = context.setdefault('file_upload_count', {})
+        for item in items:
+            if item.video in file_upload_count:
+                file_upload_count[item.video] = max(0, file_upload_count[item.video] - 1)
+
+
 def _mark_notified_exhausted(
     name: str,
     file_list: List[UploadBase.FileInfo],
@@ -116,27 +180,7 @@ def pre_processor(name, url):
     yield Event(DOWNLOAD, (name, url))
 
 
-@event_manager.register(DOWNLOAD, block='Asynchronous1')
-def process(name, url):
-    url_status = context['PluginInfo'].url_status
-    # 下载开始
-    try:
-        with NamedLock('download_dispatch'):
-            url_status[url] = 1
-            pending_download_urls.discard(url)
-        stream_info = biliup_download(name, url, config['streamers'][name].copy())
-        yield Event(DOWNLOADED, (stream_info,))
-    except Exception as e:
-        logger.exception(f"下载错误: {name} - {e}")
-    finally:
-        # 下载结束
-        with NamedLock('download_dispatch'):
-            url_status[url] = 0 if check_timerange(name) else 2
-            pending_download_urls.discard(url)
-
-
-@event_manager.register(DOWNLOADED, block='Asynchronous1')
-def processed(stream_info):
+def _run_downloaded_processor(stream_info):
     name = stream_info['name']
     url = stream_info['url']
     # 下载后处理 上传前处理
@@ -153,6 +197,35 @@ def processed(stream_info):
             "file_list": [file.video for file in file_list]
         }, ensure_ascii=False))
         # 后处理完成后重新扫描文件列表
+
+
+@event_manager.register(DOWNLOAD, block='Asynchronous1')
+def process(name, url):
+    url_status = context['PluginInfo'].url_status
+    # 下载开始
+    try:
+        with NamedLock('download_dispatch'):
+            url_status[url] = 1
+            pending_download_urls.discard(url)
+        stream_info = biliup_download(name, url, config['streamers'][name].copy())
+        _run_downloaded_processor(stream_info)
+        if stream_info.get('disk_soft_triggered'):
+            _mark_pending_soft_upload(stream_info.get('url') or url)
+        yield Event(UPLOAD, (stream_info,))
+    except Exception as e:
+        logger.exception(f"下载错误: {name} - {e}")
+    finally:
+        # 下载结束
+        with NamedLock('download_dispatch'):
+            url_status[url] = 0 if check_timerange(name) else 2
+            pending_download_urls.discard(url)
+
+
+@event_manager.register(DOWNLOADED, block='Asynchronous1')
+def processed(stream_info):
+    _run_downloaded_processor(stream_info)
+    if stream_info.get('disk_soft_triggered'):
+        _mark_pending_soft_upload(stream_info.get('url'))
     yield Event(UPLOAD, (stream_info,))
 
 
@@ -303,6 +376,8 @@ def _resolve_upload_stream_info(stream_info: dict, name: str, file_list: List[Up
         merged = {**fallback_meta, **stream_info, "name": name}
         if not merged.get("title") and fallback_meta.get("title"):
             merged["title"] = fallback_meta["title"]
+        if not merged.get("title"):
+            merged.pop("title", None)
         if not merged.get("live_cover_path") and fallback_meta.get("live_cover_path"):
             merged["live_cover_path"] = fallback_meta["live_cover_path"]
         if _date_sort_key(earliest_date) is not None:
@@ -311,6 +386,8 @@ def _resolve_upload_stream_info(stream_info: dict, name: str, file_list: List[Up
             merged.pop("date", None)
         formatted, _ = fmt_title_and_desc(merged)
         stream_info.update(formatted)
+        if not stream_info.get("title"):
+            stream_info.pop("title", None)
         if _date_sort_key(stream_info.get("date")) is None:
             stream_info.pop("date", None)
     elif _date_sort_key(earliest_date) is not None:
@@ -326,17 +403,23 @@ def process_upload(stream_info):
     url = stream_info['url']
     name = stream_info['name']
     url_upload_count = context['url_upload_count']
+    is_soft_event = bool(stream_info.get('disk_soft_triggered'))
     # 永远不可能有两个同url的下载线程
     # 可能对同一个url同时发送两次上传事件
     with NamedLock(f"upload_count_{url}"):
-        if context['url_upload_count'][url] > 0:
+        if url_upload_count.get(url, 0) > 0:
+            if is_soft_event:
+                _mark_pending_soft_upload(url)
             return logger.debug(f'{url} 正在上传中，跳过')
         # from .handler import event_manager, UPLOAD
         # += 不是原子操作
-        context['url_upload_count'][url] += 1
+        url_upload_count[url] = url_upload_count.get(url, 0) + 1
     # 上传开始
     try:
         raw_file_list = UploadBase.file_list(name)
+        while len(raw_file_list) <= 0 and _consume_pending_soft_upload(url):
+            is_soft_event = True
+            raw_file_list = UploadBase.file_list(name)
         if len(raw_file_list) <= 0:
             with _notified_exhausted_lock:
                 _notified_exhausted_files.pop(name, None)
@@ -363,6 +446,7 @@ def process_upload(stream_info):
             ]
         file_count = len(file_list)
         if file_count <= 0:
+            _consume_pending_soft_upload(url)
             with _notified_exhausted_lock:
                 newly_exhausted = current_videos - _notified_exhausted_files.get(name, set())
                 if newly_exhausted:
@@ -382,15 +466,39 @@ def process_upload(stream_info):
             return
 
         # 上传延迟检测
+        pending_soft = _consume_pending_soft_upload(url)
+        soft_triggered = is_soft_event or pending_soft
         url_status = context['PluginInfo'].url_status
-        if not stream_info.get('disk_soft_triggered') and url_status.get(url) != 2:
+        waited_delay = False
+        woken_by_soft = False
+        if not soft_triggered and url_status.get(url) != 2:
             delay = int(config.get('delay') or 0)
-            if delay:
+            if delay > 0:
+                waited_delay = True
                 logger.info(f'{name} -> {url} {delay}s 后检测是否上传')
-                time.sleep(delay)
-                if url_status.get(url) == 1:
+                woken_by_soft = _wait_upload_delay(url, delay)
+                if woken_by_soft or _consume_pending_soft_upload(url):
+                    soft_triggered = True
+                    woken_by_soft = True
+                if not soft_triggered and url_status.get(url) == 1:
                     # 上传延迟检测，启用的话会在一段时间后检测是否存在下载任务，若存在则跳过本次上传
                     return logger.info(f'{name} -> {url} 存在下载任务, 跳过本次上传')
+
+        if waited_delay:
+            if woken_by_soft:
+                refreshed_raw = UploadBase.file_list(name)
+                with NamedLock("file_upload_count"):
+                    file_upload_count = context.setdefault('file_upload_count', {})
+                    file_list = [
+                        item for item in refreshed_raw
+                        if file_upload_count.get(item.video, 0) < max_upload_limit
+                        and os.path.exists(item.video)
+                    ]
+            else:
+                file_list = [item for item in file_list if os.path.exists(item.video)]
+            if not file_list:
+                logger.debug(f'{name} 延迟结束后待传文件已不存在，跳过本次上传')
+                return
 
         stream_info = _resolve_upload_stream_info(stream_info, name, file_list)
 
@@ -402,26 +510,41 @@ def process_upload(stream_info):
             # 上传webhook部分
             expt = None
             try:
+                UploadBase.reset_last_claimed_videos()
                 res_files = upload(stream_info, target_files=[item.video for item in file_list])
+                claimed_videos = UploadBase.get_last_claimed_videos()
                 if res_files:
                     filelist = res_files
+                    if claimed_videos is not None:
+                        claimed_set = set(claimed_videos)
+                        unclaimed_files = [item for item in file_list if item.video not in claimed_set]
+                        if unclaimed_files:
+                            _rollback_file_upload_counts(unclaimed_files)
                 else:
                     logger.info(f"{name} 未实际占用待传文件，回退本批重试计数")
-                    with NamedLock("file_upload_count"):
-                        file_upload_count = context.setdefault('file_upload_count', {})
-                        for item in file_list:
-                            if item.video in file_upload_count:
-                                file_upload_count[item.video] = max(0, file_upload_count[item.video] - 1)
+                    _rollback_file_upload_counts(file_list)
             except Exception as e:
+                claimed_videos = UploadBase.get_last_claimed_videos()
                 expt = e
                 logger.error(f"{name} 上传异常: {e}")
-                if is_unrecoverable_error(e):
+                if claimed_videos is not None:
+                    claimed_set = set(claimed_videos)
+                    affected_files = [item for item in file_list if item.video in claimed_set]
+                    unclaimed_files = [item for item in file_list if item.video not in claimed_set]
+                    if unclaimed_files:
+                        _rollback_file_upload_counts(unclaimed_files)
+                else:
+                    affected_files = file_list
+
+                if not affected_files:
+                    pass
+                elif is_unrecoverable_error(e):
                     logger.error(f"{name} 检测到不可自愈上传错误 ({e})，标记该批文件不再重试")
                     with NamedLock("file_upload_count"):
                         file_upload_count = context.setdefault('file_upload_count', {})
-                        for item in file_list:
+                        for item in affected_files:
                             file_upload_count[item.video] = max_upload_limit
-                    marked_videos = _mark_notified_exhausted(name, file_list, max_upload_limit, all_files=True)
+                    marked_videos = _mark_notified_exhausted(name, affected_files, max_upload_limit, all_files=True)
                     send_notification(
                         title=f"biliup 上传不可自愈错误告警: {name}",
                         content=f"主播: {name}\nURL: {url}\n错误信息: {e}\n该批文件已被标记跳过重试，请检查账号状态或Cookie。",
@@ -429,17 +552,31 @@ def process_upload(stream_info):
                         error_type="unrecoverable_upload_error",
                         on_failure=lambda vids=marked_videos: _unmark_notified_exhausted(name, vids),
                     )
-                elif upload_count + 1 >= max_upload_limit:
-                    logger.warning(f"上传次数达到阈值: {name}")
-                    marked_videos = _mark_notified_exhausted(name, file_list, max_upload_limit)
-                    send_notification(
-                        title=f"biliup 上传达到重试上限告警: {name}",
-                        content=f"主播: {name}\nURL: {url}\n部分或全部待传文件重试次数已达到阈值 ({upload_count + 1}/{max_upload_limit})，达到上限的文件将停止自动重试（其余未达上限文件仍会在后续重试）。最后一次错误: {e}",
-                        streamer_name=name,
-                        error_type="max_upload_limit_reached",
-                        on_failure=lambda vids=marked_videos: _unmark_notified_exhausted(name, vids),
-                    )
+                else:
+                    if claimed_videos is not None and len(affected_files) < len(file_list):
+                        with NamedLock("file_upload_count"):
+                            file_upload_count = context.setdefault('file_upload_count', {})
+                            affected_max_after = max(
+                                (file_upload_count.get(item.video, 0) for item in affected_files),
+                                default=0,
+                            )
+                        hit_limit = affected_max_after >= max_upload_limit
+                        reported_count = affected_max_after
+                    else:
+                        hit_limit = upload_count + 1 >= max_upload_limit
+                        reported_count = upload_count + 1
+                    if hit_limit:
+                        logger.warning(f"上传次数达到阈值: {name}")
+                        marked_videos = _mark_notified_exhausted(name, affected_files, max_upload_limit)
+                        send_notification(
+                            title=f"biliup 上传达到重试上限告警: {name}",
+                            content=f"主播: {name}\nURL: {url}\n部分或全部待传文件重试次数已达到阈值 ({reported_count}/{max_upload_limit})，达到上限的文件将停止自动重试（其余未达上限文件仍会在后续重试）。最后一次错误: {e}",
+                            streamer_name=name,
+                            error_type="max_upload_limit_reached",
+                            on_failure=lambda vids=marked_videos: _unmark_notified_exhausted(name, vids),
+                        )
             finally:
+                UploadBase.reset_last_claimed_videos()
                 post_processor = config['streamers'].get(name, {}).get("postprocessor", None)
                 if post_processor is not None and (expt is not None or filelist):
                     for processor in post_processor:
@@ -478,8 +615,18 @@ def process_upload(stream_info):
     finally:
         # 上传结束
         # 有可能有两个同url的上传线程 保证计数正确
+        should_dispatch_soft_followup = False
         with NamedLock(f'upload_count_{url}'):
-            url_upload_count[url] -= 1
+            url_upload_count[url] = max(0, url_upload_count.get(url, 1) - 1)
+            if url_upload_count[url] == 0 and _consume_pending_soft_upload(url):
+                should_dispatch_soft_followup = True
+        if should_dispatch_soft_followup:
+            logger.info(f'{name} -> {url} 检测到上传期间到达的软水位事件，触发后续上传')
+            event_manager.send_event(Event(UPLOAD, ({
+                'name': name,
+                'url': url,
+                'disk_soft_triggered': True,
+            },)))
 
 
 def uploaded(name, live_cover_path, data: List):

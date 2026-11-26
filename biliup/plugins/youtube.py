@@ -110,8 +110,10 @@ class YoutubeLive(DownloadBase):
             'proxy': proxy,
         }
 
+        download_ok = True
         if self.downloader == 'ytarchive':
             proc = None
+            download_ok = False
             cmd_args = ['ytarchive']
             for key, value in yta_opts.items():
                 if value is True:
@@ -128,16 +130,27 @@ class YoutubeLive(DownloadBase):
                     stderr=subprocess.STDOUT,
                     # text=True
                 )
-                for line in iter(proc.stdout.readline, b''):
-                    decoded_line = line.decode('utf-8', errors='replace').rstrip()
-                    if 'Video Fragments:' in decoded_line:
-                        print(f'\r{decoded_line}', end='', flush=True)
-                    else:
-                        print(decoded_line)
+                if proc.stdout is not None:
+                    for line in iter(proc.stdout.readline, b''):
+                        decoded_line = line.decode('utf-8', errors='replace').rstrip()
+                        if 'Video Fragments:' in decoded_line:
+                            print(f'\r{decoded_line}', end='', flush=True)
+                        else:
+                            print(decoded_line)
+                proc.wait(timeout=20)
+                download_ok = proc is not None and proc.returncode == 0
+                if not download_ok:
+                    logger.error(f"{self.plugin_msg}: ytarchive 异常退出 (returncode={proc.returncode})")
             except Exception as e:
+                download_ok = False
                 logger.error(f"{self.plugin_msg}: {e}")
             finally:
-                if proc:
+                if proc is not None:
+                    if proc.stdout is not None:
+                        try:
+                            proc.stdout.close()
+                        except Exception:
+                            pass
                     try:
                         if proc.poll() is None:
                             proc.terminate()
@@ -173,7 +186,7 @@ class YoutubeLive(DownloadBase):
         if self.use_live_cover and cover_thread.is_alive():
             cover_thread.join(timeout=20)
 
-        return True
+        return download_ok
 
 
     @staticmethod

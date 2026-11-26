@@ -336,13 +336,13 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
               validator: (rule, value) => {
                 if (!value) return true;
                 try {
-                  JSON.parse(value);
-                  return true;
+                  const parsed = JSON.parse(value);
+                  return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed);
                 } catch (e) {
                   return false;
                 }
               },
-              message: '请输入正确的Json格式文本',
+              message: '请输入正确的Json对象格式文本',
             }
           ]}
         />

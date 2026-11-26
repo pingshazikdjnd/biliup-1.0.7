@@ -545,18 +545,21 @@ class Bililive(DownloadBase):
                 qn_str = match1(line, r'BILI-QN=(\d+)')
                 current_qn = int(qn_str) if qn_str else None
 
-                if codec and current_qn:
+                if codec and current_qn is not None:
                     if 'avc' in codec.lower():
                         result.setdefault(current_qn, {})
                     else:
                         current_qn = None
+                else:
+                    current_qn = None
 
             elif line.startswith('http') and current_qn is not None:
                 cdn_name = match1(line, r'cdn=([^&]+)')
                 if cdn_name:
                     result[current_qn].setdefault(cdn_name, self.parse_stream_url(line))
 
-        return dict(sorted(result.items(), key=lambda x: int(x[0]), reverse=True))
+        filtered = {k: v for k, v in result.items() if v}
+        return dict(sorted(filtered.items(), key=lambda x: int(x[0]), reverse=True))
 
 # Copy from room-player.js
 def check_areablock(data):

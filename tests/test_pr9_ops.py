@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import requests
 from aiohttp.test_utils import TestClient, TestServer
 
 from biliup.config import config
@@ -124,6 +125,74 @@ class TestPR9PythonHttpsAndOps(unittest.IsolatedAsyncioTestCase):
             with patch.object(web_mod, '_bili_client', return_value=fake_bili):
                 resp = await client.get('/api/login_by_cookie')
                 self.assertEqual(resp.status, 200)
+
+            # 3b. 非 TOML 模式真实调用 BiliBili.login_by_cookies（不 mock login_by_cookies / _bili_client，仅 mock requests.Session.get）
+            config.data.pop('toml', None)
+            config.data['user'] = {
+                'cookies': {
+                    'SESSDATA': 'real_sess',
+                    'bili_jct': 'real_jct',
+                    'DedeUserID': 12345,
+                    'ignored_none': None,
+                }
+            }
+            nav_calls = []
+
+            def _fake_session_get(session_self, url, *args, **kwargs):
+                nav_calls.append((url, session_self.cookies.get_dict(), kwargs.get('timeout')))
+                resp_obj = MagicMock()
+                resp_obj.json.return_value = {'code': 0, 'data': {'isLogin': True}}
+                return resp_obj
+
+            with patch.object(requests.Session, 'get', autospec=True, side_effect=_fake_session_get):
+                resp = await client.get('/api/login_by_cookie')
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(await resp.json(), {'status': 200})
+
+            self.assertEqual(len(nav_calls), 1)
+            self.assertEqual(nav_calls[0][0], 'https://api.bilibili.com/x/web-interface/nav')
+            self.assertEqual(nav_calls[0][1].get('SESSDATA'), 'real_sess')
+            self.assertEqual(nav_calls[0][1].get('bili_jct'), 'real_jct')
+            self.assertEqual(nav_calls[0][1].get('DedeUserID'), '12345')
+            self.assertNotIn('ignored_none', nav_calls[0][1])
+
+            # 3c. 验证 BiliBili.login_by_cookies 兼容嵌套 cookie_info.cookies 并拒绝非法类型
+            nested_bili = bili_webup_mod.BiliBili(bili_webup_mod.Data())
+            nested_calls = []
+
+            def _fake_nested_get(url, *args, **kwargs):
+                nested_calls.append((url, nested_bili._BiliBili__session.cookies.get_dict()))
+                resp_obj = MagicMock()
+                resp_obj.json.return_value = {'code': 0, 'data': {'isLogin': True}}
+                return resp_obj
+
+            with patch.object(nested_bili._BiliBili__session, 'get', autospec=True, side_effect=_fake_nested_get):
+                nested_bili.login_by_cookies({
+                    'cookie_info': {
+                        'cookies': [
+                            {'name': 'SESSDATA', 'value': 'nested_sess'},
+                            {'name': 'bili_jct', 'value': 'nested_jct'},
+                            {'name': 'skip_none', 'value': None},
+                        ]
+                    }
+                })
+            self.assertEqual(nested_calls[0][1].get('SESSDATA'), 'nested_sess')
+            self.assertEqual(nested_calls[0][1].get('bili_jct'), 'nested_jct')
+            self.assertNotIn('skip_none', nested_calls[0][1])
+            self.assertEqual(nested_bili._BiliBili__bili_jct, 'nested_jct')
+
+            for bad_cookie in (
+                None,
+                ['SESSDATA'],
+                'SESSDATA=1',
+                {'cookie_info': 'bad'},
+                {'cookie_info': {'cookies': 'bad'}},
+                {'cookie_info': {'cookies': [{'name': 'only_name'}]}},
+                {'SESSDATA': {'nested': 1}},
+                {123: 'bad_key'},
+            ):
+                with self.assertRaises(ValueError):
+                    nested_bili.login_by_cookies(bad_cookie)
 
         # 验证懒初始化（spawn 上下文）与 shutdown 显式终止残留子进程
         fake_proc = MagicMock()

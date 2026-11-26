@@ -200,6 +200,7 @@ export interface LiveStreamerEntity {
 	id: number;
 	url: string;
 	remark: string;
+	filename_prefix?: string;
 	filename: string;
 	split_time?: number;
 	split_size?: number;

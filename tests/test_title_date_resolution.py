@@ -17,6 +17,7 @@ import biliup.common.tools as tools_mod
 import biliup.database.db as db_mod
 import biliup.engine.download as download_mod
 import biliup.handler as handler_mod
+import biliup.uploader as uploader_mod
 from biliup.config import config
 from biliup.database.models import BaseModel, FileList, StreamerInfo
 from biliup.engine.event import Event
@@ -687,6 +688,60 @@ class TestTitleDateResolution(unittest.TestCase):
 
         self.assertTrue(any('反查上传元数据失败' in msg for msg in handler_logs.output))
         self.assertEqual(captured_titles, ['【降级告警主播】 2026-11-24 【降级告警主播】'])
+
+    def test_none_title_without_db_record_does_not_format_literal_none(self):
+        streamer = '主播A'
+        url = 'https://live.bilibili.com/12345'
+        p1_name = f'{streamer}2026-11-24T23_30_00.flv'
+        with open(p1_name, 'wb') as f:
+            f.write(b'flvdata')
+
+        config['streamers'] = {
+            streamer: {
+                'url': url,
+                'title': '{streamer} %Y-%m-%d {title}',
+                'uploader': 'Noop',
+            }
+        }
+        app_mod.context['url_upload_count'][url] = 0
+        app_mod.context['PluginInfo'].url_status = {url: 2}
+
+        captured_data = []
+
+        class _FakeNoopUploader:
+            def __init__(self, principal, data, **kwargs):
+                self.data = data
+
+            def start(self, allowed_files=None):
+                captured_data.append(dict(self.data))
+                return [UploadBase.FileInfo(video=f, danmaku=None) for f in (allowed_files or [])]
+
+        fake_files = [UploadBase.FileInfo(video=p1_name, danmaku=None)]
+        stream_info = {'name': streamer, 'url': url, 'title': None}
+
+        with patch('biliup.handler.SessionLocal', self._TestSession), \
+             patch('biliup.handler.UploadBase.file_list', return_value=fake_files), \
+             patch('biliup.handler.uploaded'), \
+             patch('biliup.uploader.Plugin.upload_plugins', {'Noop': _FakeNoopUploader}):
+            handler_mod.process_upload(Event(handler_mod.UPLOAD, (stream_info,)))
+
+        self.assertEqual(len(captured_data), 1)
+        self.assertEqual(captured_data[0]['format_title'], '主播A 2026-11-24 主播A')
+        self.assertNotIn('None', captured_data[0]['format_title'])
+        self.assertNotIn('title', captured_data[0])
+        self.assertNotIn('title', stream_info)
+
+        # 直接验证 fmt_title_and_desc 对空串/None 字段的兜底行为
+        formatted, _ = uploader_mod.fmt_title_and_desc({
+            'name': streamer,
+            'url': url,
+            'title': '',
+            'streamer': None,
+            'date': None,
+        })
+        today_str = time.strftime('%Y-%m-%d', time.localtime())
+        self.assertEqual(formatted['format_title'], f'{streamer} {today_str} {streamer}')
+        self.assertNotIn('None', formatted['format_title'])
 
 
 if __name__ == '__main__':

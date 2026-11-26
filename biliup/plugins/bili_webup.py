@@ -6,6 +6,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.parse
 from dataclasses import asdict, dataclass, field, InitVar
@@ -266,16 +267,23 @@ class BiliBili:
 
     def login(self, persistence_path, user_cookie):
         self.persistence_path = user_cookie
-        if os.path.isfile(self.persistence_path):
+        if self.persistence_path and os.path.isfile(self.persistence_path):
             print('使用持久化内容上传')
             self.load()
+        elif not self.account:
+            raise FileNotFoundError(self.persistence_path)
         if self.cookies:
             try:
                 self.login_by_cookies(self.cookies)
-            except:
+                return
+            except Exception:
                 logger.exception('login error')
+                if not self.account:
+                    raise
                 self.login_by_password(**self.account)
         else:
+            if not self.account:
+                raise RuntimeError(f'Cookie invalid or empty: {self.persistence_path}')
             self.login_by_password(**self.account)
         self.store()
 
@@ -289,11 +297,37 @@ class BiliBili:
             logger.exception('加载cookie出错')
 
     def store(self):
-        with open(self.persistence_path, "w") as f:
-            json.dump({**self.cookies,
-                       'access_token': self.access_token,
-                       'refresh_token': self.refresh_token
-                       }, f)
+        target_dir = os.path.dirname(os.path.abspath(self.persistence_path))
+        os.makedirs(target_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix='.cookie_', suffix='.tmp', dir=target_dir)
+        try:
+            if os.name == 'posix':
+                os.chmod(tmp_path, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                fd = None
+                json.dump(
+                    {
+                        **(self.cookies or {}),
+                        'access_token': self.access_token,
+                        'refresh_token': self.refresh_token,
+                    },
+                    f,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.persistence_path)
+            tmp_path = None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp_path is not None and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def send_sms(self, phone_number, country_code):
         params = {
@@ -365,7 +399,27 @@ class BiliBili:
 
     def login_by_cookies(self, cookie):
         logger.info(f'{self.__class__.__name__}: login by cookies')
-        cookies_dict = {c['name']: c['value'] for c in cookie['cookie_info']['cookies']}
+        if not isinstance(cookie, dict):
+            raise ValueError(f"Invalid cookie format: expected dict, got {type(cookie).__name__}")
+        if 'cookie_info' in cookie:
+            cookie_info = cookie.get('cookie_info')
+            cookie_list = cookie_info.get('cookies') if isinstance(cookie_info, dict) else None
+            if not isinstance(cookie_list, list):
+                raise ValueError("Invalid cookie_info format: expected dict with cookies list")
+            cookies_dict = {}
+            for c in cookie_list:
+                if not isinstance(c, dict) or 'name' not in c or 'value' not in c:
+                    raise ValueError("Invalid cookie item in cookie_info.cookies")
+                if c['name'] is not None and c['value'] is not None:
+                    cookies_dict[str(c['name'])] = str(c['value'])
+        else:
+            cookies_dict = {}
+            for k, v in cookie.items():
+                if v is None:
+                    continue
+                if not isinstance(k, str) or isinstance(v, (dict, list, tuple, set)):
+                    raise ValueError(f"Invalid cookie entry for key {k!r}")
+                cookies_dict[k] = str(v)
         requests.utils.add_dict_to_cookiejar(self.__session.cookies, cookies_dict)
         if 'bili_jct' in cookies_dict:
             self.__bili_jct = cookies_dict['bili_jct']

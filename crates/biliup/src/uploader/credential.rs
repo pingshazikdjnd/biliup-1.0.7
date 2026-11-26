@@ -74,11 +74,7 @@ pub fn bilibili_from_info(login_info: LoginInfo, proxy: Option<&str>) -> Result<
 static ATOMIC_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static COOKIE_COMMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn write_login_info_atomic_inner(
-    path: &Path,
-    info: &LoginInfo,
-    expected_token: Option<(u64, &str)>,
-) -> Result<bool> {
+fn cookie_path_parts(path: &Path) -> (&Path, &str) {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -87,6 +83,106 @@ fn write_login_info_atomic_inner(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("cookies.json");
+    (parent, file_name)
+}
+
+fn canonical_cookie_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let (parent, file_name) = cookie_path_parts(path);
+    if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+        return canonical_parent.join(file_name);
+    }
+    path.to_path_buf()
+}
+
+fn refresh_lock_path(path: &Path) -> PathBuf {
+    let resolved = canonical_cookie_path(path);
+    let (parent, file_name) = cookie_path_parts(&resolved);
+    parent.join(format!(".{file_name}.refresh.lock"))
+}
+
+fn read_login_info(path: &Path) -> Result<LoginInfo> {
+    let file = std::fs::File::options().read(true).open(path)?;
+    Ok(serde_json::from_reader(std::io::BufReader::new(file))?)
+}
+
+#[cfg(windows)]
+fn is_retryable_rename_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied || matches!(err.raw_os_error(), Some(5 | 32))
+}
+
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        const MAX_RETRIES: usize = 5;
+        const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+        let mut attempt = 0;
+        loop {
+            match std::fs::rename(from, to) {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt < MAX_RETRIES && is_retryable_rename_error(&err) => {
+                    attempt += 1;
+                    warn!(
+                        "rename {} -> {} encountered Windows sharing/permission error ({}); retry {}/{}",
+                        from.display(),
+                        to.display(),
+                        err,
+                        attempt,
+                        MAX_RETRIES
+                    );
+                    std::thread::sleep(RETRY_DELAY);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
+/// RAII guard for a sidecar lock file serializing cookie refreshes across OS processes.
+struct RefreshLockGuard {
+    file: std::fs::File,
+}
+
+impl RefreshLockGuard {
+    async fn acquire(path: &Path) -> Result<Self> {
+        let lock_path = refresh_lock_path(path);
+        let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let file = opts.open(&lock_path)?;
+            file.lock()?;
+            Ok(file)
+        })
+        .await
+        .map_err(|err| Kind::Custom(format!("refresh lock task failed: {err}")))??;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for RefreshLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn write_login_info_atomic_inner(
+    path: &Path,
+    info: &LoginInfo,
+    expected_token: Option<(u64, &str)>,
+) -> Result<bool> {
+    let (parent, file_name) = cookie_path_parts(path);
     let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -122,11 +218,8 @@ fn write_login_info_atomic_inner(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     if let Some((expected_mid, expected_refresh)) = expected_token {
-        let matches_disk = std::fs::File::options()
-            .read(true)
-            .open(path)
+        let matches_disk = read_login_info(path)
             .ok()
-            .and_then(|f| serde_json::from_reader::<_, LoginInfo>(std::io::BufReader::new(f)).ok())
             .map(|cur| {
                 cur.token_info.mid == expected_mid
                     && cur.token_info.refresh_token == expected_refresh
@@ -142,7 +235,7 @@ fn write_login_info_atomic_inner(
         }
     }
 
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
+    if let Err(err) = rename_with_retry(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err.into());
     }
@@ -155,22 +248,51 @@ pub fn write_login_info_atomic(path: &Path, info: &LoginInfo) -> Result<()> {
     Ok(())
 }
 
+async fn refresh_login_info_with_lock<F, Fut>(
+    path: &Path,
+    login_info: LoginInfo,
+    renew_fn: F,
+) -> Result<LoginInfo>
+where
+    F: FnOnce(LoginInfo) -> Fut,
+    Fut: Future<Output = Result<LoginInfo>>,
+{
+    let original_mid = login_info.token_info.mid;
+    let original_refresh = login_info.token_info.refresh_token.clone();
+    let _lock_guard = RefreshLockGuard::acquire(path).await?;
+
+    if let Ok(disk_info) = read_login_info(path)
+        && (disk_info.token_info.mid != original_mid
+            || disk_info.token_info.refresh_token != original_refresh)
+    {
+        info!(
+            "cookie file {} already refreshed by another worker; skipping renew",
+            path.display()
+        );
+        return Ok(disk_info);
+    }
+
+    let new_info = renew_fn(login_info).await?;
+    let written =
+        write_login_info_atomic_inner(path, &new_info, Some((original_mid, &original_refresh)))?;
+    if !written && let Ok(disk_info) = read_login_info(path) {
+        return Ok(disk_info);
+    }
+    Ok(new_info)
+}
+
 pub async fn login_by_cookies(file: impl AsRef<Path>, proxy: Option<&str>) -> Result<BiliBili> {
     let path = file.as_ref();
-    let login_info: LoginInfo = {
-        let file = std::fs::File::options().read(true).open(path)?;
-        serde_json::from_reader(std::io::BufReader::new(file))?
-    };
+    let login_info = read_login_info(path)?;
 
     let client: Credential = Credential::new(proxy);
     let need_refresh = client.validate_tokens(&login_info).await?;
 
     if need_refresh {
-        let original_mid = login_info.token_info.mid;
-        let original_refresh = login_info.token_info.refresh_token.clone();
-        let new_info = client.renew_tokens(login_info).await?;
-        write_login_info_atomic_inner(path, &new_info, Some((original_mid, &original_refresh)))?;
-        bilibili_from_info(new_info, proxy)
+        let latest_info =
+            refresh_login_info_with_lock(path, login_info, |info| client.renew_tokens(info))
+                .await?;
+        bilibili_from_info(latest_info, proxy)
     } else {
         info!("无需更新cookie");
         bilibili_from_info(login_info, proxy)
@@ -750,8 +872,28 @@ impl Default for Credential {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginInfo, TokenInfo, write_login_info_atomic};
+    use super::{
+        LoginInfo, RefreshLockGuard, TokenInfo, read_login_info, refresh_lock_path,
+        refresh_login_info_with_lock, write_login_info_atomic,
+    };
     use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn sample_login_info(mid: u64, access: &str, refresh: &str) -> LoginInfo {
+        LoginInfo {
+            cookie_info: json!({"cookies": [{"name": "SESSDATA", "value": access}]}),
+            sso: vec!["https://passport.bilibili.com".to_string()],
+            token_info: TokenInfo {
+                access_token: access.to_string(),
+                expires_in: 3600,
+                mid,
+                refresh_token: refresh.to_string(),
+            },
+            platform: Some("BiliTV".to_string()),
+        }
+    }
 
     #[test]
     fn test_write_login_info_atomic_replaces_existing_file() {
@@ -763,22 +905,11 @@ mod tests {
         let target = dir.join("cookies.json");
         std::fs::write(&target, r#"{"old": true}"#).unwrap();
 
-        let info = LoginInfo {
-            cookie_info: json!({"cookies": [{"name": "SESSDATA", "value": "abc"}]}),
-            sso: vec!["https://passport.bilibili.com".to_string()],
-            token_info: TokenInfo {
-                access_token: "new_token".to_string(),
-                expires_in: 3600,
-                mid: 12345,
-                refresh_token: "new_refresh".to_string(),
-            },
-            platform: Some("BiliTV".to_string()),
-        };
+        let info = sample_login_info(12345, "new_token", "new_refresh");
 
         write_login_info_atomic(&target, &info).unwrap();
 
-        let loaded: LoginInfo =
-            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        let loaded = read_login_info(&target).unwrap();
         assert_eq!(loaded.token_info.access_token, "new_token");
         assert_eq!(loaded.token_info.mid, 12345);
 
@@ -803,40 +934,203 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("cookies.json");
 
-        let newer_account = LoginInfo {
-            cookie_info: json!({"cookies": [{"name": "SESSDATA", "value": "newer"}]}),
-            sso: vec![],
-            token_info: TokenInfo {
-                access_token: "newer_access".to_string(),
-                expires_in: 3600,
-                mid: 99999,
-                refresh_token: "newer_refresh".to_string(),
-            },
-            platform: Some("BiliTV".to_string()),
-        };
+        let newer_account = sample_login_info(99999, "newer_access", "newer_refresh");
         write_login_info_atomic(&target, &newer_account).unwrap();
 
-        let stale_refreshed = LoginInfo {
-            cookie_info: json!({"cookies": [{"name": "SESSDATA", "value": "stale"}]}),
-            sso: vec![],
-            token_info: TokenInfo {
-                access_token: "stale_access".to_string(),
-                expires_in: 3600,
-                mid: 11111,
-                refresh_token: "stale_refresh_new".to_string(),
-            },
-            platform: Some("BiliTV".to_string()),
-        };
+        let stale_refreshed = sample_login_info(11111, "stale_access", "stale_refresh_new");
 
         let written =
             write_login_info_atomic_inner(&target, &stale_refreshed, Some((11111, "stale_old")))
                 .unwrap();
         assert!(!written);
 
-        let loaded: LoginInfo =
-            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        let loaded = read_login_info(&target).unwrap();
         assert_eq!(loaded.token_info.mid, 99999);
         assert_eq!(loaded.token_info.access_token, "newer_access");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_login_info_with_lock_skips_renew_when_disk_already_refreshed() {
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_lock_skip_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cookies.json");
+
+        let v1 = sample_login_info(12345, "access_v1", "refresh_v1");
+        let v2 = sample_login_info(12345, "access_v2", "refresh_v2");
+        write_login_info_atomic(&target, &v2).unwrap();
+
+        let renew_calls = Arc::new(AtomicUsize::new(0));
+        let renew_calls_clone = Arc::clone(&renew_calls);
+
+        let returned = refresh_login_info_with_lock(&target, v1, move |info| async move {
+            renew_calls_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(info)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(renew_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(returned.token_info.access_token, "access_v2");
+        assert_eq!(returned.token_info.refresh_token, "refresh_v2");
+
+        let disk = read_login_info(&target).unwrap();
+        assert_eq!(disk.token_info.access_token, "access_v2");
+        assert_eq!(disk.token_info.refresh_token, "refresh_v2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_refresh_login_info_with_lock_concurrent_tasks_preserve_valid_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_lock_concurrent_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cookies.json");
+
+        let v1 = sample_login_info(54321, "access_v1", "refresh_v1");
+        write_login_info_atomic(&target, &v1).unwrap();
+
+        let renew_calls = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let path = target.clone();
+            let initial = v1.clone();
+            let calls = Arc::clone(&renew_calls);
+            handles.push(tokio::spawn(async move {
+                refresh_login_info_with_lock(&path, initial, move |_| async move {
+                    let call_id = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    Ok(sample_login_info(
+                        54321,
+                        &format!("access_v2_{call_id}"),
+                        &format!("refresh_v2_{call_id}"),
+                    ))
+                })
+                .await
+                .unwrap()
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.unwrap());
+        }
+
+        assert_eq!(renew_calls.load(Ordering::SeqCst), 1);
+        for res in &results {
+            assert_eq!(res.token_info.access_token, "access_v2_1");
+            assert_eq!(res.token_info.refresh_token, "refresh_v2_1");
+        }
+
+        let disk = read_login_info(&target).unwrap();
+        assert_eq!(disk.token_info.access_token, "access_v2_1");
+        assert_eq!(disk.token_info.refresh_token, "refresh_v2_1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_write_login_info_atomic_retries_on_windows_sharing_conflict() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_win_retry_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cookies.json");
+
+        let v1 = sample_login_info(77777, "access_v1", "refresh_v1");
+        let v2 = sample_login_info(77777, "access_v2", "refresh_v2");
+        write_login_info_atomic(&target, &v1).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target_clone = target.clone();
+        let holder = std::thread::spawn(move || {
+            let _locked_handle = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&target_clone)
+                .unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+        });
+
+        rx.recv().unwrap();
+        write_login_info_atomic(&target, &v2).unwrap();
+        holder.join().unwrap();
+
+        let disk = read_login_info(&target).unwrap();
+        assert_eq!(disk.token_info.access_token, "access_v2");
+        assert_eq!(disk.token_info.refresh_token, "refresh_v2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_refresh_lock_path_canonicalizes_aliases() {
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_lock_alias_test_{}",
+            std::process::id()
+        ));
+        let sub_dir = dir.join("sub");
+        let alias_dir = dir.join("alias_dir");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::create_dir_all(&alias_dir).unwrap();
+
+        let target = dir.join("cookies.json");
+        let v1 = sample_login_info(55555, "access_v1", "refresh_v1");
+        write_login_info_atomic(&target, &v1).unwrap();
+
+        let dot_alias = sub_dir.join("..").join("cookies.json");
+        assert_eq!(refresh_lock_path(&dot_alias), refresh_lock_path(&target));
+
+        let symlink_alias = alias_dir.join("alias.json");
+        #[cfg(unix)]
+        let symlink_created = std::os::unix::fs::symlink(&target, &symlink_alias).is_ok();
+        #[cfg(windows)]
+        let symlink_created = std::os::windows::fs::symlink_file(&target, &symlink_alias).is_ok();
+        if symlink_created {
+            assert_eq!(refresh_lock_path(&symlink_alias), refresh_lock_path(&target));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_lock_guard_holds_os_level_file_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "biliup_cookie_os_lock_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cookies.json");
+        let v1 = sample_login_info(66666, "access_v1", "refresh_v1");
+        write_login_info_atomic(&target, &v1).unwrap();
+
+        let guard = RefreshLockGuard::acquire(&target).await.unwrap();
+        let lock_path = refresh_lock_path(&target);
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        drop(guard);
+        probe.try_lock().unwrap();
+        let _ = probe.unlock();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
