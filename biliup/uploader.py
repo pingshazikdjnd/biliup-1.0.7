@@ -25,7 +25,7 @@ def merge_dict(*dicts):
                 d = json.loads(d)
             except json.JSONDecodeError:
                 continue
-        if d:  # 检查字典是否为 None 或空
+        if isinstance(d, dict):  # 仅合并字典，忽略 None 或非对象 JSON
             result.update(d)
     return result
 
@@ -171,9 +171,9 @@ def fmt_title_and_desc(data):
     index = data['name']
     context = {**config, **config['streamers'][index]}
     user_format_string = context.get('title') or f'%Y.%m.%d{index}'
-    live_stream_title = data.get('title', index)
-    streamer_name = data.get('streamer', index)
-    upload_date = data.get("date", time.localtime())
+    live_stream_title = data.get('title') or index
+    streamer_name = data.get('streamer') or index
+    upload_date = data.get("date") or time.localtime()
     stream_url = data.get('url')
 
     if "{title}" in user_format_string:

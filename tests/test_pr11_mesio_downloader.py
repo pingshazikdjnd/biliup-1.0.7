@@ -160,6 +160,8 @@ class TestPR11MesioDownloader(unittest.TestCase):
         })
         app_mod.context['url_upload_count'] = {}
         app_mod.context['file_upload_count'] = {}
+        handler_mod.clear_pending_soft_upload_urls()
+        UploadBase.reset_last_claimed_videos()
 
         db_file = os.path.join(self._tmpdir.name, 'test_pr11.sqlite3')
         self._engine = create_engine(f'sqlite:///{db_file}', connect_args={'check_same_thread': False})
@@ -167,6 +169,8 @@ class TestPR11MesioDownloader(unittest.TestCase):
         self._TestSession = sessionmaker(bind=self._engine, autocommit=False)
 
     def tearDown(self):
+        handler_mod.clear_pending_soft_upload_urls()
+        UploadBase.reset_last_claimed_videos()
         self._engine.dispose()
         os.chdir(self._orig_cwd)
         self._tmpdir.cleanup()
@@ -371,10 +375,17 @@ class TestPR11MesioDownloader(unittest.TestCase):
         with self._TestSession() as db:
             dl.database_row_id = db_mod.add_stream_info(db, dl.fname, dl.url, time.localtime())
 
-        state = {'session_dir': None, 'stage1_ok': False, 'stage2_ok': False}
-        poll1_done = threading.Event()
-        seg0_db_done = threading.Event()
+        state = {
+            'session_dir': None,
+            'stage1_ok': False,
+            'stage2_unmoved_ok': False,
+            'stage2_moved_ok': False,
+            'stage3_ok': False,
+        }
         poll2_done = threading.Event()
+        seg1_nonempty_ready = threading.Event()
+        seg0_db_done = threading.Event()
+        poll4_done = threading.Event()
         seg1_db_done = threading.Event()
         stage3_ready = threading.Event()
         drive_errors = []
@@ -393,7 +404,7 @@ class TestPR11MesioDownloader(unittest.TestCase):
         def fake_popen(cmd, **kwargs):
             sdir = _extract_session_dir(cmd)
             state['session_dir'] = sdir
-            # 阶段 1：出现 seg_000.flv (1024B) 与正在写入的 seg_001.flv (0B)
+            # 阶段 1：出现 seg_000.flv (1024B) 与正在写入的 seg_001.flv (0B)，无 Closed segment 日志
             with open(os.path.join(sdir, 'seg_000.flv'), 'wb') as f:
                 f.write(b'A' * 1024)
             with open(os.path.join(sdir, 'seg_001.flv'), 'wb') as f:
@@ -401,42 +412,57 @@ class TestPR11MesioDownloader(unittest.TestCase):
 
             def on_poll(proc, count):
                 if count == 1:
-                    poll1_done.set()
                     return None
                 if count == 2:
-                    # 验证阶段 1 后：seg_000.flv 已移出为 static_rec.flv，而 0B 的 seg_001.flv 仍在隔离目录
+                    # 阶段 1：seg_001 为 0B 且未收到关闭日志时，seg_000 绝不能提前移出
+                    self.assertFalse(os.path.exists('static_rec.flv'))
+                    self.assertTrue(os.path.isfile(os.path.join(sdir, 'seg_000.flv')))
+                    self.assertTrue(os.path.isfile(os.path.join(sdir, 'seg_001.flv')))
+                    state['stage1_ok'] = True
+                    poll2_done.set()
+                    self.assertTrue(seg1_nonempty_ready.wait(timeout=5))
+                    return None
+                if count == 3:
+                    # 阶段 2a：seg_001 刚变为非空，首次扫描仅记录指纹，seg_000 仍不提前移出
+                    self.assertFalse(os.path.exists('static_rec.flv'))
+                    self.assertTrue(os.path.isfile(os.path.join(sdir, 'seg_000.flv')))
+                    state['stage2_unmoved_ok'] = True
+                    return None
+                if not poll4_done.is_set():
+                    # 阶段 2b：连续两次扫描 (st_size, st_mtime_ns) 稳定且 seg_001 > 0 后，seg_000 兜底移出
                     self.assertTrue(seg0_db_done.wait(timeout=5))
                     self.assertTrue(os.path.isfile('static_rec.flv'))
                     self.assertFalse(os.path.exists(os.path.join(sdir, 'seg_000.flv')))
                     self.assertTrue(os.path.isfile(os.path.join(sdir, 'seg_001.flv')))
-                    state['stage1_ok'] = True
-                    poll2_done.set()
+                    state['stage2_moved_ok'] = True
+                    poll4_done.set()
                     return None
-                if count == 3:
-                    # 验证阶段 2 后：进程存活期间由 Closed segment 日志触发 seg_001.flv 被立即移出为 static_rec_p001.flv
-                    self.assertTrue(stage3_ready.wait(timeout=5))
+                if stage3_ready.is_set():
+                    # 阶段 3：收到 Closed segment 日志后，seg_001 在进程存活期间立即移出为 static_rec_p001.flv
                     self.assertTrue(seg1_db_done.is_set())
                     self.assertTrue(os.path.isfile('static_rec_p001.flv'))
                     self.assertFalse(os.path.exists(os.path.join(sdir, 'seg_001.flv')))
-                    state['stage2_ok'] = True
+                    state['stage3_ok'] = True
                     return 0
-                return 0
+                return None
 
             proc = FakePopenProcess(cmd, returncode=0, on_poll=on_poll)
-            # 唤醒第 1 轮循环
             proc.stdout.push(b'mesio started\n')
 
             def _drive():
                 try:
-                    # 等待第 1 轮 poll 与 seg_000 移出及 DB 登记完成后，再注入 seg_001 字节与 Closed segment 日志
-                    self.assertTrue(poll1_done.wait(timeout=5))
-                    self.assertTrue(seg0_db_done.wait(timeout=5))
+                    # 阶段 2：确认 0B 新段不触发提前移出后，向 seg_001 写入非空数据
+                    self.assertTrue(poll2_done.wait(timeout=5))
                     with open(os.path.join(sdir, 'seg_001.flv'), 'wb') as f:
                         f.write(b'B' * 2048)
+                    seg1_nonempty_ready.set()
+
+                    # 阶段 3：等待 seg_000 稳定后兜底移出并登记 DB，再向 seg_001 发送 Closed segment 日志
+                    self.assertTrue(poll4_done.wait(timeout=5))
+                    self.assertTrue(seg0_db_done.wait(timeout=5))
                     closed_line = f'2026-11-25 INFO Closed segment path={os.path.join(sdir, "seg_001.flv")} tags=42\n'
                     proc.stdout.push(closed_line.encode('utf-8'))
-                    # 等待第 2 轮 poll 与进程存活期间 seg_001 移出及 DB 登记完成，再准备收尾分段并退出
-                    self.assertTrue(poll2_done.wait(timeout=5))
+
                     self.assertTrue(seg1_db_done.wait(timeout=5))
                     self.assertIsNone(proc.returncode)
                     with open(os.path.join(sdir, 'seg_002.flv'), 'wb') as f:
@@ -449,6 +475,7 @@ class TestPR11MesioDownloader(unittest.TestCase):
                     proc.stdout.push_eof()
                 except Exception as exc:
                     drive_errors.append(exc)
+                    seg1_nonempty_ready.set()
                     stage3_ready.set()
                     proc.stdout.push_eof()
 
@@ -457,7 +484,8 @@ class TestPR11MesioDownloader(unittest.TestCase):
             t.start()
             return proc
 
-        with patch('biliup.engine.download.SessionLocal', self._TestSession), \
+        with patch('biliup.engine.download._MESIO_POLL_INTERVAL', 0.02), \
+                patch('biliup.engine.download.SessionLocal', self._TestSession), \
                 patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen), \
                 patch('biliup.engine.download.update_file_list', side_effect=tracked_update_file_list):
             ret = dl.mesio_download('/usr/bin/mesio')
@@ -468,7 +496,9 @@ class TestPR11MesioDownloader(unittest.TestCase):
         self.assertEqual(drive_errors, [])
         self.assertTrue(ret)
         self.assertTrue(state['stage1_ok'])
-        self.assertTrue(state['stage2_ok'])
+        self.assertTrue(state['stage2_unmoved_ok'])
+        self.assertTrue(state['stage2_moved_ok'])
+        self.assertTrue(state['stage3_ok'])
 
         self.assertTrue(os.path.isfile('static_rec.flv'))
         self.assertTrue(os.path.isfile('static_rec_p001.flv'))
@@ -1157,6 +1187,305 @@ class TestPR11MesioDownloader(unittest.TestCase):
             scanned = UploadBase.file_list('hist_up')
 
         self.assertEqual([item.video for item in scanned], ['custom_old_session.flv'])
+
+    def test_p1_2_mesio_cross_midnight_segment_uses_start_timestamp(self):
+        ts_2325 = time.mktime((2026, 11, 25, 23, 25, 0, 0, 0, -1))
+        ts_2330 = time.mktime((2026, 11, 25, 23, 30, 0, 0, 0, -1))
+        ts_0015 = time.mktime((2026, 11, 26, 0, 15, 0, 0, 0, -1))
+        ts_0030 = time.mktime((2026, 11, 26, 0, 30, 0, 0, 0, -1))
+        ts_0130 = time.mktime((2026, 11, 26, 1, 30, 0, 0, 0, -1))
+
+        # A. 无 birth_ts（如 Linux 旧文件系统）：首段用 session_start_ts，次日新发现段用发现时刻
+        subdir_a = os.path.join(self._tmpdir.name, 'cross_no_birth')
+        os.makedirs(subdir_a, exist_ok=True)
+        prev_cwd = os.getcwd()
+        os.chdir(subdir_a)
+        try:
+            dl = DummyMesioDownloader(fname='cross_up')
+            dl.downloader = 'mesio'
+            dl.filename_prefix = '{streamer}%Y-%m-%dT%H_%M_%S'
+            with self._TestSession() as db:
+                dl.database_row_id = db_mod.add_stream_info(db, dl.fname, dl.url, time.localtime())
+            clock = {'now': ts_2330}
+            poll1_done = threading.Event()
+            seg0_closed_done = threading.Event()
+            driver_errors = []
+            drivers = []
+
+            def fake_popen_a(cmd, **kwargs):
+                sdir = _extract_session_dir(cmd)
+                with open(os.path.join(sdir, 'seg_000.flv'), 'wb') as f:
+                    f.write(b'DAY1' * 64)
+
+                def on_poll(proc, count):
+                    if count == 1:
+                        poll1_done.set()
+                        return None
+                    if os.path.isfile('cross_up2026-11-25T23_30_00.flv'):
+                        seg0_closed_done.set()
+                        clock['now'] = ts_0130
+                        return 0
+                    return None
+
+                proc = FakePopenProcess(cmd, returncode=0, on_poll=on_poll)
+
+                def _drive():
+                    try:
+                        self.assertTrue(poll1_done.wait(timeout=5))
+                        # 跨越午夜后到 00:30，关闭 seg_000 并创建 seg_001
+                        clock['now'] = ts_0030
+                        with open(os.path.join(sdir, 'seg_001.flv'), 'wb') as f:
+                            f.write(b'DAY2' * 64)
+                        proc.stdout.push(
+                            f'Closed segment path={os.path.join(sdir, "seg_000.flv")} index=0\n'.encode('utf-8')
+                        )
+                        self.assertTrue(seg0_closed_done.wait(timeout=5))
+                        proc.stdout.push_eof()
+                    except Exception as exc:
+                        driver_errors.append(exc)
+                        proc.stdout.push_eof()
+
+                t = threading.Thread(target=_drive, daemon=True)
+                drivers.append(t)
+                t.start()
+                return proc
+
+            with patch('biliup.engine.download._MESIO_POLL_INTERVAL', 0.02), \
+                    patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                    patch('biliup.engine.download.time.time', side_effect=lambda: clock['now']), \
+                    patch('biliup.engine.download.get_file_birth_timestamp', return_value=None), \
+                    patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen_a):
+                ret = dl.mesio_download('/usr/bin/mesio')
+
+            for t in drivers:
+                t.join(timeout=5)
+            self._join_segment_threads(dl)
+            self.assertEqual(driver_errors, [])
+            self.assertTrue(ret)
+            self.assertTrue(os.path.isfile('cross_up2026-11-25T23_30_00.flv'))
+            self.assertTrue(os.path.isfile('cross_up2026-11-26T00_30_00.flv'))
+        finally:
+            os.chdir(prev_cwd)
+
+        # B. get_file_birth_timestamp 可用且更早时，优先采用分段真实创建时间
+        subdir_b = os.path.join(self._tmpdir.name, 'cross_with_birth')
+        os.makedirs(subdir_b, exist_ok=True)
+        os.chdir(subdir_b)
+        try:
+            dl_b = DummyMesioDownloader(fname='birth_up')
+            dl_b.downloader = 'mesio'
+            dl_b.filename_prefix = '{streamer}%Y-%m-%dT%H_%M_%S'
+            with self._TestSession() as db:
+                dl_b.database_row_id = db_mod.add_stream_info(db, dl_b.fname, dl_b.url, time.localtime())
+            clock_b = {'now': ts_2330}
+
+            def fake_birth(path):
+                base = os.path.basename(path)
+                if base == 'seg_000.flv':
+                    return ts_2325
+                if base == 'seg_001.flv':
+                    return ts_0015
+                return None
+
+            def fake_popen_b(cmd, **kwargs):
+                sdir = _extract_session_dir(cmd)
+                with open(os.path.join(sdir, 'seg_000.flv'), 'wb') as f:
+                    f.write(b'B0' * 64)
+                with open(os.path.join(sdir, 'seg_001.flv'), 'wb') as f:
+                    f.write(b'B1' * 64)
+
+                def on_poll(proc, count):
+                    if count == 1:
+                        clock_b['now'] = ts_0130
+                        proc.stdout.push_eof()
+                        return 0
+                    return 0
+
+                return FakePopenProcess(cmd, returncode=0, on_poll=on_poll)
+
+            with patch('biliup.engine.download._MESIO_POLL_INTERVAL', 0.02), \
+                    patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                    patch('biliup.engine.download.time.time', side_effect=lambda: clock_b['now']), \
+                    patch('biliup.engine.download.get_file_birth_timestamp', side_effect=fake_birth), \
+                    patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen_b):
+                ret_b = dl_b.mesio_download('/usr/bin/mesio')
+
+            self._join_segment_threads(dl_b)
+            self.assertTrue(ret_b)
+            self.assertTrue(os.path.isfile('birth_up2026-11-25T23_25_00.flv'))
+            self.assertTrue(os.path.isfile('birth_up2026-11-26T00_15_00.flv'))
+        finally:
+            os.chdir(prev_cwd)
+
+    def test_p1_3_fallback_requires_nonempty_successor_and_two_stable_scans(self):
+        dl = DummyMesioDownloader(fname='p13_up')
+        dl.downloader = 'mesio'
+        dl.filename_prefix = 'p13_seg'
+
+        with self._TestSession() as db:
+            dl.database_row_id = db_mod.add_stream_info(db, dl.fname, dl.url, time.localtime())
+
+        timeline = []
+        closed_sent = {'done': False}
+
+        def fake_popen(cmd, **kwargs):
+            sdir = _extract_session_dir(cmd)
+            seg0 = os.path.join(sdir, 'seg_000.flv')
+            seg1 = os.path.join(sdir, 'seg_001.flv')
+            with open(seg0, 'wb') as f:
+                f.write(b'A' * 100)
+            with open(seg1, 'wb') as f:
+                pass
+
+            def on_poll(proc, count):
+                if count == 1:
+                    timeline.append(('poll1_before_flush', os.path.exists('p13_seg.flv')))
+                    return None
+                if count == 2:
+                    # poll1 时 seg_001 为 0B，seg_000 绝不移出
+                    timeline.append(('after_zero_successor', os.path.exists('p13_seg.flv')))
+                    with open(seg1, 'wb') as f:
+                        f.write(b'S' * 50)
+                    return None
+                if count == 3:
+                    # poll2 仅完成第 1 次含非空后继的扫描，不移出；此时变更 seg_000 大小和 mtime，破坏稳定性
+                    timeline.append(('after_first_nonempty_scan', os.path.exists('p13_seg.flv')))
+                    with open(seg0, 'ab') as f:
+                        f.write(b'Z' * 20)
+                    st = os.stat(seg0)
+                    os.utime(seg0, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+                    return None
+                if count == 4:
+                    # poll3 时 seg_000 指纹发生变化并记录新指纹，仍不得移出；本轮保持 seg_000 不变
+                    timeline.append(('after_changed_scan', os.path.exists('p13_seg.flv')))
+                    return None
+                if count == 5:
+                    # poll4 完成新指纹连续第 2 次相同 (st_size, st_mtime_ns) 扫描，seg_000 应已兜底移出
+                    timeline.append(('after_second_stable_scan', os.path.exists('p13_seg.flv')))
+                    if not closed_sent['done']:
+                        closed_sent['done'] = True
+                        proc.stdout.push(f'Closed segment path={seg1} index=1\n'.encode('utf-8'))
+                    return None
+                if proc.returncode is None and os.path.isfile('p13_seg_p001.flv'):
+                    # 即使是最后一个分段，命中 closed_snapshot 也应立即在进程存活时移出
+                    timeline.append(('seg1_moved_while_alive', os.path.exists(seg1)))
+                    proc.stdout.push_eof()
+                    return 0
+                return None
+
+            return FakePopenProcess(cmd, returncode=0, on_poll=on_poll)
+
+        with patch('biliup.engine.download._MESIO_POLL_INTERVAL', 0.02), \
+                patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen):
+            ret = dl.mesio_download('/usr/bin/mesio')
+
+        self._join_segment_threads(dl)
+        self.assertTrue(ret)
+        self.assertEqual(
+            timeline,
+            [
+                ('poll1_before_flush', False),
+                ('after_zero_successor', False),
+                ('after_first_nonempty_scan', False),
+                ('after_changed_scan', False),
+                ('after_second_stable_scan', True),
+                ('seg1_moved_while_alive', False),
+            ],
+        )
+        self.assertTrue(os.path.isfile('p13_seg.flv'))
+        self.assertTrue(os.path.isfile('p13_seg_p001.flv'))
+
+    def test_mesio_hls_closed_segment_log_format_and_flv_tags_format(self):
+        hls_sample = (
+            r'INFO process_input:writer_processing: hls_fix::writer_task: '
+            r'Closed segment path=C:\tmp\seg_000.ts items=2 duration_secs=2.0 index=1 '
+            r'input=http://live.example.com/stream.m3u8'
+        )
+        flv_sample = r'2026-11-25 INFO Closed segment path=C:\tmp\seg_001.flv tags=42'
+        hls_match = download_mod._MESIO_CLOSED_SEGMENT_RE.search(hls_sample)
+        flv_match = download_mod._MESIO_CLOSED_SEGMENT_RE.search(flv_sample)
+        self.assertIsNotNone(hls_match)
+        self.assertEqual(hls_match.group(1), r'C:\tmp\seg_000.ts')
+        self.assertIsNotNone(flv_match)
+        self.assertEqual(flv_match.group(1), r'C:\tmp\seg_001.flv')
+
+        dl = DummyMesioDownloader(fname='hls_up')
+        dl.downloader = 'mesio'
+        dl.filename_prefix = 'hls_seg'
+
+        with self._TestSession() as db:
+            dl.database_row_id = db_mod.add_stream_info(db, dl.fname, dl.url, time.localtime())
+
+        state = {
+            'hls_pushed': False,
+            'hls_alive_moved': False,
+            'flv_pushed': False,
+            'flv_alive_moved': False,
+        }
+        seg0_db_done = threading.Event()
+        orig_update_file_list = download_mod.update_file_list
+
+        def tracked_update_file_list(db, row_id, file_name):
+            res = orig_update_file_list(db, row_id, file_name)
+            if file_name == 'hls_seg.ts':
+                seg0_db_done.set()
+            return res
+
+        def fake_popen(cmd, **kwargs):
+            sdir = _extract_session_dir(cmd)
+            seg0_ts = os.path.join(sdir, 'seg_000.ts')
+            seg1_flv = os.path.join(sdir, 'seg_001.flv')
+            with open(seg0_ts, 'wb') as f:
+                f.write(b'T' * 256)
+
+            def on_poll(proc, count):
+                if count > 200:
+                    proc.stdout.push_eof()
+                    return 1
+                if not state['hls_pushed']:
+                    state['hls_pushed'] = True
+                    hls_line = (
+                        'INFO process_input:writer_processing: hls_fix::writer_task: '
+                        f'Closed segment path={seg0_ts} items=2 duration_secs=2.0 index=1 '
+                        'input=http://live.example.com/stream.m3u8\n'
+                    )
+                    proc.stdout.push(hls_line.encode('utf-8'))
+                    return None
+                if not state['flv_pushed'] and os.path.isfile('hls_seg.ts'):
+                    self.assertIsNone(proc.returncode)
+                    self.assertTrue(seg0_db_done.wait(timeout=5))
+                    state['hls_alive_moved'] = not os.path.exists(seg0_ts)
+                    with open(seg1_flv, 'wb') as f:
+                        f.write(b'F' * 256)
+                    state['flv_pushed'] = True
+                    flv_line = f'2026-11-25 INFO Closed segment path={seg1_flv} tags=42\n'
+                    proc.stdout.push(flv_line.encode('utf-8'))
+                    return None
+                if state['flv_pushed'] and os.path.isfile('hls_seg.flv'):
+                    self.assertIsNone(proc.returncode)
+                    state['flv_alive_moved'] = not os.path.exists(seg1_flv)
+                    proc.stdout.push_eof()
+                    return 0
+                return None
+
+            return FakePopenProcess(cmd, returncode=0, on_poll=on_poll)
+
+        with patch('biliup.engine.download._MESIO_POLL_INTERVAL', 0.02), \
+                patch('biliup.engine.download.SessionLocal', self._TestSession), \
+                patch('biliup.engine.download.subprocess.Popen', side_effect=fake_popen), \
+                patch('biliup.engine.download.update_file_list', side_effect=tracked_update_file_list):
+            ret = dl.mesio_download('/usr/bin/mesio')
+
+        self._join_segment_threads(dl)
+        self.assertTrue(ret)
+        self.assertTrue(state['hls_alive_moved'])
+        self.assertTrue(state['flv_alive_moved'])
+        self.assertTrue(os.path.isfile('hls_seg.ts'))
+        self.assertTrue(os.path.isfile('hls_seg.flv'))
+        with self._TestSession() as db:
+            db_files = db_mod.get_file_list(db, dl.database_row_id)
+        self.assertEqual(db_files, ['hls_seg.ts', 'hls_seg.flv'])
 
 
 if __name__ == '__main__':

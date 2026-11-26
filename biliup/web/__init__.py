@@ -9,6 +9,7 @@ import json
 import multiprocessing
 import os
 import pathlib
+import re
 import concurrent.futures
 import tempfile
 import threading
@@ -117,6 +118,57 @@ def _validate_static_token(request: web.Request) -> bool:
     filename = request.path[len('/static/'):]
     token = request.query.get('token', '')
     return verify_static_token(request.app.get('static_token_secret'), filename, token)
+
+
+_UNIX_SENSITIVE_PREFIXES = (
+    '/etc/',
+    '/proc/',
+    '/sys/',
+    '/dev/',
+    '/root/',
+    '/boot/',
+    '/bin/',
+    '/sbin/',
+    '/usr/',
+    '/lib/',
+    '/lib64/',
+    '/run/',
+    '/var/run/',
+)
+_WINDOWS_SENSITIVE_PREFIXES = (
+    'windows/',
+    'program files/',
+    'program files (x86)/',
+    'programdata/',
+    'system volume information/',
+    '$recycle.bin/',
+)
+
+
+def _validate_cookie_file_path(value) -> bool:
+    """校验用户提交的 Cookie 文件路径，防止目录穿越与敏感系统路径注入"""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if value != value.strip():
+        return False
+    if any(ord(ch) < 32 for ch in value):
+        return False
+    if re.match(r'^[a-zA-Z]:(?![/\\])', value):
+        return False
+    norm = value.replace('\\', '/')
+    if norm.startswith('//'):
+        return False
+    if '..' in [part for part in norm.split('/') if part]:
+        return False
+    basename = norm.rsplit('/', 1)[-1]
+    if not basename.lower().endswith('.json') or len(basename) <= 5:
+        return False
+    collapsed = re.sub(r'/+', '/', norm).lower()
+    if collapsed.startswith(_UNIX_SENSITIVE_PREFIXES):
+        return False
+    if re.match(r'^[a-z]:/', collapsed) and collapsed[3:].startswith(_WINDOWS_SENSITIVE_PREFIXES):
+        return False
+    return True
 
 
 def _is_registered_cookie_file(file_path: str) -> bool:
@@ -457,6 +509,8 @@ async def add_lives(request):
     with SessionLocal() as db:
         if uid:
             us = db.get(UploadStreamers, uid)
+            if us is None:
+                return web.HTTPBadRequest(text=f"Upload streamer {uid} not found")
             to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data), upload_streamers_id=us.id)
         else:
             to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data))
@@ -540,7 +594,10 @@ async def get_streamers(request):
 async def streamers_id(request):
     _id = request.match_info['id']
     with SessionLocal() as db:
-        res = db.get(UploadStreamers, _id).as_dict()
+        us = db.get(UploadStreamers, _id)
+        if us is None:
+            return web.HTTPNotFound(text="Upload streamer not found")
+        res = us.as_dict()
         return web.json_response(res)
 
 
@@ -607,8 +664,19 @@ async def users(request):
 
 @routes.post('/v1/users')
 async def users(request):
-    json_data = await request.json()
-    to_save = Configuration(key=json_data['platform'], value=json_data['value'])
+    try:
+        json_data = await request.json()
+    except Exception:
+        return web.HTTPBadRequest(text="Invalid JSON body")
+    if not isinstance(json_data, dict):
+        return web.HTTPBadRequest(text="Invalid request body")
+    platform = json_data.get('platform')
+    if platform != 'bilibili-cookies':
+        return web.HTTPBadRequest(text="Invalid platform")
+    value = json_data.get('value')
+    if not _validate_cookie_file_path(value):
+        return web.HTTPBadRequest(text="Invalid cookie file path")
+    to_save = Configuration(key=platform, value=value)
     with SessionLocal() as db:
         db.add(to_save)
         db.flush()
@@ -627,6 +695,8 @@ async def users(request):
     # Configuration.delete_by_id(request.match_info['id'])
     with SessionLocal() as db:
         configuration = db.get(Configuration, request.match_info['id'])
+        if configuration is None or configuration.key != 'bilibili-cookies':
+            return web.HTTPNotFound(text="User not found")
         db.delete(configuration)
         db.commit()
     return web.HTTPOk()
@@ -697,16 +767,14 @@ async def dump_config(request):
 @routes.get('/v1/status')
 async def app_status(request):
     from biliup.app import context
-    from biliup.config import Config
-    from biliup.app import PluginInfo
     from biliup import __version__
-    res = {'version': __version__, }
-    for key, value in context.items():  # 遍历删除不能被 json 序列化的键值对
-        if isinstance(value, Config):
-            continue
-        if isinstance(value, PluginInfo):
-            continue
-        res[key] = value
+    res = {
+        'version': __version__,
+        'url_upload_count': context.get('url_upload_count', {}),
+        'upload_filename': context.get('upload_filename', []),
+        'file_upload_count': context.get('file_upload_count', {}),
+        'sync_downloader_map': context.get('sync_downloader_map', {}),
+    }
     return web.json_response(res)
 
 

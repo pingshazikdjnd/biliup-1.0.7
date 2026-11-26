@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import time
 import random
@@ -33,7 +34,7 @@ class Douyu(DownloadBase):
 
         try:
             if not self.__room_id:
-                self.__room_id = _get_real_rid(self.url)
+                self.__room_id = await asyncio.to_thread(_get_real_rid, self.url)
         except:
             logger.exception(f"{self.plugin_msg}: 获取房间号错误")
             return False

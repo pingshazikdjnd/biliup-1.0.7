@@ -42,9 +42,10 @@ pending_download_urls = set()
 async def singleton_check(platform, name, url):
     from biliup.handler import PRE_DOWNLOAD, UPLOAD
     context['url_upload_count'].setdefault(url, 0)
-    if context['PluginInfo'].url_status.get(url) == 1 or url in pending_download_urls:
-        logger.debug(f'{url} 正在下载或待下载中，跳过检测')
-        return
+    with NamedLock('download_dispatch'):
+        if context['PluginInfo'].url_status.get(url) == 1 or url in pending_download_urls:
+            logger.debug(f'{url} 正在下载或待下载中，跳过检测')
+            return
 
     event_manager.send_event(Event(UPLOAD, ({'name': name, 'url': url},)))
     p = platform(name, url)

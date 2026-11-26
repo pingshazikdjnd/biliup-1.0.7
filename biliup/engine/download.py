@@ -15,7 +15,7 @@ import time
 import shutil
 import copy
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, List, Callable, Optional
+from typing import AsyncGenerator, Dict, List, Callable, Optional, Tuple
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 
@@ -24,7 +24,7 @@ import requests
 from requests.utils import DEFAULT_ACCEPT_ENCODING, parse_header_links
 from httpx import HTTPStatusError
 
-from biliup.common.tools import NamedLock
+from biliup.common.tools import NamedLock, get_file_birth_timestamp
 from biliup.common.util import client, loop, check_timerange
 from biliup.database.db import add_stream_info, SessionLocal, get_stream_info, update_cover_path, update_room_title, update_file_list
 from biliup.plugins import random_user_agent
@@ -41,8 +41,9 @@ from biliup.app import context
 logger = logging.getLogger('biliup')
 
 _MESIO_MEDIA_EXTENSIONS = ('.flv', '.ts', '.mp4', '.mkv', '.webm')
-_MESIO_CLOSED_SEGMENT_RE = re.compile(r'Closed segment path=(.+?)(?:\s+tags=|\s+index=|$)')
+_MESIO_CLOSED_SEGMENT_RE = re.compile(r'Closed segment path=(.+?)(?:\s+(?:tags|items|duration_secs|index|input)=|$)')
 _MESIO_SEG_INDEX_RE = re.compile(r'seg_(\d+)')
+_MESIO_POLL_INTERVAL = 2.0
 
 
 def _parse_duration_to_seconds(duration_str: Optional[str]) -> Optional[int]:
@@ -188,7 +189,7 @@ def _rename_with_retry(src: str, dst: str, retries: int = 3, delay: float = 0.1)
             time.sleep(delay)
 
 
-def _list_sorted_mesio_media(session_dir: str):
+def _list_sorted_mesio_media_stats(session_dir: str):
     entries = []
     if not os.path.isdir(session_dir):
         return entries
@@ -205,9 +206,16 @@ def _list_sorted_mesio_media(session_dir: str):
             continue
         match = _MESIO_SEG_INDEX_RE.search(name)
         seg_index = int(match.group(1)) if match else float('inf')
-        entries.append(((seg_index, st.st_mtime, name), src_path, name, ext, st.st_size))
+        entries.append(((seg_index, st.st_mtime, name), src_path, name, ext, st.st_size, st.st_mtime_ns))
     entries.sort(key=lambda item: item[0])
-    return [(src_path, name, ext, size) for _, src_path, name, ext, size in entries]
+    return [(src_path, name, ext, size, mtime_ns) for _, src_path, name, ext, size, mtime_ns in entries]
+
+
+def _list_sorted_mesio_media(session_dir: str):
+    return [
+        (src_path, name, ext, size)
+        for src_path, name, ext, size, _ in _list_sorted_mesio_media_stats(session_dir)
+    ]
 
 
 def _try_register_mesio_file(database_row_id: Optional[int], file_basename: str, log_target: str) -> bool:
@@ -697,25 +705,27 @@ class DownloadBase(ABC):
 
     def mesio_download(self, mesio_bin: str) -> bool:
         self._mesio_soft_triggered = False
+        session_start_ts = time.time()
         session_tmp_dir = os.path.join(
             '.mesio_tmp',
-            f'{self.database_row_id}_{int(time.time() * 1000)}_{os.getpid()}',
+            f'{self.database_row_id}_{int(session_start_ts * 1000)}_{os.getpid()}',
         )
         os.makedirs(session_tmp_dir, exist_ok=True)
 
-        def _render_base_name(fallback: str) -> str:
+        def _render_base_name(fallback: str, ts: Optional[float] = None) -> str:
             try:
                 tmpl = self.gen_download_filename(is_fmt=False)
+                render_time = time.localtime(ts) if ts is not None else time.localtime()
                 rendered = time.strftime(
                     tmpl.encode("unicode-escape").decode(),
-                    time.localtime(),
+                    render_time,
                 ).encode().decode("unicode-escape")
                 return rendered or fallback
             except Exception:
                 return fallback
 
         safe_fallback = re.sub(r'[\\/:*?"<>|%\s]+', '_', str(self.fname or 'mesio')).strip('_') or 'mesio'
-        session_base_name = _render_base_name(f'{safe_fallback}_{int(time.time())}')
+        session_base_name = _render_base_name(f'{safe_fallback}_{int(session_start_ts)}', ts=session_start_ts)
         meta_path = os.path.join(session_tmp_dir, '.meta.json')
         session_meta = {
             'name': self.fname,
@@ -766,12 +776,35 @@ class DownloadBase(ABC):
         recent_lines = collections.deque(maxlen=30)
         explicitly_closed_paths = set()
         closed_event = threading.Event()
+        seg_start_times: Dict[str, float] = {}
+        first_segment_recorded = False
+        fallback_stable_fingerprints: Dict[str, Tuple[int, int]] = {}
         proc = None
         log_thread = None
         segments_moved = 0
         stop_requested = False
         stopped_by_timerange = False
         stop_deadline = 0.0
+
+        def _record_seg_start_time(src_path: str, norm_src: str, name: str) -> float:
+            nonlocal first_segment_recorded
+            if norm_src in seg_start_times:
+                return seg_start_times[norm_src]
+            try:
+                birth_ts = get_file_birth_timestamp(src_path)
+            except OSError:
+                birth_ts = None
+            match = _MESIO_SEG_INDEX_RE.search(name)
+            seg_index = int(match.group(1)) if match else None
+            if not first_segment_recorded or seg_index == 0:
+                start_ts = session_start_ts
+                if birth_ts is not None and birth_ts < start_ts:
+                    start_ts = birth_ts
+                first_segment_recorded = True
+            else:
+                start_ts = birth_ts if birth_ts is not None else time.time()
+            seg_start_times[norm_src] = start_ts
+            return start_ts
 
         def _read_stdout():
             stdout = proc.stdout if proc is not None else None
@@ -808,36 +841,63 @@ class DownloadBase(ABC):
                 closed_event.set()
 
         def _flush_closed_segments(final: bool) -> int:
-            media_files = _list_sorted_mesio_media(session_tmp_dir)
-            if not media_files:
-                return 0
             with log_lock:
                 closed_snapshot = set(explicitly_closed_paths)
+            media_files = _list_sorted_mesio_media_stats(session_tmp_dir)
+            if not media_files:
+                fallback_stable_fingerprints.clear()
+                return 0
             moved_count = 0
             last_idx = len(media_files) - 1
-            for idx, (src_path, _name, ext, size) in enumerate(media_files):
+            active_norm_paths = set()
+            for idx, (src_path, name, ext, size, mtime_ns) in enumerate(media_files):
+                norm_src = _normalize_mesio_path(src_path)
+                active_norm_paths.add(norm_src)
+                seg_ts = _record_seg_start_time(src_path, norm_src, name)
+
                 if final:
                     if size == 0:
                         try:
                             os.remove(src_path)
                         except OSError as e:
                             logger.warning(f"{self.plugin_msg}: 删除 mesio 0 字节文件失败 ({src_path}): {e}")
+                        else:
+                            seg_start_times.pop(norm_src, None)
+                            fallback_stable_fingerprints.pop(norm_src, None)
                         continue
                 else:
                     if size <= 0:
+                        fallback_stable_fingerprints.pop(norm_src, None)
                         continue
-                    norm_src = _normalize_mesio_path(src_path)
-                    if norm_src not in closed_snapshot and idx >= last_idx:
-                        continue
+                    if norm_src not in closed_snapshot:
+                        if idx >= last_idx:
+                            fallback_stable_fingerprints.pop(norm_src, None)
+                            continue
+                        has_nonempty_successor = any(
+                            next_size > 0 for _, _, _, next_size, _ in media_files[idx + 1:]
+                        )
+                        if not has_nonempty_successor:
+                            fallback_stable_fingerprints.pop(norm_src, None)
+                            continue
+                        fingerprint = (size, mtime_ns)
+                        if fallback_stable_fingerprints.get(norm_src) != fingerprint:
+                            fallback_stable_fingerprints[norm_src] = fingerprint
+                            continue
 
-                base_name = _render_base_name(session_base_name)
+                base_name = _render_base_name(session_base_name, ts=seg_ts)
                 try:
                     dst = _publish_mesio_file(src_path, base_name, ext, '.')
                 except OSError as e:
                     logger.warning(f"{self.plugin_msg}: 移出 mesio 分段失败 ({src_path}): {e}")
                     continue
+                seg_start_times.pop(norm_src, None)
+                fallback_stable_fingerprints.pop(norm_src, None)
                 self.__download_segment_callback(dst)
                 moved_count += 1
+
+            for stale_path in list(fallback_stable_fingerprints):
+                if stale_path not in active_norm_paths:
+                    fallback_stable_fingerprints.pop(stale_path, None)
             return moved_count
 
         def _has_nonempty_session_media() -> bool:
@@ -893,7 +953,7 @@ class DownloadBase(ABC):
                     log_thread.start()
 
                 while True:
-                    closed_event.wait(timeout=2.0)
+                    closed_event.wait(timeout=_MESIO_POLL_INTERVAL)
                     closed_event.clear()
 
                     exited = proc.poll() is not None

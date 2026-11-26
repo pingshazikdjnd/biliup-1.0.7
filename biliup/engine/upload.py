@@ -2,6 +2,7 @@ import logging
 import os
 import pathlib
 import shutil
+import threading
 
 from typing import NamedTuple, Optional, List
 
@@ -14,6 +15,8 @@ logger = logging.getLogger('biliup')
 
 
 class UploadBase:
+    _claim_state = threading.local()
+
     class FileInfo(NamedTuple):
         video: str
         danmaku: Optional[str]
@@ -23,25 +26,38 @@ class UploadBase:
         self.persistence_path = persistence_path
         self.data: dict = data
         self.post_processor = postprocessor
+        self.last_claimed_videos: List[str] = []
+
+    @classmethod
+    def reset_last_claimed_videos(cls) -> None:
+        cls._claim_state.last_claimed_videos = None
+
+    @classmethod
+    def get_last_claimed_videos(cls) -> Optional[List[str]]:
+        return getattr(cls._claim_state, 'last_claimed_videos', None)
 
     # 此方法会返回文件列表中上传次数最大文件的上传次数
     @staticmethod
     def get_max_upload_count(filelist: List[FileInfo]) -> int:
         from biliup.handler import event_manager
         with NamedLock("file_upload_count"):
-            file_upload_count = event_manager.context['file_upload_count']
-            for file_name in os.listdir('.'):
+            file_upload_count = event_manager.context.setdefault('file_upload_count', {})
+            existing_files = set(os.listdir('.'))
+            for file_name in existing_files:
                 if file_name not in file_upload_count:
                     file_upload_count[file_name] = 0
             for file_name in list(file_upload_count):
-                if file_name not in os.listdir('.'):
+                if file_name not in existing_files:
                     del file_upload_count[file_name]
-            max = 0
+            max_count = 0
             for item in filelist:
-                if file_upload_count[item.video] > max:
-                    max = file_upload_count[item.video]
-                file_upload_count[item.video] += 1
-        return max
+                if item.video not in existing_files:
+                    continue
+                cur_count = file_upload_count.get(item.video, 0)
+                if cur_count > max_count:
+                    max_count = cur_count
+                file_upload_count[item.video] = cur_count + 1
+        return max_count
 
     @staticmethod
     def _is_streamer_recording(index) -> bool:
@@ -176,6 +192,8 @@ class UploadBase:
 
     def start(self, allowed_files=None):
         from biliup.handler import event_manager
+        self.last_claimed_videos = []
+        UploadBase._claim_state.last_claimed_videos = []
         # 保证一个name同时只有一个上传线程扫描文件列表
         lock = NamedLock(f'upload_file_list_{self.principal}')
         lock_acquired = False
@@ -205,6 +223,9 @@ class UploadBase:
 
                 if not claimed_files:
                     return None
+                claimed_videos = [f.video for f in claimed_files]
+                self.last_claimed_videos = claimed_videos
+                UploadBase._claim_state.last_claimed_videos = claimed_videos
                 logger.info('准备上传' + self.data["format_title"])
                 lock.release()
                 lock_acquired = False

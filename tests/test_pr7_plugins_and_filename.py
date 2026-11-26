@@ -605,9 +605,36 @@ class TestPR7Plugins(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await yt.acheck_stream(is_check=True))
                 to_thread_mock.assert_awaited_once()
 
-        # Verify ytarchive finally ordering (terminate before wait, kill only on TimeoutExpired) & no cover_thread.close()
+        # 1. 正常退出 (returncode=0): 返回 True，先 wait(timeout=20)，不调用 terminate/kill，安全关闭 stdout
         yt_live.downloader = 'ytarchive'
         yt_live.use_live_cover = True
+        fake_thread_ok = MagicMock()
+        fake_thread_ok.is_alive.return_value = True
+        del fake_thread_ok.close  # AttributeError if close() were still called
+
+        ok_calls = []
+        ok_proc = MagicMock()
+        ok_proc.stdout.readline.side_effect = [b'Video Fragments: 1\n', b'']
+        ok_proc.returncode = 0
+        ok_proc.poll.return_value = 0
+
+        def _ok_wait(timeout=None):
+            ok_calls.append(('wait', timeout))
+            return 0
+
+        ok_proc.wait.side_effect = _ok_wait
+
+        with patch.object(youtube_mod.threading, 'Thread', return_value=fake_thread_ok):
+            with patch.object(youtube_mod.subprocess, 'Popen', return_value=ok_proc):
+                self.assertTrue(yt_live.download())
+
+        self.assertEqual(ok_calls, [('wait', 20)])
+        ok_proc.terminate.assert_not_called()
+        ok_proc.kill.assert_not_called()
+        ok_proc.stdout.close.assert_called_once()
+        fake_thread_ok.join.assert_called_once_with(timeout=20)
+
+        # 2. 超时挂起: wait(20) 超时后触发 terminate -> wait(20) -> kill -> wait()，返回 False
         fake_thread = MagicMock()
         fake_thread.is_alive.return_value = True
         del fake_thread.close  # AttributeError if close() were still called
@@ -634,10 +661,22 @@ class TestPR7Plugins(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(youtube_mod.threading, 'Thread', return_value=fake_thread):
             with patch.object(youtube_mod.subprocess, 'Popen', return_value=fake_proc):
-                self.assertTrue(yt_live.download())
+                self.assertFalse(yt_live.download())
 
-        self.assertEqual(call_order, ['terminate', ('wait', 20), 'kill', ('wait', None)])
+        self.assertEqual(call_order, [('wait', 20), 'terminate', ('wait', 20), 'kill', ('wait', None)])
+        fake_proc.stdout.close.assert_called_once()
         fake_thread.join.assert_called_once_with(timeout=20)
+
+        # 3. 缺失 ytarchive 二进制 (FileNotFoundError): 记录日志并返回 False
+        fake_thread_missing = MagicMock()
+        fake_thread_missing.is_alive.return_value = True
+        del fake_thread_missing.close
+
+        with patch.object(youtube_mod.threading, 'Thread', return_value=fake_thread_missing):
+            with patch.object(youtube_mod.subprocess, 'Popen', side_effect=FileNotFoundError('ytarchive not found')):
+                self.assertFalse(yt_live.download())
+
+        fake_thread_missing.join.assert_called_once_with(timeout=20)
 
     def test_douyu_get_real_rid_caches_truthy_only_with_timeout(self):
         fail_resp = MagicMock(text='not found')

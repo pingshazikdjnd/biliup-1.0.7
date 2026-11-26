@@ -40,12 +40,13 @@ def silence_event_loop_closed(func):
     return wrapper
 
 
-def get_file_birth_timestamp(file: str) -> Optional[float]:
+def get_file_birth_timestamp(file: str, stat_result=None) -> Optional[float]:
     """
     跨平台获取文件真实创建时间（birth time）
     如平台或文件系统不支持则返回 None
     """
-    stat_result = os.stat(file)
+    if stat_result is None:
+        stat_result = os.stat(file)
 
     if hasattr(stat_result, "st_birthtime"):
         return stat_result.st_birthtime
@@ -55,7 +56,13 @@ def get_file_birth_timestamp(file: str) -> Optional[float]:
 
     if platform.system() == 'Linux':
         try:
-            birth_time = float(subprocess.check_output(["stat", "-c", "%W", file]).decode('utf8'))
+            birth_time = float(
+                subprocess.check_output(
+                    ["stat", "-c", "%W", "--", file],
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                ).decode('utf8')
+            )
             if birth_time > 0:
                 return birth_time
         except Exception:
@@ -69,10 +76,11 @@ def get_file_create_timestamp(file: str) -> float:
     跨平台获取文件创建时间
     如无法获取则返回修改时间
     """
-    birth_ts = get_file_birth_timestamp(file)
+    stat_result = os.stat(file)
+    birth_ts = get_file_birth_timestamp(file, stat_result=stat_result)
     if birth_ts is not None:
         return birth_ts
-    return os.stat(file).st_mtime
+    return stat_result.st_mtime
 
 
 def processor(processors, data):

@@ -55,11 +55,12 @@ const removeCircularReferences = (obj: any, seen = new WeakSet()): any => {
   return result
 }
 
-// 对标 Python LiveStreamers 表字段与 API DTO 字段；有意排除 filename_prefix，使其保留在 downloadSettings 中写入 override
+// 对标 Python LiveStreamers 表字段与 API DTO 字段；将 filename_prefix 纳入表字段以便直接回写 LiveStreamers.filename_prefix
 const ENTITY_FIELDS = new Set([
   'id',
   'url',
   'remark',
+  'filename_prefix',
   'filename',
   'split_time',
   'split_size',
@@ -121,12 +122,18 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
         base[key] = value
       }
     })
+    if (typeof initialOverride.filename_prefix === 'string' && initialOverride.filename_prefix !== '') {
+      base.filename_prefix = initialOverride.filename_prefix
+    }
     return base
   }, [entity, initialOverride])
 
   useEffect(() => {
     // 子组件 Plugin 的 mount useEffect 先于父组件执行，待其初始 setValue 完成后再开启变更追踪
     isInitializingRef.current = false
+    return () => {
+      isInitializingRef.current = true
+    }
   }, [])
 
   useEffect(() => {
@@ -278,6 +285,24 @@ const OverrideModalContent: React.FC<OverrideModalContentProps> = ({
         }
         delete nextValues[key]
       })
+      if (overrideTextChanged && !touchedFields.has('filename_prefix')) {
+        if (Object.prototype.hasOwnProperty.call(overrideConfig, 'filename_prefix')) {
+          nextValues.filename_prefix = overrideConfig.filename_prefix
+            ? String(overrideConfig.filename_prefix)
+            : null
+          delete overrideConfig.filename_prefix
+        } else if (
+          !entity?.filename_prefix &&
+          Object.prototype.hasOwnProperty.call(initialOverride, 'filename_prefix')
+        ) {
+          nextValues.filename_prefix = null
+        } else {
+          nextValues.filename_prefix = entity?.filename_prefix ? entity.filename_prefix : null
+        }
+      } else {
+        nextValues.filename_prefix = nextValues.filename_prefix ? nextValues.filename_prefix : null
+        delete overrideConfig.filename_prefix
+      }
       nextValues.override = overrideConfig
 
       // 处理循环引用

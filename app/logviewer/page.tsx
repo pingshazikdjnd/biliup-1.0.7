@@ -105,7 +105,9 @@ function LogViewerContent({ logs, setLogs, isConnected, setIsConnected, isLoadin
 
     // 关闭现有连接
     if (wsRef.current) {
-      wsRef.current.close()
+      const prevWs = wsRef.current
+      wsRef.current = null
+      prevWs.close()
     }
 
     // 创建新的WebSocket连接
@@ -127,16 +129,19 @@ function LogViewerContent({ logs, setLogs, isConnected, setIsConnected, isLoadin
     wsRef.current = ws
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) return
       setIsConnected(true)
       setIsLoading(false)
       Toast.success('日志连接已建立')
     }
 
     ws.onmessage = (event) => {
+      if (wsRef.current !== ws) return
       setLogs((prev: string[]) => [...prev, event.data])
     }
 
     ws.onerror = (error) => {
+      if (wsRef.current !== ws) return
       console.error('WebSocket错误:', error)
 
       // 检查是否是连接建立前WebSocket已关闭的错误
@@ -152,6 +157,7 @@ function LogViewerContent({ logs, setLogs, isConnected, setIsConnected, isLoadin
     }
 
     ws.onclose = () => {
+      if (wsRef.current !== ws) return
       setIsConnected(false)
       console.log('WebSocket连接已关闭')
     }
@@ -164,7 +170,9 @@ function LogViewerContent({ logs, setLogs, isConnected, setIsConnected, isLoadin
       // 组件卸载时关闭WebSocket连接
       if (wsRef.current) {
         console.log('主动关闭WebSocket连接')
-        wsRef.current.close()
+        const prevWs = wsRef.current
+        wsRef.current = null
+        prevWs.close()
       }
     }
   }, [activeTab])
