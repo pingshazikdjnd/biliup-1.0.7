@@ -1,0 +1,220 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci.yml
+
+  windows-desktop:
+    if: startsWith(github.ref, 'refs/tags/v')
+    name: Build Windows Desktop Installer
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build frontend
+        run: |
+          npm install
+          npm run build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release
+
+      - name: Build PyInstaller sidecar
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install target/wheels/*.whl
+          pip install Pillow pyinstaller
+          pyinstaller biliup.spec
+
+      - name: Prepare Tauri sidecar
+        shell: pwsh
+        run: |
+          $TARGET_TRIPLE = (rustc -Vv | Select-String "host:" | ForEach-Object { $_.Line.Split(" ")[1] }).Trim()
+          echo "Target Triple: $TARGET_TRIPLE"
+          New-Item -ItemType Directory -Force -Path tauri-app/src-tauri/binaries | Out-Null
+          Copy-Item -Recurse -Force dist/bbup/* tauri-app/src-tauri/binaries/
+
+      - name: Install Tauri frontend dependencies
+        working-directory: tauri-app
+        run: npm install
+
+      - name: Build Tauri installers
+        working-directory: tauri-app
+        run: npm run tauri build
+
+      - name: Stage Windows desktop artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path desktop-dist | Out-Null
+          $msi = Get-ChildItem -Path target/release/bundle/msi -Filter *.msi -ErrorAction SilentlyContinue
+          $exe = Get-ChildItem -Path target/release/bundle/nsis -Filter *-setup.exe -ErrorAction SilentlyContinue
+          if (-not $msi) { throw "No .msi installer found under target/release/bundle/msi" }
+          if (-not $exe) { throw "No *-setup.exe installer found under target/release/bundle/nsis" }
+          Copy-Item -Force $msi.FullName desktop-dist/
+          Copy-Item -Force $exe.FullName desktop-dist/
+
+      - name: Upload Windows desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows
+          if-no-files-found: error
+          path: desktop-dist/
+
+  termux:
+    if: startsWith(github.ref, 'refs/tags/v')
+    name: Build Termux Wheel
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Get Termux Python info
+        id: termux-python
+        run: |
+          BASE_URL="https://packages.termux.dev/apt/termux-main/pool/main/p/python"
+          FNAME=$(curl -fsSL "$BASE_URL/" | grep -oP '(?<=href=")python_[^"]+_aarch64\.deb' | head -n 1)
+          TERMUX_PY_VER=$(echo "$FNAME" | grep -oP '\d+\.\d+' | head -n 1)
+          echo "filename=$FNAME" >> "$GITHUB_OUTPUT"
+          echo "version=$TERMUX_PY_VER" >> "$GITHUB_OUTPUT"
+          echo "Detected Termux Python version: $TERMUX_PY_VER"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.termux-python.outputs.version }}
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Install dependencies and Android target
+        run: |
+          pip install maturin
+          rustup target add aarch64-linux-android
+
+      - name: Set up CPython interpreter for cross-compilation
+        run: |
+          BASE_URL="https://packages.termux.dev/apt/termux-main/pool/main/p/python"
+          FNAME="${{ steps.termux-python.outputs.filename }}"
+          wget -nv "$BASE_URL/$FNAME"
+
+          mkdir termux_python
+          dpkg-deb -x "$FNAME" termux_python
+
+          cp -a termux_python/data/data/com.termux/files/usr/lib/libpython* "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/24"
+
+          sed -i 's/"abi3-py38",\? *//g' crates/stream-gears/Cargo.toml
+          sed -i '/dependencies = \[/a\    "quickjs >= 1.19.4",' pyproject.toml
+          sed -i 's/aiohttp\[speedups\] >= 3\.9\.5/aiohttp[speedups] <= 3.9.5/' pyproject.toml
+
+      - name: Build wheel for aarch64 (Termux)
+        run: |
+          export NDK_BIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          export CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android24-clang
+          export AR_aarch64_linux_android=$NDK_BIN/llvm-ar
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android24-clang
+
+          export PYO3_CROSS_LIB_DIR=${{ github.workspace }}/termux_python/data/data/com.termux/files/usr/lib
+          export PYO3_CROSS_INCLUDE_DIR=${{ github.workspace }}/termux_python/data/data/com.termux/files/usr/include/python${{ steps.termux-python.outputs.version }}
+          export PYO3_CROSS_PYTHON_VERSION=${{ steps.termux-python.outputs.version }}
+
+          maturin build \
+            --release \
+            --strip \
+            --manylinux off \
+            --target aarch64-linux-android \
+            --out dist
+
+      - name: Upload Termux wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-termux
+          if-no-files-found: error
+          path: dist/*.whl
+
+  publish:
+    needs: [wheels, windows-desktop, termux]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.wheels.result == 'success' && needs.windows-desktop.result == 'success'
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Extract release notes
+        run: node .github/scripts/release-notes.mjs "${GITHUB_REF_NAME#v}" CHANGELOG.md > notes.md
+
+      - name: Prepare and verify release assets
+        run: |
+          python3 .github/scripts/label_release_assets.py prepare artifacts "$GITHUB_REF_NAME" > assets.txt
+          find artifacts -maxdepth 1 -type f -name '*.whl' | grep -q . || { echo "::error::Missing .whl artifacts"; exit 1; }
+          find artifacts -maxdepth 1 -type f -name '*-setup.exe' | grep -q . || { echo "::error::Missing *-setup.exe artifact"; exit 1; }
+          find artifacts -maxdepth 1 -type f -name '*.msi' | grep -q . || { echo "::error::Missing *.msi artifact"; exit 1; }
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "artifacts/*"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -t ASSETS < assets.txt
+          sh .github/scripts/publish-release.sh "$GITHUB_REF_NAME" notes.md "${ASSETS[@]}"

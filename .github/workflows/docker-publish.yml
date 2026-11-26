@@ -5,10 +5,8 @@ on:
     # Publish `master` as Docker `latest` image.
     branches:
       - master
-
-    # Publish `v1.2.3` tags as releases.
-    tags:
-      - v*
+    # 暂不在 tag 触发 Docker 发布：下方 IMAGE_NAME 仍指向上游 ghcr.io/biliup/caution，
+    # 在本 fork 推送会无权限失败；如需启用请先将 IMAGE_NAME 改为自己的镜像路径。
 
   # Run tests for any PRs.
   pull_request:

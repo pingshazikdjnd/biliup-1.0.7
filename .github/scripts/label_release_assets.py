@@ -68,6 +68,9 @@ def classify_asset(name: str, tag: str) -> Optional[Tuple[Optional[str], str]]:
         if "x86_64" in lower:
             return None, "Python Wheel · macOS Intel (x86_64)"
 
+    if "linux_aarch64" in lower or "android" in lower:
+        return None, "Python Wheel · Android Termux (aarch64)"
+
     return None
 
 
@@ -89,7 +92,53 @@ def api_request(method: str, url: str, token: str, payload: Optional[dict] = Non
         return json.loads(resp.read().decode("utf-8"))
 
 
+def prepare_assets(target_dir: str, tag: str) -> int:
+    if not os.path.isdir(target_dir):
+        print(f"Asset directory not found: {target_dir}", file=sys.stderr)
+        return 1
+
+    version = tag[1:] if tag.startswith("v") else tag
+    used_names = set(os.listdir(target_dir))
+
+    for name in sorted(os.listdir(target_dir)):
+        src = os.path.join(target_dir, name)
+        if not os.path.isfile(src):
+            continue
+        result = classify_asset(name, version)
+        if not result:
+            print(src)
+            continue
+
+        new_name, label = result
+        dst = src
+        if new_name and new_name != name:
+            candidate = os.path.join(target_dir, new_name)
+            if new_name not in used_names:
+                os.replace(src, candidate)
+                used_names.discard(name)
+                used_names.add(new_name)
+                dst = candidate
+            else:
+                print(
+                    f"Warning: target filename already exists, keeping {name}",
+                    file=sys.stderr,
+                )
+
+        print(f"{dst}#{label}")
+
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "prepare":
+        if len(sys.argv) != 4:
+            print(
+                "Usage: label_release_assets.py prepare <dir> <tag>",
+                file=sys.stderr,
+            )
+            return 1
+        return prepare_assets(sys.argv[2], sys.argv[3])
+
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     tag = os.environ.get("RELEASE_TAG", "").strip()
