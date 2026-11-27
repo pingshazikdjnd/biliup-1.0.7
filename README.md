@@ -1,21 +1,19 @@
 <div align="center">
-  <img src="https://docs.biliup.rs/home.png" alt="biliup" width="300" height="300"/>
+  <img src="./public/logo.png" alt="biliup" width="160" />
+  <h1>biliup</h1>
+  <p>基于上游 <a href="https://github.com/biliup/biliup">biliup/biliup</a> 二次开发维护的稳定增强分支，保留原有开箱即用 WebUI 与多平台录播投稿能力，并重点强化了录制稳定性、上传可靠性与运维安全。</p>
+  <p>
+    <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.9%2B-blue?style=flat" alt="Python" /></a>
+    <a href="https://github.com/pingshazikdjnd/biliup-1.0.7/releases/latest"><img src="https://img.shields.io/github/v/release/pingshazikdjnd/biliup-1.0.7?style=flat" alt="Release" /></a>
+    <a href="https://github.com/pingshazikdjnd/biliup-1.0.7/releases"><img src="https://img.shields.io/github/downloads/pingshazikdjnd/biliup-1.0.7/total.svg?style=flat" alt="Downloads" /></a>
+    <a href="https://github.com/pingshazikdjnd/biliup-1.0.7/blob/dev-1.0.7/LICENSE"><img src="https://img.shields.io/github/license/pingshazikdjnd/biliup-1.0.7?style=flat" alt="License" /></a>
+  </p>
+  <p>
+    <a href="https://github.com/pingshazikdjnd/biliup-1.0.7/issues"><img src="https://img.shields.io/github/issues/pingshazikdjnd/biliup-1.0.7?label=Issues&style=flat" alt="GitHub Issues" /></a>
+    <a href="https://github.com/pingshazikdjnd/biliup-1.0.7/stargazers"><img src="https://img.shields.io/github/stars/pingshazikdjnd/biliup-1.0.7?style=flat" alt="GitHub Stars" /></a>
+    <a href="https://github.com/pingshazikdjnd/biliup-1.0.7/forks"><img src="https://img.shields.io/github/forks/pingshazikdjnd/biliup-1.0.7?style=flat" alt="GitHub Forks" /></a>
+  </p>
 </div>
-
-<div align="center">
-
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/downloads/)
-[![Release](https://img.shields.io/github/v/release/pingshazikdjnd/biliup-1.0.7)](https://github.com/pingshazikdjnd/biliup-1.0.7/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/pingshazikdjnd/biliup-1.0.7/total)](https://github.com/pingshazikdjnd/biliup-1.0.7/releases)
-[![License](https://img.shields.io/github/license/pingshazikdjnd/biliup-1.0.7)](https://github.com/pingshazikdjnd/biliup-1.0.7/blob/dev-1.0.7/LICENSE)
-
-[![GitHub Issues](https://img.shields.io/github/issues/pingshazikdjnd/biliup-1.0.7?label=Issues)](https://github.com/pingshazikdjnd/biliup-1.0.7/issues)
-[![GitHub Stars](https://img.shields.io/github/stars/pingshazikdjnd/biliup-1.0.7)](https://github.com/pingshazikdjnd/biliup-1.0.7/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/pingshazikdjnd/biliup-1.0.7)](https://github.com/pingshazikdjnd/biliup-1.0.7/forks)
-
-</div>
-
-> 基于上游 [biliup/biliup](https://github.com/biliup/biliup) 二次开发维护的稳定增强分支，保留原有开箱即用 WebUI 与多平台录播投稿能力，并重点强化了录制稳定性、上传可靠性与运维安全。
 
 ## 🛠️ 核心功能与本分支增强
 
@@ -36,7 +34,7 @@
 - **[GitHub Releases »](https://github.com/pingshazikdjnd/biliup-1.0.7/releases)**
 - **[CHANGELOG.md »](./CHANGELOG.md)**
 - **[问题反馈 / Issues »](https://github.com/pingshazikdjnd/biliup-1.0.7/issues)**
-- 上游基础配置参考文档：[docs.biliup.rs »](https://docs.biliup.rs)（通用基础配置可参考，新增特性请以本仓库 Releases 与 WebUI 说明为准）
+- 上游基础配置参考文档：[biliup.github.io/biliup »](https://biliup.github.io/biliup/)（通用基础配置可参考，新增特性请以本仓库 Releases 与 WebUI 说明为准）
 
 ## 🚀 快速开始
 
