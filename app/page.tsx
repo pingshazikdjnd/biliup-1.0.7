@@ -2,6 +2,7 @@
 import React from 'react'
 import { Button, Card, Divider, Layout, Space, Tag, Typography } from '@douyinfe/semi-ui'
 import { IconGlobe } from '@douyinfe/semi-icons'
+import generatedReleases from './changelog.generated.json'
 import { AuthGuard } from './lib/auth-guard'
 import ProtectedLayout from './lib/protected-layout'
 
@@ -12,24 +13,23 @@ type ChangeKind = 'feat' | 'fix' | 'warn'
 interface ChangeItem {
   kind: ChangeKind
   title: string
-  detail: string
+  detail?: string
 }
 
 interface ReleaseEntry {
   version: string
+  tag?: string
   date: string
-  latest?: boolean
   summary?: string
   items: ChangeItem[]
 }
 
 const REPO_RELEASES_URL = 'https://github.com/pingshazikdjnd/biliup-1.0.7/releases'
 
-const RELEASES: ReleaseEntry[] = [
+const LEGACY_RELEASES: ReleaseEntry[] = [
   {
     version: '1.0.7.009',
     date: '2026-11-25',
-    latest: true,
     summary: '新增外挂 mesio 下载器支持、跨夜标题日期校准与稳定性收口。',
     items: [
       {
@@ -180,6 +180,13 @@ const RELEASES: ReleaseEntry[] = [
   },
 ]
 
+const GENERATED_RELEASES = generatedReleases as unknown as ReleaseEntry[]
+const GENERATED_VERSION_SET = new Set(GENERATED_RELEASES.map((r) => r.version))
+const RELEASES: ReleaseEntry[] = [
+  ...GENERATED_RELEASES,
+  ...LEGACY_RELEASES.filter((r) => !GENERATED_VERSION_SET.has(r.version)),
+]
+
 const KIND_META: Record<ChangeKind, { emoji: string; label: string; color: 'green' | 'blue' | 'orange' }> = {
   feat: { emoji: '💡', label: '新功能', color: 'green' },
   fix: { emoji: '🔧', label: '已修复', color: 'blue' },
@@ -253,7 +260,7 @@ const Home: React.FC = () => (
           <Divider margin="0 0 20px 0" />
 
           <Space vertical align="start" spacing={16} style={{ width: '100%' }}>
-            {RELEASES.map((release) => (
+            {RELEASES.map((release, releaseIdx) => (
               <Card
                 key={release.version}
                 style={{ width: '100%' }}
@@ -264,7 +271,7 @@ const Home: React.FC = () => (
                     <Title heading={4} style={{ margin: 0 }}>
                       {release.version}
                     </Title>
-                    {release.latest && (
+                    {releaseIdx === 0 && (
                       <Tag color="green" type="solid" size="small">
                         Latest
                       </Tag>
@@ -280,7 +287,7 @@ const Home: React.FC = () => (
                     size="small"
                     onClick={() =>
                       window.open(
-                        `${REPO_RELEASES_URL}/tag/${encodeURIComponent(release.version)}`,
+                        `${REPO_RELEASES_URL}/tag/${encodeURIComponent(release.tag ?? release.version)}`,
                         '_blank',
                         'noopener,noreferrer'
                       )
@@ -297,7 +304,7 @@ const Home: React.FC = () => (
                 )}
                 <ul style={{ margin: 0, paddingLeft: 0, listStyle: 'none' }}>
                   {release.items.map((item, idx) => {
-                    const meta = KIND_META[item.kind]
+                    const meta = KIND_META[item.kind] ?? KIND_META.fix
                     return (
                       <li
                         key={`${release.version}-${idx}`}
@@ -318,8 +325,8 @@ const Home: React.FC = () => (
                           {meta.emoji} {meta.label}
                         </Tag>
                         <div>
-                          <Text strong>{item.title}：</Text>
-                          <Text>{item.detail}</Text>
+                          <Text strong>{item.detail ? `${item.title}：` : item.title}</Text>
+                          {item.detail && <Text>{item.detail}</Text>}
                         </div>
                       </li>
                     )

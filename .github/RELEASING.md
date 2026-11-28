@@ -32,6 +32,7 @@ flowchart LR
   - `tauri-app/src-tauri/Cargo.toml`、`tauri-app/src-tauri/tauri.conf.json`、`tauri-app/package.json`
   - `Cargo.lock`（`stream-gears` 与 `tauri-app`）
   - 根 `CHANGELOG.md` 与文档站 `docs/content/docs/guide/CHANGELOG.md`
+  - `app/changelog.generated.json`（WebUI 首页内置更新日志数据）
 - 注意：`crates/biliup` 与 `crates/biliup-cli`（`0.2.4`）保持独立版本，不受此同步脚本影响。
 
 ---
@@ -82,7 +83,7 @@ flowchart LR
 - **旧 workflow 整合**：已将原重复的 `releases.yml` 与 `pyinstaller-publish.yml` 整合进 `.github/workflows/build-release.yml` 统一编排，并移除了不使用的 `Termux-publish.yml`；`ci.yml` 改造为可复用的纯构建 workflow（并升级至 `actions/setup-node@v4`）；保留 `Build Old Version.yml` 与 `docs-publish.yml`。
 - **PR 阶段跳过打包**：`ci.yml` 已移除 `pull_request` 与分支 `push` 触发、`docker-publish.yml` 已移除 `pull_request` 触发（`docs-publish.yml` 亦仅对修改 `docs/**` 的非 `changeset-release/*` PR 运行），普通业务 PR 与 `Version Packages` PR 均不执行打包；完整全平台打包仅在合并发版 PR 推送 `v*` tag 后由 `build-release.yml` 单次触发（亦可按需手动 `workflow_dispatch` 触发）。
 - **Docker 发布暂未在 tag 启用**：`.github/workflows/docker-publish.yml` 已移除 `tags: v*` 触发器，原因是其中的 `IMAGE_NAME` 仍指向上游组织镜像 `ghcr.io/biliup/caution`；如需从本 fork 发布 Docker 镜像，请先将 `IMAGE_NAME` 改为你自己的仓库路径后再恢复 tag 触发。
-- **前端内置更新日志仍需手动维护**：WebUI 首页 `app/page.tsx` 中的更新日志数组与 `REPO_RELEASES_URL` 不会由 Changesets 自动修改，发版前后如需在网页端展示请继续手动维护。
+- **前端内置更新日志自动同步**：`npm run version-packages` 执行 `sync-version.mjs` 时，会自动将包含可展示变更的新版 SemVer 内容同步至 `app/changelog.generated.json`（纯依赖更新的版本会跳过写入，存在无法识别的变更正文时会输出告警），并在 `app/page.tsx` 中与历史 `1.0.7.001 ~ 1.0.7.009` 条目合并展示（自动将最新一条标记为 `Latest` 并跳转到 `vX.Y.Z` tag）；仅当 fork 到其他仓库时需按需调整 `REPO_RELEASES_URL`。
 
 ---
 
