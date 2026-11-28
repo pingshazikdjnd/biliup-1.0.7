@@ -10,7 +10,8 @@ on:
     branches:
       - main
       - master
-  pull_request:
+  # PR（包括功能/修复 PR 与 changeset-release/* 发版 PR）不再触发全平台 wheel 打包，
+  # 统一在合并发版 PR 推送 v* tag 后由 build-release.yml 通过 workflow_call 单次构建发布。
   workflow_dispatch:
   workflow_call:
 
