@@ -47,6 +47,7 @@ downloads/
 target
 _internal
 .trae/
+.workbuddy/
 pnpm-lock.yaml
 cookies.json
 biliup/database/migration/versions/*.py
