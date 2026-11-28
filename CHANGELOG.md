@@ -8,6 +8,12 @@
 
 # 更新日志
 
+## 1.0.9
+
+### Patch Changes
+
+- fix(bilibili): 为 B 站拉流请求头补充 Referer 并修复软水位单测延迟 mock (#20)
+
 ## 1.0.8
 
 ### Patch Changes
