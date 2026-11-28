@@ -154,9 +154,9 @@ function classifyAndFormatBullet(section, rawFirst, details) {
   return detail ? { kind, title, detail } : { kind, title };
 }
 
-export function parseChangelogSectionToWebItems(markdownBody) {
+export function parseChangelogSection(markdownBody) {
   if (!markdownBody || typeof markdownBody !== "string") {
-    return [];
+    return { items: [], sawDependencyBullet: false, sawUnparsedContent: false };
   }
   const lines = markdownBody.replace(/\r\n/g, "\n").split("\n");
   let fenceChar = "";
@@ -164,6 +164,8 @@ export function parseChangelogSectionToWebItems(markdownBody) {
   let currentSection = "";
   let skippingUpdatedDeps = false;
   let currentBullet = null;
+  let sawDependencyBullet = false;
+  let sawUnparsedContent = false;
   const items = [];
 
   const flushBullet = () => {
@@ -194,6 +196,8 @@ export function parseChangelogSectionToWebItems(markdownBody) {
       if (currentBullet && !skippingUpdatedDeps) {
         const trimmed = line.trim();
         if (trimmed) currentBullet.details.push(trimmed);
+      } else if (!skippingUpdatedDeps && line.trim()) {
+        sawUnparsedContent = true;
       }
       continue;
     }
@@ -204,6 +208,8 @@ export function parseChangelogSectionToWebItems(markdownBody) {
       if (currentBullet && !skippingUpdatedDeps) {
         const trimmed = line.trim();
         if (trimmed) currentBullet.details.push(trimmed);
+      } else if (!skippingUpdatedDeps) {
+        sawUnparsedContent = true;
       }
       continue;
     }
@@ -229,6 +235,7 @@ export function parseChangelogSectionToWebItems(markdownBody) {
       const rawText = bulletMatch[1].trim();
       if (/^Updated dependencies\b/i.test(rawText)) {
         skippingUpdatedDeps = true;
+        sawDependencyBullet = true;
         continue;
       }
       if (
@@ -236,6 +243,7 @@ export function parseChangelogSectionToWebItems(markdownBody) {
           rawText,
         )
       ) {
+        sawDependencyBullet = true;
         continue;
       }
       currentBullet = {
@@ -259,43 +267,72 @@ export function parseChangelogSectionToWebItems(markdownBody) {
       }
       flushBullet();
     }
+
+    const trimmedLine = line.trim();
+    if (trimmedLine !== "" && trimmedLine !== "No changes in this release.") {
+      sawUnparsedContent = true;
+    }
   }
 
   flushBullet();
-  return items;
+  return { items, sawDependencyBullet, sawUnparsedContent };
+}
+
+export function parseChangelogSectionToWebItems(markdownBody) {
+  return parseChangelogSection(markdownBody).items;
+}
+
+export function readWebChangelogFile(filePath) {
+  if (!existsSync(filePath)) {
+    return { eol: "\n", entries: [] };
+  }
+  const raw = readFileSync(filePath, "utf8");
+  const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Expected JSON array in ${filePath}`);
+  }
+  return { eol, entries: parsed };
 }
 
 export function syncWebChangelog(filePath, version, body, { now } = {}) {
-  const items = parseChangelogSectionToWebItems(body);
+  const { items, sawDependencyBullet, sawUnparsedContent } =
+    parseChangelogSection(body);
   if (items.length === 0) {
-    return false;
+    const status = sawUnparsedContent
+      ? "unparsed"
+      : sawDependencyBullet
+        ? "skipped-deps-only"
+        : "empty";
+    return { updated: false, status, itemCount: 0 };
   }
 
-  let eol = "\n";
-  let entries = [];
-  if (existsSync(filePath)) {
-    const raw = readFileSync(filePath, "utf8");
-    if (raw.includes("\r\n")) {
-      eol = "\r\n";
-    }
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      throw new Error(`Expected JSON array in ${filePath}`);
-    }
-    entries = parsed;
-  }
-
+  const { eol, entries } = readWebChangelogFile(filePath);
   const tag = `v${version}`;
   const existingIdx = entries.findIndex((entry) => entry && entry.version === version);
   let nextEntries;
+  let itemCount = items.length;
   if (existingIdx !== -1) {
     const prev = entries[existingIdx];
+    const prevKindsByTitle = new Map();
+    if (Array.isArray(prev.items)) {
+      for (const prevItem of prev.items) {
+        if (prevItem && typeof prevItem.title === "string" && prevItem.kind) {
+          prevKindsByTitle.set(prevItem.title, prevItem.kind);
+        }
+      }
+    }
+    const mergedItems = items.map((item) => {
+      const prevKind = prevKindsByTitle.get(item.title);
+      return prevKind ? { ...item, kind: prevKind } : item;
+    });
+    itemCount = mergedItems.length;
     const updated = {
       ...prev,
       version,
       tag,
       date: prev.date || formatDateUtc8(now),
-      items,
+      items: mergedItems,
     };
     nextEntries = entries.map((entry, idx) => (idx === existingIdx ? updated : entry));
   } else {
@@ -316,7 +353,7 @@ export function syncWebChangelog(filePath, version, body, { now } = {}) {
     output = output.replace(/\n/g, "\r\n");
   }
   writeFileSync(filePath, output, "utf8");
-  return true;
+  return { updated: true, status: "updated", itemCount };
 }
 
 function main() {
@@ -325,6 +362,12 @@ function main() {
   if (!version) {
     throw new Error("Root package.json is missing version");
   }
+
+  const rootChangelog = readFileSync("CHANGELOG.md", "utf8");
+  const body = extractSection(rootChangelog, version);
+  const webChangelogPath = "app/changelog.generated.json";
+  // 在修改任何版本文件前先校验内置更新日志 JSON，避免半截写入
+  readWebChangelogFile(webChangelogPath);
 
   updateCargoPackageVersion("crates/stream-gears/Cargo.toml", version);
   updateCargoPackageVersion("tauri-app/src-tauri/Cargo.toml", version);
@@ -338,8 +381,7 @@ function main() {
     return updated;
   });
 
-  const rootChangelog = readFileSync("CHANGELOG.md", "utf8");
-  const body = extractSection(rootChangelog, version);
+  let webSync = null;
   if (body) {
     const docsChangelogPath = "docs/content/docs/guide/CHANGELOG.md";
     writePreservingEol(docsChangelogPath, (norm) => {
@@ -361,10 +403,21 @@ function main() {
         norm.slice(anchorMatch.index)
       );
     });
-    syncWebChangelog("app/changelog.generated.json", version, body);
+    webSync = syncWebChangelog(webChangelogPath, version, body);
+    if (webSync.status === "unparsed") {
+      console.warn(
+        `::warning::Release ${version} has non-empty CHANGELOG content that could not be parsed into WebUI changelog items; ${webChangelogPath} was not updated.`,
+      );
+    } else if (webSync.status === "skipped-deps-only") {
+      console.log(
+        `::notice::Skipping ${webChangelogPath} update for ${version} (dependency-only release).`,
+      );
+    }
   }
 
-  console.log(`Synced biliup version ${version} across Cargo/Tauri/package manifests and WebUI changelog.`);
+  console.log(
+    `Synced biliup version ${version} across Cargo/Tauri/package manifests${webSync?.updated ? " and WebUI changelog" : ""}.`,
+  );
 }
 
 if (
