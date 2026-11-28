@@ -494,13 +494,13 @@ class TestPR1UploadSafety(unittest.TestCase):
         self.assertIn('3/3', mock_send_notify.call_args.kwargs['content'])
 
     # 11. 软水位切稿 (disk_soft_triggered=True) 应穿透 delay 立即上传并删录像
-    @patch('biliup.handler.time.sleep')
+    @patch('biliup.handler._wait_upload_delay')
     @patch('biliup.handler.uploaded')
     @patch('biliup.handler.upload')
     @patch('biliup.handler.UploadBase.file_list')
     @patch('biliup.handler.UploadBase.get_max_upload_count')
     def test_disk_soft_triggered_skips_delay_and_uploads(
-        self, mock_get_count, mock_file_list, mock_upload, mock_uploaded, mock_sleep
+        self, mock_get_count, mock_file_list, mock_upload, mock_uploaded, mock_wait_delay
     ):
         mock_file = UploadBase.FileInfo(video='soft_cut.mp4', danmaku=None)
         mock_file_list.return_value = [mock_file]
@@ -521,7 +521,7 @@ class TestPR1UploadSafety(unittest.TestCase):
         }
         process_upload(Event(UPLOAD, (stream_info,)))
 
-        mock_sleep.assert_not_called()
+        mock_wait_delay.assert_not_called()
         mock_upload.assert_called_once()
         mock_uploaded.assert_called_once_with('test_streamer', None, [mock_file])
 
