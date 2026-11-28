@@ -8,6 +8,12 @@
 
 # 更新日志
 
+## 1.1.0
+
+### Minor Changes
+
+- feat(webui): 发版 bot 自动同步内置更新日志页并补齐 1.0.8 与 1.0.9 记录 (#23)
+
 ## 1.0.9
 
 ### Patch Changes
