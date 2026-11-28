@@ -304,7 +304,7 @@ export function syncWebChangelog(filePath, version, body, { now } = {}) {
       : sawDependencyBullet
         ? "skipped-deps-only"
         : "empty";
-    return { updated: false, status, itemCount: 0 };
+    return { updated: false, status, itemCount: 0, hasUnparsedContent: sawUnparsedContent };
   }
 
   const { eol, entries } = readWebChangelogFile(filePath);
@@ -353,7 +353,7 @@ export function syncWebChangelog(filePath, version, body, { now } = {}) {
     output = output.replace(/\n/g, "\r\n");
   }
   writeFileSync(filePath, output, "utf8");
-  return { updated: true, status: "updated", itemCount };
+  return { updated: true, status: "updated", itemCount, hasUnparsedContent: sawUnparsedContent };
 }
 
 function main() {
@@ -411,6 +411,10 @@ function main() {
     } else if (webSync.status === "skipped-deps-only") {
       console.log(
         `::notice::Skipping ${webChangelogPath} update for ${version} (dependency-only release).`,
+      );
+    } else if (webSync.hasUnparsedContent) {
+      console.warn(
+        `::warning::Release ${version} had non-bullet CHANGELOG lines that were skipped while syncing ${webChangelogPath}.`,
       );
     }
   }
