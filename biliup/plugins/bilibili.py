@@ -315,6 +315,9 @@ class Bililive(DownloadBase):
                 }
             )
 
+    def update_headers(self, headers: dict):
+        # 拉流与健康检查共用 stream_headers，只补充防盗链 referer，不复制 cookie
+        headers['referer'] = self.url or 'https://live.bilibili.com/'
 
     async def get_play_info(self, api: str, qn: int = 10000) -> dict:
         full_url = f"{api}/xlive/web-room/v2/index/getRoomPlayInfo"

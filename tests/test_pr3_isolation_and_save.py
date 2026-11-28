@@ -150,6 +150,45 @@ class TestPR3IsolationAndSave(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0][1].get('cookie'), 'SESSDATA=bili_secret;bili_jct=123')
         self.assertNotIn('cookie', {k.lower() for k in util_mod.client.headers.keys()})
 
+    async def test_bililive_stream_headers_injects_referer_without_cookie(self):
+        bili = Bililive('bili_room', 'https://live.bilibili.com/6')
+        bili.fake_headers['cookie'] = 'SESSDATA=bili_secret;bili_jct=123'
+        bili.fake_headers['referer'] = bili.url
+
+        bili.update_headers(bili.stream_headers)
+        self.assertEqual(bili.stream_headers.get('referer'), 'https://live.bilibili.com/6')
+        self.assertNotIn('cookie', {k.lower() for k in bili.stream_headers})
+
+        util_mod.client.headers.pop('cookie', None)
+        util_mod.client.headers.pop('Cookie', None)
+        captured_stream_headers = []
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.raise_for_status = MagicMock()
+        stream_cm = MagicMock()
+        stream_cm.__aenter__ = AsyncMock(return_value=resp)
+        stream_cm.__aexit__ = AsyncMock(return_value=False)
+
+        def fake_stream(method, url, **kwargs):
+            captured_stream_headers.append(dict(kwargs.get('headers') or {}))
+            return stream_cm
+
+        with patch.object(util_mod.client, 'stream', side_effect=fake_stream):
+            res = await bili.acheck_url_healthy('https://cdn.bilivideo.com/live/stream.flv')
+
+        self.assertEqual(res, 'https://cdn.bilivideo.com/live/stream.flv')
+        self.assertEqual(len(captured_stream_headers), 1)
+        self.assertEqual(captured_stream_headers[0].get('referer'), 'https://live.bilibili.com/6')
+        self.assertNotIn('cookie', {k.lower() for k in captured_stream_headers[0]})
+        self.assertNotIn('cookie', {k.lower() for k in util_mod.client.headers.keys()})
+
+        bili_empty = Bililive('bili_empty', '')
+        hdrs = {}
+        bili_empty.update_headers(hdrs)
+        self.assertEqual(hdrs.get('referer'), 'https://live.bilibili.com/')
+
     async def test_kuaishou_and_huya_do_not_pollute_global_client_headers(self):
         # 1. 快手插件
         config['kuaishou_cookie'] = 'ks_secret=abc'

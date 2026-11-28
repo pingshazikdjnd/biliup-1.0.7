@@ -644,10 +644,10 @@ class TestPR11MesioDownloader(unittest.TestCase):
                             patch('biliup.handler.UploadBase.get_max_upload_count', return_value=0), \
                             patch('biliup.handler.upload', return_value=[mock_file]) as mock_upload, \
                             patch('biliup.handler.uploaded') as mock_uploaded, \
-                            patch('biliup.handler.time.sleep') as mock_sleep:
+                            patch('biliup.handler._wait_upload_delay') as mock_wait_delay:
                         handler_mod.process_upload(Event(handler_mod.UPLOAD, (stream_info,)))
 
-                    mock_sleep.assert_not_called()
+                    mock_wait_delay.assert_not_called()
                     mock_upload.assert_called_once()
                     mock_uploaded.assert_called_once_with(f'streamer_{os_name}', None, [mock_file])
                 finally:
