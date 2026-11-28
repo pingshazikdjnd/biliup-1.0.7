@@ -6,12 +6,8 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - main
-      - master
-  # PR（包括功能/修复 PR 与 changeset-release/* 发版 PR）不再触发全平台 wheel 打包，
-  # 统一在合并发版 PR 推送 v* tag 后由 build-release.yml 通过 workflow_call 单次构建发布。
+  # PR（包括功能/修复 PR 与 changeset-release/* 发版 PR）及分支 push 均不再自动触发全平台 wheel 打包，
+  # 统一在合并发版 PR 推送 v* tag 后由 build-release.yml 通过 workflow_call 单次构建发布（亦可手动触发）。
   workflow_dispatch:
   workflow_call:
 
