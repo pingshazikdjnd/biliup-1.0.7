@@ -80,6 +80,7 @@ flowchart LR
 ## 变更说明与已知限制
 
 - **旧 workflow 整合**：已将原重复的 `releases.yml` 与 `pyinstaller-publish.yml` 整合进 `.github/workflows/build-release.yml` 统一编排，并移除了不使用的 `Termux-publish.yml`；`ci.yml` 改造为可复用的纯构建 workflow（并升级至 `actions/setup-node@v4`）；保留 `Build Old Version.yml` 与 `docs-publish.yml`。
+- **PR 阶段跳过打包**：`ci.yml` 已移除 `pull_request` 与分支 `push` 触发、`docker-publish.yml` 已移除 `pull_request` 触发（`docs-publish.yml` 亦仅对修改 `docs/**` 的非 `changeset-release/*` PR 运行），普通业务 PR 与 `Version Packages` PR 均不执行打包；完整全平台打包仅在合并发版 PR 推送 `v*` tag 后由 `build-release.yml` 单次触发（亦可按需手动 `workflow_dispatch` 触发）。
 - **Docker 发布暂未在 tag 启用**：`.github/workflows/docker-publish.yml` 已移除 `tags: v*` 触发器，原因是其中的 `IMAGE_NAME` 仍指向上游组织镜像 `ghcr.io/biliup/caution`；如需从本 fork 发布 Docker 镜像，请先将 `IMAGE_NAME` 改为你自己的仓库路径后再恢复 tag 触发。
 - **前端内置更新日志仍需手动维护**：WebUI 首页 `app/page.tsx` 中的更新日志数组与 `REPO_RELEASES_URL` 不会由 Changesets 自动修改，发版前后如需在网页端展示请继续手动维护。
 

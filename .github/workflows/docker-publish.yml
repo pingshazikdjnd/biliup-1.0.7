@@ -8,8 +8,8 @@ on:
     # 暂不在 tag 触发 Docker 发布：下方 IMAGE_NAME 仍指向上游 ghcr.io/biliup/caution，
     # 在本 fork 推送会无权限失败；如需启用请先将 IMAGE_NAME 改为自己的镜像路径。
 
-  # Run tests for any PRs.
-  pull_request:
+  # PR 不再触发 Docker 构建，避免重复打包；如需验证可手动触发。
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -27,18 +27,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get PR number, repo URL, and branch name
+      - name: Get repo URL and branch name
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            pr_number=$(jq -r .number < "$GITHUB_EVENT_PATH")
-            repo_url=$(jq -r .pull_request.head.repo.clone_url < "$GITHUB_EVENT_PATH")
-            branch_name=$GITHUB_HEAD_REF
-          else
-            pr_number=""
-            repo_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY
-            branch_name="master"
-          fi
-          echo "PR_NUMBER=$pr_number" >> $GITHUB_ENV
+          repo_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY
+          branch_name=${GITHUB_REF_NAME:-master}
           echo "REPO_URL=$repo_url" >> $GITHUB_ENV
           echo "BRANCH_NAME=$branch_name" >> $GITHUB_ENV
 
